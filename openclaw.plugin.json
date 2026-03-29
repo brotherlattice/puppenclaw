@@ -1,0 +1,160 @@
+{
+  "id": "puppenclaw",
+  "name": "Puppenclaw",
+  "description": "ACP-backed Claude Code and Codex orchestration for OpenClaw, with oc2oc-aware remote control.",
+  "skills": [
+    "./skills"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "backend": {
+        "type": "string",
+        "enum": [
+          "local",
+          "daemon"
+        ],
+        "description": "local uses acpx directly; daemon talks to a standalone HTTP daemon."
+      },
+      "daemonUrl": {
+        "type": "string",
+        "description": "Only used when backend=daemon."
+      },
+      "defaultAgent": {
+        "type": "string",
+        "enum": [
+          "claude",
+          "codex"
+        ],
+        "description": "Default ACP agent alias."
+      },
+      "maxSessions": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+        "description": "Maximum concurrently tracked sessions."
+      },
+      "permissionMode": {
+        "type": "string",
+        "enum": [
+          "approve-reads",
+          "approve-all",
+          "deny-all"
+        ],
+        "description": "ACP permission policy."
+      },
+      "sessionTtlMinutes": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1440,
+        "description": "Garbage-collect completed or stopped sessions after this TTL."
+      },
+      "streamOutput": {
+        "type": "boolean",
+        "description": "Capture streamed output chunks while turns run."
+      },
+      "acpxCommand": {
+        "type": "string",
+        "description": "Optional acpx binary override."
+      },
+      "agentCommands": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "claude": {
+            "type": "string",
+            "description": "Optional raw ACP adapter command override for Claude."
+          },
+          "codex": {
+            "type": "string",
+            "description": "Optional raw ACP adapter command override for Codex."
+          }
+        }
+      },
+      "mcpServers": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              }
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "workingDirectory": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "fallbackTarget": {
+        "type": "string",
+        "description": "Optional async notification target description."
+      },
+      "remoteControl": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mediated": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              }
+            }
+          },
+          "purePipe": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "allowFrom": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "allowedAgents": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "claude",
+                    "codex"
+                  ]
+                }
+              }
+            }
+          },
+          "requireConversationBinding": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

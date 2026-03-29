@@ -1,0 +1,56 @@
+{
+  "name": "@puppenclaw/openclaw-plugin",
+  "version": "0.1.0",
+  "description": "ACP-backed Claude Code and Codex orchestration for OpenClaw, including oc2oc-aware remote control.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist/",
+    "skills/",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "puppenclaw-daemon": "./dist/daemon/cli.js"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "node --experimental-strip-types scripts/sync-manifest.mts && tsup",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit --pretty false",
+    "test": "vitest run",
+    "verify": "npm run build && npm run lint && npm run test"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "acp",
+    "claude-code",
+    "codex",
+    "oc2oc"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.3.0 <2027"
+  },
+  "dependencies": {
+    "fastify": "^5.6.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "openclaw": "^2026.3.24",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

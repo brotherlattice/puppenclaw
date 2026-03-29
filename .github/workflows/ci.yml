@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - "puppenclaw/**"
+  pull_request:
+    paths:
+      - "puppenclaw/**"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: puppenclaw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: puppenclaw/package.json
+      - run: npm install
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test
