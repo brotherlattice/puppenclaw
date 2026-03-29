@@ -1,7 +1,7 @@
 {
   "id": "puppenclaw",
   "name": "Puppenclaw",
-  "description": "ACP-backed Claude Code and Codex orchestration for OpenClaw, with oc2oc-aware remote control.",
+  "description": "Project-aware orchestration runtime for OpenClaw, with ACP coding agents, scientific campaign workflows, and oc2oc-aware remote control.",
   "skills": [
     "./skills"
   ],
@@ -111,6 +111,58 @@
       "fallbackTarget": {
         "type": "string",
         "description": "Optional async notification target description."
+      },
+      "orchestration": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxCampaigns": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500
+          },
+          "artifactRetentionHours": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8760
+          },
+          "allowLocalCommandExecution": {
+            "type": "boolean"
+          },
+          "defaultProjectRoot": {
+            "type": "string"
+          },
+          "gptResearcherCommand": {
+            "type": "string"
+          },
+          "localWorker": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "projectRoots": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
       },
       "remoteControl": {
         "type": "object",

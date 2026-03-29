@@ -13,6 +13,7 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   bundle: true,
+  skipNodeModulesBundle: false,
   splitting: false,
   outDir: "dist",
   external: ["openclaw"]

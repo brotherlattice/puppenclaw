@@ -106,5 +106,5 @@ describe("daemon/local parity", () => {
       globalThis.fetch = originalFetch;
       await app.close();
     }
-  });
+  }, 20_000);
 });

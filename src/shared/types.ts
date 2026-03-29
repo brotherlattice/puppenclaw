@@ -3,19 +3,33 @@ import type { z } from "zod";
 import type {
   agentKindZod,
   backendZod,
+  campaignActionParamsZod,
+  campaignRunParamsZod,
+  campaignStateZod,
+  campaignStatusParamsZod,
+  campaignTemplateZod,
+  campaignStepParamsZod,
+  contextSyncParamsZod,
   costParamsZod,
   effortLevelZod,
   exposeParamsZod,
   forkParamsZod,
   mcpServerConfigZod,
+  orchestrationConfigZod,
+  orchestrationExecutorZod,
+  orchestrationStepKindZod,
   permissionModeZod,
   pluginConfigZod,
+  projectCreateParamsZod,
   remoteControlConfigZod,
   resumeParamsZod,
+  runStateZod,
   sendParamsZod,
   startParamsZod,
   statusParamsZod,
-  stopParamsZod
+  stopParamsZod,
+  workerManifestZod,
+  artifactListParamsZod
 } from "./schema.js";
 
 export type AgentKind = z.infer<typeof agentKindZod>;
@@ -26,6 +40,7 @@ export type PluginConfig = z.input<typeof pluginConfigZod>;
 export type ParsedPluginConfig = z.output<typeof pluginConfigZod>;
 export type McpServerConfig = z.infer<typeof mcpServerConfigZod>;
 export type RemoteControlConfig = z.infer<typeof remoteControlConfigZod>;
+export type OrchestrationConfig = z.infer<typeof orchestrationConfigZod>;
 export type StartParams = z.infer<typeof startParamsZod>;
 export type SendParams = z.infer<typeof sendParamsZod>;
 export type StopParams = z.infer<typeof stopParamsZod>;
@@ -34,6 +49,19 @@ export type ForkParams = z.infer<typeof forkParamsZod>;
 export type StatusParams = z.infer<typeof statusParamsZod>;
 export type CostParams = z.infer<typeof costParamsZod>;
 export type ExposeParams = z.infer<typeof exposeParamsZod>;
+export type WorkerManifestInput = z.infer<typeof workerManifestZod>;
+export type ProjectCreateParams = z.infer<typeof projectCreateParamsZod>;
+export type ContextSyncParams = z.infer<typeof contextSyncParamsZod>;
+export type OrchestrationStepParams = z.infer<typeof campaignStepParamsZod>;
+export type CampaignRunParams = z.infer<typeof campaignRunParamsZod>;
+export type CampaignStatusParams = z.infer<typeof campaignStatusParamsZod>;
+export type ArtifactListParams = z.infer<typeof artifactListParamsZod>;
+export type CampaignActionParams = z.infer<typeof campaignActionParamsZod>;
+export type OrchestrationStepKind = z.infer<typeof orchestrationStepKindZod>;
+export type OrchestrationExecutor = z.infer<typeof orchestrationExecutorZod>;
+export type CampaignTemplate = z.infer<typeof campaignTemplateZod>;
+export type CampaignState = z.infer<typeof campaignStateZod>;
+export type RunState = z.infer<typeof runStateZod>;
 
 export type ToolTextBlock = {
   type: "text";

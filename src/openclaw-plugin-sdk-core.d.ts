@@ -10,6 +10,11 @@ declare module "openclaw/plugin-sdk/core" {
 
   export interface PluginRuntime {}
 
+  export interface GatewayRequestHandlerOptions {
+    params?: unknown;
+    respond(ok: boolean, result?: unknown, error?: { message: string; code?: string }): void;
+  }
+
   export interface OpenClawPluginToolContext {
     messageChannel?: string;
     requesterSenderId?: string;
@@ -88,11 +93,13 @@ declare module "openclaw/plugin-sdk/core" {
   export interface OpenClawPluginApi {
     runtime: PluginRuntime;
     logger: PluginLogger;
+    config: unknown;
     pluginConfig?: unknown;
     resolvePath?: (input: string) => string;
     registerTool(provider: (toolCtx: OpenClawPluginToolContext) => AnyAgentTool[]): void;
     registerCommand(command: OpenClawPluginCommand): void;
     registerService(service: OpenClawPluginService): void;
+    registerGatewayMethod?(method: string, handler: (opts: GatewayRequestHandlerOptions) => Promise<void> | void): void;
   }
 
   export interface OpenClawPluginDefinition {

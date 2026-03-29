@@ -1,7 +1,7 @@
 {
   "name": "@puppenclaw/openclaw-plugin",
   "version": "0.1.0",
-  "description": "ACP-backed Claude Code and Codex orchestration for OpenClaw, including oc2oc-aware remote control.",
+  "description": "Project-aware orchestration runtime for OpenClaw with ACP coding agents, scientific campaign workflows, and oc2oc-aware remote control.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -26,6 +26,7 @@
   },
   "scripts": {
     "build": "node --experimental-strip-types scripts/sync-manifest.mts && tsup",
+    "clean": "node --input-type=module -e \"import { rm } from 'node:fs/promises'; await Promise.all(['dist','coverage'].map((path) => rm(path, { recursive: true, force: true })));\"",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit --pretty false",
     "test": "vitest run",
@@ -35,6 +36,8 @@
     "openclaw",
     "plugin",
     "acp",
+    "orchestration",
+    "research",
     "claude-code",
     "codex",
     "oc2oc"

@@ -7,6 +7,7 @@ import {
   pluginConfigZod
 } from "./src/shared/schema.js";
 import { registerPuppenclawCommands } from "./src/plugin/commands.js";
+import { registerPuppenclawGatewayMethods } from "./src/plugin/gateway-methods.js";
 import { configurePuppenclawRegistration, createPuppenclawService } from "./src/plugin/service.js";
 import { registerPuppenclawTools } from "./src/plugin/tools.js";
 
@@ -18,6 +19,7 @@ export default definePluginEntry({
   register(api: OpenClawPluginApi) {
     configurePuppenclawRegistration(api);
     api.registerService(createPuppenclawService());
+    registerPuppenclawGatewayMethods(api);
     registerPuppenclawTools(api);
     registerPuppenclawCommands(api);
   }

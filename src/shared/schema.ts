@@ -6,7 +6,7 @@ export const PACKAGE_NAME = "@puppenclaw/openclaw-plugin";
 export const PLUGIN_ID = "puppenclaw";
 export const PLUGIN_NAME = "Puppenclaw";
 export const PLUGIN_DESCRIPTION =
-  "ACP-backed Claude Code and Codex orchestration for OpenClaw, with oc2oc-aware remote control.";
+  "Project-aware orchestration runtime for OpenClaw, with ACP coding agents, scientific campaign workflows, and oc2oc-aware remote control.";
 export const DAEMON_PORT = 18_795;
 export const DEFAULT_DAEMON_URL = `http://127.0.0.1:${DAEMON_PORT}`;
 export const DEFAULT_MAX_SESSIONS = 5;
@@ -16,17 +16,56 @@ export const DEFAULT_AGENT = "claude" as const;
 export const DEFAULT_REMOTE_REQUIRE_BINDING = true;
 export const SESSION_STORE_VERSION = 1 as const;
 export const DEFAULT_STREAM_OUTPUT = true;
+export const DEFAULT_MAX_CAMPAIGNS = 32;
+export const DEFAULT_ARTIFACT_RETENTION_HOURS = 24 * 14;
 export const DEFAULT_ACPX_AGENT_COMMANDS = {
   claude: "npx -y @zed-industries/claude-agent-acp",
   codex: "npx @zed-industries/codex-acp"
 } as const;
 
 const nonEmptyString = z.string().trim().min(1);
+const idString = nonEmptyString.regex(/^[a-zA-Z0-9._:-]+$/u);
 
 export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
 export const permissionModeZod = z.enum(["approve-reads", "approve-all", "deny-all"]);
 export const effortLevelZod = z.enum(["low", "medium", "high"]);
+export const orchestrationStepKindZod = z.enum([
+  "judge",
+  "research",
+  "plan",
+  "code",
+  "experiment",
+  "eval",
+  "artifact_sync",
+  "review",
+  "publish",
+  "handoff"
+]);
+export const orchestrationExecutorZod = z.enum(["acp", "command"]);
+export const campaignTemplateZod = z.enum([
+  "custom",
+  "literature_review",
+  "baseline_from_scratch",
+  "ablation_campaign",
+  "self_improvement_loop"
+]);
+export const campaignStateZod = z.enum([
+  "draft",
+  "running",
+  "waiting_approval",
+  "completed",
+  "failed",
+  "cancelled"
+]);
+export const runStateZod = z.enum([
+  "pending",
+  "running",
+  "waiting_approval",
+  "completed",
+  "failed",
+  "cancelled"
+]);
 
 export const mcpServerConfigZod = z
   .object({
@@ -72,6 +111,48 @@ export const remoteControlConfigZod = z
     requireConversationBinding: DEFAULT_REMOTE_REQUIRE_BINDING
   });
 
+export const orchestrationConfigZod = z
+  .object({
+    enabled: z.boolean().default(true),
+    maxCampaigns: z.number().int().min(1).max(500).default(DEFAULT_MAX_CAMPAIGNS),
+    artifactRetentionHours: z
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 365)
+      .default(DEFAULT_ARTIFACT_RETENTION_HOURS),
+    allowLocalCommandExecution: z.boolean().default(true),
+    defaultProjectRoot: nonEmptyString.optional(),
+    gptResearcherCommand: nonEmptyString.optional(),
+    localWorker: z
+      .object({
+        id: idString.default("local"),
+        label: nonEmptyString.default("Local Worker"),
+        labels: z.array(nonEmptyString).default(["local"]),
+        projectRoots: z.array(nonEmptyString).default([])
+      })
+      .strict()
+      .default({
+        id: "local",
+        label: "Local Worker",
+        labels: ["local"],
+        projectRoots: []
+      })
+  })
+  .strict()
+  .default({
+    enabled: true,
+    maxCampaigns: DEFAULT_MAX_CAMPAIGNS,
+    artifactRetentionHours: DEFAULT_ARTIFACT_RETENTION_HOURS,
+    allowLocalCommandExecution: true,
+    localWorker: {
+      id: "local",
+      label: "Local Worker",
+      labels: ["local"],
+      projectRoots: []
+    }
+  });
+
 export const pluginConfigZod = z
   .object({
     backend: backendZod.default("local"),
@@ -91,7 +172,118 @@ export const pluginConfigZod = z
       .default({}),
     mcpServers: z.record(z.string(), mcpServerConfigZod).default({}),
     fallbackTarget: nonEmptyString.optional(),
-    remoteControl: remoteControlConfigZod
+    remoteControl: remoteControlConfigZod,
+    orchestration: orchestrationConfigZod
+  })
+  .strict();
+
+export const workerManifestZod = z
+  .object({
+    id: idString,
+    label: nonEmptyString,
+    labels: z.array(nonEmptyString).default([]),
+    projectRoots: z.array(nonEmptyString).default([]),
+    supportedSteps: z.array(orchestrationStepKindZod).default([
+      "judge",
+      "research",
+      "plan",
+      "code",
+      "experiment",
+      "eval",
+      "review",
+      "publish",
+      "handoff"
+    ]),
+    executors: z.array(orchestrationExecutorZod).default(["acp"]),
+    defaultAgent: agentKindZod.optional(),
+    maxConcurrentRuns: z.number().int().min(1).max(64).default(1),
+    adminOnlyRawSessions: z.boolean().default(true)
+  })
+  .strict();
+
+export const projectCreateParamsZod = z
+  .object({
+    id: idString.optional(),
+    name: nonEmptyString,
+    rootDir: nonEmptyString,
+    description: z.string().trim().optional()
+  })
+  .strict();
+
+export const contextSyncParamsZod = z
+  .object({
+    projectId: idString,
+    includeFiles: z.array(nonEmptyString).default([]),
+    memoryText: z.string().trim().optional(),
+    notes: z.string().trim().optional()
+  })
+  .strict();
+
+export const campaignStepParamsZod = z
+  .object({
+    id: idString.optional(),
+    title: nonEmptyString,
+    kind: orchestrationStepKindZod,
+    executor: orchestrationExecutorZod,
+    instruction: z.string().trim().optional(),
+    command: z.string().trim().optional(),
+    contextFiles: z.array(nonEmptyString).default([]),
+    approvalRequired: z.boolean().default(false),
+    agent: agentKindZod.optional(),
+    workingDirectory: nonEmptyString.optional(),
+    env: z.record(z.string(), z.string()).default({})
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.executor === "acp" && (value.instruction?.trim().length ?? 0) === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "ACP orchestration steps require instruction text.",
+        path: ["instruction"]
+      });
+    }
+    if (value.executor === "command" && (value.command?.trim().length ?? 0) === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Command orchestration steps require a command string.",
+        path: ["command"]
+      });
+    }
+  });
+
+export const campaignRunParamsZod = z
+  .object({
+    projectId: idString,
+    workerId: idString,
+    name: nonEmptyString,
+    template: campaignTemplateZod.default("custom"),
+    task: nonEmptyString.optional(),
+    evaluationCommand: z.string().trim().optional(),
+    experimentCommands: z.array(nonEmptyString).default([]),
+    iterations: z.number().int().min(1).max(10).default(1),
+    steps: z.array(campaignStepParamsZod).default([])
+  })
+  .strict();
+
+export const campaignStatusParamsZod = z
+  .object({
+    campaignId: idString.optional(),
+    projectId: idString.optional()
+  })
+  .strict()
+  .default({});
+
+export const artifactListParamsZod = z
+  .object({
+    campaignId: idString.optional(),
+    projectId: idString.optional()
+  })
+  .strict()
+  .default({});
+
+export const campaignActionParamsZod = z
+  .object({
+    campaignId: idString
   })
   .strict();
 
@@ -256,6 +448,58 @@ export const pluginManifestConfigSchema = {
       type: "string",
       description: "Optional async notification target description."
     },
+    orchestration: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: {
+          type: "boolean"
+        },
+        maxCampaigns: {
+          type: "integer",
+          minimum: 1,
+          maximum: 500
+        },
+        artifactRetentionHours: {
+          type: "integer",
+          minimum: 1,
+          maximum: 8760
+        },
+        allowLocalCommandExecution: {
+          type: "boolean"
+        },
+        defaultProjectRoot: {
+          type: "string"
+        },
+        gptResearcherCommand: {
+          type: "string"
+        },
+        localWorker: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            id: {
+              type: "string"
+            },
+            label: {
+              type: "string"
+            },
+            labels: {
+              type: "array",
+              items: {
+                type: "string"
+              }
+            },
+            projectRoots: {
+              type: "array",
+              items: {
+                type: "string"
+              }
+            }
+          }
+        }
+      }
+    },
     remoteControl: {
       type: "object",
       additionalProperties: false,
@@ -349,6 +593,108 @@ export const toolForkSchema = Type.Object({
 
 export const toolCostSchema = Type.Object({
   name: Type.String({ minLength: 1 })
+});
+
+export const toolProjectCreateSchema = Type.Object({
+  id: Type.Optional(Type.String({ minLength: 1 })),
+  name: Type.String({ minLength: 1 }),
+  rootDir: Type.String({ minLength: 1 }),
+  description: Type.Optional(Type.String())
+});
+
+export const toolWorkerRegisterSchema = Type.Object({
+  id: Type.String({ minLength: 1 }),
+  label: Type.String({ minLength: 1 }),
+  labels: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  projectRoots: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  supportedSteps: Type.Optional(
+    Type.Array(
+      Type.Union([
+        Type.Literal("judge"),
+        Type.Literal("research"),
+        Type.Literal("plan"),
+        Type.Literal("code"),
+        Type.Literal("experiment"),
+        Type.Literal("eval"),
+        Type.Literal("artifact_sync"),
+        Type.Literal("review"),
+        Type.Literal("publish"),
+        Type.Literal("handoff")
+      ])
+    )
+  ),
+  executors: Type.Optional(
+    Type.Array(Type.Union([Type.Literal("acp"), Type.Literal("command")]))
+  ),
+  defaultAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
+  maxConcurrentRuns: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+  adminOnlyRawSessions: Type.Optional(Type.Boolean())
+});
+
+export const toolContextSyncSchema = Type.Object({
+  projectId: Type.String({ minLength: 1 }),
+  includeFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  memoryText: Type.Optional(Type.String()),
+  notes: Type.Optional(Type.String())
+});
+
+const toolCampaignStepSchema = Type.Object({
+  id: Type.Optional(Type.String({ minLength: 1 })),
+  title: Type.String({ minLength: 1 }),
+  kind: Type.Union([
+    Type.Literal("judge"),
+    Type.Literal("research"),
+    Type.Literal("plan"),
+    Type.Literal("code"),
+    Type.Literal("experiment"),
+    Type.Literal("eval"),
+    Type.Literal("artifact_sync"),
+    Type.Literal("review"),
+    Type.Literal("publish"),
+    Type.Literal("handoff")
+  ]),
+  executor: Type.Union([Type.Literal("acp"), Type.Literal("command")]),
+  instruction: Type.Optional(Type.String()),
+  command: Type.Optional(Type.String()),
+  contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  approvalRequired: Type.Optional(Type.Boolean()),
+  agent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
+  workingDirectory: Type.Optional(Type.String({ minLength: 1 })),
+  env: Type.Optional(Type.Object({}, { additionalProperties: Type.String() }))
+});
+
+export const toolCampaignRunSchema = Type.Object({
+  projectId: Type.String({ minLength: 1 }),
+  workerId: Type.String({ minLength: 1 }),
+  name: Type.String({ minLength: 1 }),
+  template: Type.Optional(
+    Type.Union([
+      Type.Literal("custom"),
+      Type.Literal("literature_review"),
+      Type.Literal("baseline_from_scratch"),
+      Type.Literal("ablation_campaign"),
+      Type.Literal("self_improvement_loop")
+    ])
+  ),
+  task: Type.Optional(Type.String({ minLength: 1 })),
+  evaluationCommand: Type.Optional(Type.String()),
+  experimentCommands: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  iterations: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+  steps: Type.Optional(Type.Array(toolCampaignStepSchema))
+});
+
+export const toolCampaignStatusSchema = Type.Object({
+  campaignId: Type.Optional(Type.String({ minLength: 1 })),
+  projectId: Type.Optional(Type.String({ minLength: 1 }))
+});
+
+export const toolArtifactsSchema = Type.Object({
+  campaignId: Type.Optional(Type.String({ minLength: 1 })),
+  projectId: Type.Optional(Type.String({ minLength: 1 }))
+});
+
+export const toolCampaignActionSchema = Type.Object({
+  campaignId: Type.String({ minLength: 1 })
 });
 
 export function buildPluginManifest(): Record<string, unknown> {

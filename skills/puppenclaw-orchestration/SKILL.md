@@ -1,6 +1,6 @@
 ---
 name: puppenclaw-orchestration
-description: Route repo work into Puppenclaw-managed ACP sessions and use oc2oc remote control safely.
+description: Run project-aware Puppenclaw orchestration campaigns, use raw ACP sessions only when needed, and handle oc2oc-mediated delegation safely.
 user-invocable: false
 metadata:
   openclaw:
@@ -12,29 +12,48 @@ metadata:
 
 ## Use Puppenclaw when
 
-- The user wants work done inside a repo, workspace, or server project.
-- The task needs file edits, shell commands, tests, builds, or git operations.
-- The task is multi-step and benefits from a persistent Claude Code or Codex session.
-- The request comes through `oc2oc` and should be delegated to a remote coding agent.
+- The user wants project-aware orchestration, not just a single coding turn.
+- The task needs repo context capture, multi-step execution, approvals, or artifacts.
+- The request is a research, baseline, ablation, or self-improvement workflow.
+- The request comes through `oc2oc` and should be mediated into a remote worker flow.
 
-## Prefer mediated orchestration
+## Prefer orchestration primitives first
 
-- When a remote `oc2oc` message asks for code work, treat Puppenclaw as the execution backend and keep the remote agent in charge of delegation.
+- Prefer:
+  - `puppenclaw_project_create`
+  - `puppenclaw_worker_register`
+  - `puppenclaw_context_sync`
+  - `puppenclaw_campaign_start`
+  - `puppenclaw_campaign_status`
+  - `puppenclaw_artifacts`
+  - `puppenclaw_campaign_approve`
+  - `puppenclaw_campaign_cancel`
+- Create or reuse a project before running a campaign.
+- Sync `AGENTS.md`, `README.md`, small design notes, and other high-signal files into context first.
+- Use named workers with constrained project roots and explicit capabilities.
+
+## Campaign selection
+
+- Prefer `baseline_from_scratch` for initial implementation loops.
+- Prefer `literature_review` for citation-conscious research dossiers.
+- Prefer `ablation_campaign` when the operator already has concrete experiment commands.
+- Prefer `self_improvement_loop` when iterative plan -> code -> eval -> review cycles are desired.
+- Use `custom` only when the built-in templates do not fit.
+
+## Raw session fallback
+
+- Use raw session tools only when orchestration is too heavy or the operator explicitly wants direct ACP control.
 - Reuse an existing session for the same `agent + directory` before starting a new one.
-- Attach explicit context files such as `AGENTS.md`, `agents.md`, or small task notes when they are already available.
+- Prefer `agent: "codex"` for Codex-oriented coding loops.
+- Prefer `agent: "claude"` when the operator explicitly wants Claude Code behavior.
 
-## Pure-pipe remote control
+## oc2oc-mediated control
 
+- For remote `oc2oc` work, keep the remote assistant in control and treat Puppenclaw as the worker runtime.
 - Use deterministic `/puppenclaw ...` commands only when the target conversation is explicitly bound and exposed for pure-pipe control.
 - If no binding exists, request `/puppenclaw bind`.
 - If the conversation is bound but not exposed, require `/puppenclaw expose`.
 - Never assume pure-pipe remote control is allowed by default.
-
-## Agent choice
-
-- Prefer `agent: "codex"` for Codex-oriented coding loops.
-- Prefer `agent: "claude"` when the operator explicitly wants Claude Code behavior.
-- Keep the requested agent stable for the life of the session unless the user asks to switch.
 
 ## When not to use Puppenclaw
 

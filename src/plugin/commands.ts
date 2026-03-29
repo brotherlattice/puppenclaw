@@ -5,14 +5,21 @@ import type {
 } from "openclaw/plugin-sdk/core";
 
 import {
+  artifactListParamsZod,
+  campaignActionParamsZod,
+  campaignRunParamsZod,
+  campaignStatusParamsZod,
+  contextSyncParamsZod,
   costParamsZod,
   exposeParamsZod,
   forkParamsZod,
+  projectCreateParamsZod,
   resumeParamsZod,
   sendParamsZod,
   startParamsZod,
   statusParamsZod,
-  stopParamsZod
+  stopParamsZod,
+  workerManifestZod
 } from "../shared/schema.js";
 import type {
   AgentKind,
@@ -27,6 +34,7 @@ import { OutputRouter, type OutputRouteEvent } from "./output-router.js";
 import {
   getConfiguredPluginConfig,
   getPuppenclawManager,
+  getPuppenclawOrchestrator,
   getPuppenclawOutputRouter,
   getPuppenclawStore,
   patchStoredSession
@@ -78,6 +86,14 @@ function renderHelp(): string {
     "resume {\"name\":\"api-refactor\"}",
     "fork {\"source\":\"api-refactor\",\"target\":\"api-refactor-alt\"}",
     "cost {\"name\":\"api-refactor\"}",
+    "project {\"name\":\"ml-research\",\"rootDir\":\".\",\"description\":\"Main project root.\"}",
+    "worker {\"id\":\"local\",\"label\":\"Local Worker\",\"labels\":[\"gpu\"],\"projectRoots\":[\".\"]}",
+    "sync {\"projectId\":\"ml-research\",\"includeFiles\":[\"AGENTS.md\",\"README.md\"]}",
+    "campaign {\"projectId\":\"ml-research\",\"workerId\":\"local\",\"name\":\"baseline\",\"template\":\"baseline_from_scratch\",\"task\":\"Implement the baseline.\",\"evaluationCommand\":\"npm test\"}",
+    "campaign-status {\"campaignId\":\"camp-...\"}",
+    "artifacts {\"campaignId\":\"camp-...\"}",
+    "approve {\"campaignId\":\"camp-...\"}",
+    "cancel {\"campaignId\":\"camp-...\"}",
     "bind",
     "unbind",
     "expose {\"agents\":[\"claude\",\"codex\"],\"allowPurePipe\":true}",
@@ -301,10 +317,74 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
         }
 
         const manager = await getPuppenclawManager();
+        const orchestrator = await getPuppenclawOrchestrator();
         const router = await getPuppenclawOutputRouter();
         const remote = sessionRequiresRemoteAuthorization(ctx);
 
         switch (parsed.verb) {
+          case "project": {
+            const result = await orchestrator.createProject(
+              projectCreateParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
+            );
+            return { text: flattenResultText(result) };
+          }
+          case "worker": {
+            const result = await orchestrator.registerWorker(
+              workerManifestZod.parse(parseJsonPayload(parsed.payloadText, {}))
+            );
+            return { text: flattenResultText(result) };
+          }
+          case "sync": {
+            const result = await orchestrator.syncContext(
+              contextSyncParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
+            );
+            return { text: flattenResultText(result) };
+          }
+          case "campaign": {
+            if (remote) {
+              await requirePurePipeExposure(ctx, null);
+            }
+            const result = await orchestrator.runCampaign(
+              campaignRunParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
+            );
+            return { text: flattenResultText(result) };
+          }
+          case "campaign-status": {
+            if (remote) {
+              await requirePurePipeExposure(ctx, null);
+            }
+            const result = await orchestrator.status(
+              campaignStatusParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
+            );
+            return { text: flattenResultText(result) };
+          }
+          case "artifacts": {
+            if (remote) {
+              await requirePurePipeExposure(ctx, null);
+            }
+            const result = await orchestrator.listArtifacts(
+              artifactListParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
+            );
+            return { text: flattenResultText(result) };
+          }
+          case "approve": {
+            if (remote) {
+              await requirePurePipeExposure(ctx, null);
+            }
+            const result = await orchestrator.approve(
+              campaignActionParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
+            );
+            return { text: flattenResultText(result) };
+          }
+          case "cancel": {
+            if (remote) {
+              await requirePurePipeExposure(ctx, null);
+            }
+            const result = await orchestrator.cancel(
+              campaignActionParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
+            );
+            return { text: flattenResultText(result) };
+          }
           case "start": {
             const params = startParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
             const binding = remote ? await requirePurePipeExposure(ctx, params.agent) : await ctx.getCurrentConversationBinding();

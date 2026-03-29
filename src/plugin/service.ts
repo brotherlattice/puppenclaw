@@ -10,6 +10,10 @@ import type {
 
 import { createSessionManager } from "../manager/factory.js";
 import type { ISessionManager } from "../manager/interface.js";
+import { DaemonOrchestratorClient } from "../orchestrator/client.js";
+import { OrchestratorRuntime } from "../orchestrator/runtime.js";
+import { OrchestratorStore } from "../orchestrator/store.js";
+import type { IOrchestrator } from "../orchestrator/types.js";
 import { SessionStore } from "../shared/store.js";
 import type { ParsedPluginConfig, SessionInfo } from "../shared/types.js";
 import { ensureDir } from "../shared/utils.js";
@@ -23,7 +27,9 @@ type RegistrationState = {
   pluginConfig: ParsedPluginConfig | null;
   dataDir: string | null;
   store: SessionStore | null;
+  orchestratorStore: OrchestratorStore | null;
   manager: ISessionManager | null;
+  orchestrator: IOrchestrator | null;
   outputRouter: OutputRouter | null;
   gcTimer: NodeJS.Timeout | null;
   initPromise: Promise<void> | null;
@@ -36,7 +42,9 @@ const state: RegistrationState = {
   pluginConfig: null,
   dataDir: null,
   store: null,
+  orchestratorStore: null,
   manager: null,
+  orchestrator: null,
   outputRouter: null,
   gcTimer: null,
   initPromise: null
@@ -104,6 +112,14 @@ export async function getPuppenclawOutputRouter(): Promise<OutputRouter> {
   return state.outputRouter;
 }
 
+export async function getPuppenclawOrchestrator(): Promise<IOrchestrator> {
+  await ensureInitialized();
+  if (state.orchestrator == null) {
+    throw new Error("Puppenclaw orchestrator is unavailable");
+  }
+  return state.orchestrator;
+}
+
 export function getConfiguredPluginConfig(): ParsedPluginConfig {
   return state.pluginConfig ?? readPluginConfig({});
 }
@@ -117,7 +133,13 @@ export async function patchStoredSession(
 }
 
 async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<void> {
-  if (state.manager != null && state.store != null && state.outputRouter != null) {
+  if (
+    state.manager != null &&
+    state.store != null &&
+    state.outputRouter != null &&
+    state.orchestratorStore != null &&
+    state.orchestrator != null
+  ) {
     return;
   }
   if (state.initPromise != null) {
@@ -138,6 +160,7 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
     }
     await ensureDir(state.dataDir);
     state.store = await SessionStore.open(state.dataDir);
+    state.orchestratorStore = await OrchestratorStore.open(join(state.dataDir, "orchestrator"));
     state.outputRouter = new OutputRouter(logger);
     state.manager = createSessionManager({
       config: getConfiguredPluginConfig(),
@@ -145,6 +168,18 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
       store: state.store,
       outputRouter: state.outputRouter
     });
+    state.orchestrator =
+      getConfiguredPluginConfig().backend === "daemon"
+        ? new DaemonOrchestratorClient({
+            config: getConfiguredPluginConfig(),
+            logger
+          })
+        : new OrchestratorRuntime({
+            config: getConfiguredPluginConfig(),
+            logger,
+            store: state.orchestratorStore,
+            sessionManager: state.manager
+          });
   })();
   try {
     await state.initPromise;
