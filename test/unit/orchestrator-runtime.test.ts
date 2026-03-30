@@ -47,6 +47,7 @@ describe("OrchestratorRuntime", () => {
         error() {},
         debug() {}
       },
+      sessionStore,
       store: await OrchestratorStore.open(join(workspaceDir, ".orchestrator")),
       sessionManager: manager
     });
@@ -72,6 +73,7 @@ describe("OrchestratorRuntime", () => {
       task: "Implement the first baseline for this project.",
       evaluationCommand: "printf 'tests-ok\\n'",
       experimentCommands: [],
+      experimentParallelism: 1,
       iterations: 1,
       steps: []
     });
@@ -82,23 +84,94 @@ describe("OrchestratorRuntime", () => {
       };
       runs: Array<{
         state: string;
+        sessionName?: string;
       }>;
       artifacts: Array<{
         kind: string;
+        sha256: string;
+        siteId: string;
+        stepId?: string;
+        files?: Array<{
+          sha256: string;
+        }>;
       }>;
+      progress: {
+        completedSteps: number;
+        experimentParallelism: number;
+      };
     };
     expect(details.campaign.state).toBe("completed");
     expect(details.runs.some((run) => run.state === "completed")).toBe(true);
     expect(details.artifacts.some((artifact) => artifact.kind === "command-output")).toBe(true);
+    expect(details.progress.completedSteps).toBe(details.runs.length);
+    expect(details.progress.experimentParallelism).toBe(1);
+    const commandArtifact = details.artifacts.find((artifact) => artifact.kind === "command-output");
+    expect(commandArtifact?.sha256).toBeTruthy();
+    expect(commandArtifact?.siteId).toBe("local");
+    expect(commandArtifact?.stepId).toBeTruthy();
+    expect(commandArtifact?.files?.[0]?.sha256).toBeTruthy();
     const projectArtifacts = await runtime.listArtifacts({
       projectId: "demo-project"
     });
     const artifactDetails = projectArtifacts.details as {
       artifacts: Array<{
         kind: string;
+        sha256: string;
       }>;
     };
     expect(artifactDetails.artifacts.some((artifact) => artifact.kind === "context")).toBe(true);
+    expect(artifactDetails.artifacts.every((artifact) => artifact.sha256.length > 0)).toBe(true);
+
+    const siteStatus = await runtime.siteStatus({
+      verbose: true
+    });
+    const siteDetails = siteStatus.details as {
+      siteId: string;
+      sessions: {
+        total: number;
+        items?: Array<{
+          name: string;
+        }>;
+      };
+      campaigns: {
+        total: number;
+      };
+      workers: Array<{
+        id: string;
+      }>;
+    };
+    expect(siteDetails.siteId).toBe("local");
+    expect(siteDetails.sessions.total).toBeGreaterThanOrEqual(1);
+    expect(siteDetails.campaigns.total).toBe(1);
+    expect(siteDetails.workers.some((worker) => worker.id === "local")).toBe(true);
+
+    const sessionName = details.runs.find((run) => run.sessionName != null)?.sessionName;
+    expect(sessionName).toBeTruthy();
+    const sessionLogs = await runtime.logs({
+      sessionName: sessionName as string,
+      limitChars: 2_000,
+      follow: false
+    });
+    const sessionLogDetails = sessionLogs.details as {
+      scope: string;
+      text: string;
+    };
+    expect(sessionLogDetails.scope).toBe("session");
+    expect(sessionLogDetails.text.length).toBeGreaterThan(0);
+
+    const campaignLogs = await runtime.logs({
+      campaignId: (campaign.details as { campaign: { id: string } }).campaign.id,
+      limitChars: 2_000,
+      follow: false
+    });
+    const campaignLogDetails = campaignLogs.details as {
+      scope: string;
+      entries: Array<{
+        id: string;
+      }>;
+    };
+    expect(campaignLogDetails.scope).toBe("campaign");
+    expect(campaignLogDetails.entries.length).toBe(details.runs.length);
   });
 
   it("pauses for approval and resumes when approved", async () => {
@@ -132,6 +205,7 @@ describe("OrchestratorRuntime", () => {
         error() {},
         debug() {}
       },
+      sessionStore: await SessionStore.open(workspaceDir),
       store: await OrchestratorStore.open(join(workspaceDir, ".orchestrator")),
       sessionManager: manager
     });
@@ -147,6 +221,7 @@ describe("OrchestratorRuntime", () => {
       name: "gated",
       template: "custom",
       experimentCommands: [],
+      experimentParallelism: 1,
       iterations: 1,
       steps: [
         {
@@ -156,7 +231,8 @@ describe("OrchestratorRuntime", () => {
           instruction: "Outline the next action.",
           approvalRequired: true,
           contextFiles: [],
-          env: {}
+          env: {},
+          retryLimit: 0
         },
         {
           title: "Continue work",
@@ -165,7 +241,8 @@ describe("OrchestratorRuntime", () => {
           instruction: "Continue after approval.",
           contextFiles: [],
           approvalRequired: false,
-          env: {}
+          env: {},
+          retryLimit: 0
         }
       ]
     });
@@ -226,6 +303,7 @@ describe("OrchestratorRuntime", () => {
         error() {},
         debug() {}
       },
+      sessionStore,
       store: await OrchestratorStore.open(join(workspaceDir, ".orchestrator")),
       sessionManager: manager
     });
@@ -242,6 +320,7 @@ describe("OrchestratorRuntime", () => {
       template: "literature_review",
       task: "Map the current project constraints and prior art.",
       experimentCommands: [],
+      experimentParallelism: 1,
       iterations: 1,
       steps: []
     });

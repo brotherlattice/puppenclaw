@@ -80,6 +80,7 @@ describe("DaemonOrchestratorClient", () => {
         template: "literature_review",
         task: "Survey the local project constraints.",
         experimentCommands: [],
+        experimentParallelism: 1,
         iterations: 1,
         steps: []
       });

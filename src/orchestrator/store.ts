@@ -5,6 +5,7 @@ import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 import type {
   ArtifactRecord,
   CampaignSpecRecord,
+  CampaignProgressSnapshot,
   CampaignStatusSnapshot,
   ProjectRecord,
   RunRecord,
@@ -146,6 +147,13 @@ export class OrchestratorStore {
       .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
   }
 
+  getRun(runId: string): RunRecord | null {
+    const row = this.db.prepare("SELECT payload FROM runs WHERE id = ?").get(runId) as
+      | { payload: string }
+      | undefined;
+    return row != null ? parseJson<RunRecord>(row.payload) : null;
+  }
+
   upsertArtifact(artifact: ArtifactRecord): void {
     this.db
       .prepare("INSERT INTO artifacts (id, project_id, campaign_id, run_id, payload) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, project_id = excluded.project_id, campaign_id = excluded.campaign_id, run_id = excluded.run_id")
@@ -184,12 +192,15 @@ export class OrchestratorStore {
     if (campaign == null) {
       return null;
     }
+    const runs = this.listRuns(campaign.id);
+    const progress = buildCampaignProgress(campaign, runs);
     return {
       campaign,
       project: this.getProject(campaign.projectId),
       worker: this.getWorker(campaign.workerId),
-      runs: this.listRuns(campaign.id),
-      artifacts: this.listArtifacts({ campaignId: campaign.id })
+      runs,
+      artifacts: this.listArtifacts({ campaignId: campaign.id }),
+      progress
     };
   }
 
@@ -201,4 +212,23 @@ export class OrchestratorStore {
     const info = await stat(join(this.resolveArtifactsDir(), relativePath));
     return info.size;
   }
+}
+
+function buildCampaignProgress(
+  campaign: CampaignSpecRecord,
+  runs: RunRecord[]
+): CampaignProgressSnapshot {
+  const completedSteps = runs.filter((run) => run.state === "completed").length;
+  const failedSteps = runs.filter((run) => run.state === "failed").length;
+  const currentStep = campaign.steps[campaign.currentStepIndex];
+  return {
+    totalSteps: campaign.steps.length,
+    completedSteps,
+    failedSteps,
+    currentStepIndex: campaign.currentStepIndex,
+    experimentParallelism: campaign.experimentParallelism,
+    ...(currentStep != null ? { currentStepId: currentStep.id, currentStepTitle: currentStep.title } : {}),
+    ...(campaign.currentRunId != null ? { currentRunId: campaign.currentRunId } : {}),
+    lastProgressAt: campaign.lastProgressAt
+  };
 }

@@ -15,8 +15,10 @@ import {
   contextSyncParamsZod,
   costParamsZod,
   forkParamsZod,
+  logsParamsZod,
   projectCreateParamsZod,
   resumeParamsZod,
+  siteStatusParamsZod,
   sendParamsZod,
   startParamsZod,
   statusParamsZod,
@@ -63,6 +65,7 @@ export async function createDaemonServer(params: {
     },
     logger,
     store: orchestratorStore,
+    sessionStore: store,
     sessionManager: manager
   });
 
@@ -188,6 +191,35 @@ export async function createDaemonServer(params: {
 
   app.post("/orchestrator/cancel", async (request) =>
     ok(await orchestrator.cancel(campaignActionParamsZod.parse(request.body)))
+  );
+
+  app.get("/site/status", async (request) =>
+    ok(
+      await orchestrator.siteStatus(
+        siteStatusParamsZod.parse({
+          verbose: (request.query as { verbose?: string }).verbose === "true",
+          format: (request.query as { format?: "text" | "json" }).format
+        })
+      )
+    )
+  );
+
+  app.get("/site/logs", async (request) =>
+    ok(
+      await orchestrator.logs(
+        logsParamsZod.parse({
+          sessionName: (request.query as { sessionName?: string }).sessionName,
+          campaignId: (request.query as { campaignId?: string }).campaignId,
+          runId: (request.query as { runId?: string }).runId,
+          limitChars:
+            (request.query as { limitChars?: string }).limitChars != null
+              ? Number((request.query as { limitChars?: string }).limitChars)
+              : undefined,
+          follow: (request.query as { follow?: string }).follow === "true",
+          format: (request.query as { format?: "text" | "json" }).format
+        })
+      )
+    )
   );
 
   app.post("/shutdown", async (_request, reply) => {

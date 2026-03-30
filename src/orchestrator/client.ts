@@ -7,8 +7,10 @@ import type {
   CampaignRunParams,
   CampaignStatusParams,
   ContextSyncParams,
+  LogsParams,
   ParsedPluginConfig,
   ProjectCreateParams,
+  SiteStatusParams,
   ToolResult,
   WorkerManifestInput
 } from "../shared/types.js";
@@ -82,6 +84,37 @@ export class DaemonOrchestratorClient implements IOrchestrator {
   async cancel(params: CampaignActionParams): Promise<ToolResult> {
     await this.ensureHealthy();
     return this.request({ method: "POST", path: "/orchestrator/cancel", body: params });
+  }
+
+  async siteStatus(params?: SiteStatusParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    const resolved = params ?? { verbose: false };
+    const url = new URL("/site/status", this.deps.config.daemonUrl);
+    url.searchParams.set("verbose", String(resolved.verbose));
+    if (resolved.format != null) {
+      url.searchParams.set("format", resolved.format);
+    }
+    return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
+  }
+
+  async logs(params: LogsParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    const url = new URL("/site/logs", this.deps.config.daemonUrl);
+    if (params.sessionName != null) {
+      url.searchParams.set("sessionName", params.sessionName);
+    }
+    if (params.campaignId != null) {
+      url.searchParams.set("campaignId", params.campaignId);
+    }
+    if (params.runId != null) {
+      url.searchParams.set("runId", params.runId);
+    }
+    url.searchParams.set("limitChars", String(params.limitChars));
+    url.searchParams.set("follow", String(params.follow));
+    if (params.format != null) {
+      url.searchParams.set("format", params.format);
+    }
+    return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
   }
 
   private async ensureHealthy(): Promise<void> {

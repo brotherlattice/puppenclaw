@@ -12,9 +12,11 @@ import {
   contextSyncParamsZod,
   costParamsZod,
   forkParamsZod,
+  logsParamsZod,
   projectCreateParamsZod,
   resumeParamsZod,
   sendParamsZod,
+  siteStatusParamsZod,
   startParamsZod,
   statusParamsZod,
   stopParamsZod,
@@ -23,16 +25,18 @@ import {
   toolCampaignRunSchema,
   toolCampaignStatusSchema,
   toolContextSyncSchema,
-  toolProjectCreateSchema,
-  toolWorkerRegisterSchema,
   toolCostSchema,
   toolForkSchema,
-  workerManifestZod,
+  toolLogsSchema,
+  toolProjectCreateSchema,
   toolResumeSchema,
   toolSendSchema,
+  toolSiteStatusSchema,
   toolStartSchema,
   toolStatusSchema,
-  toolStopSchema
+  toolStopSchema,
+  toolWorkerRegisterSchema,
+  workerManifestZod
 } from "../shared/schema.js";
 import { patchStoredSession, getPuppenclawManager, getPuppenclawOrchestrator } from "./service.js";
 
@@ -138,6 +142,26 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const orchestrator = await getPuppenclawOrchestrator();
         return orchestrator.cancel(campaignActionParamsZod.parse(rawParams));
+      }
+    },
+    {
+      name: "puppenclaw_site_status",
+      label: "Puppenclaw site status",
+      description: "Inspect site-level runtime health, capacity, workers, and remote-control exposure state.",
+      parameters: toolSiteStatusSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const orchestrator = await getPuppenclawOrchestrator();
+        return orchestrator.siteStatus(siteStatusParamsZod.parse(rawParams ?? {}));
+      }
+    },
+    {
+      name: "puppenclaw_logs",
+      label: "Puppenclaw logs",
+      description: "Fetch bounded session, run, or campaign logs for remote inspection and polling.",
+      parameters: toolLogsSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const orchestrator = await getPuppenclawOrchestrator();
+        return orchestrator.logs(logsParamsZod.parse(rawParams));
       }
     },
     {

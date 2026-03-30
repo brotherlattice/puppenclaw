@@ -24,18 +24,26 @@ import type {
   remoteControlConfigZod,
   resumeParamsZod,
   runStateZod,
+  artifactListParamsZod,
+  exposureModeZod,
+  logsParamsZod,
+  remoteVerbZod,
+  responseFormatZod,
   sendParamsZod,
+  siteStatusParamsZod,
   startParamsZod,
   statusParamsZod,
   stopParamsZod,
-  workerManifestZod,
-  artifactListParamsZod
+  workerManifestZod
 } from "./schema.js";
 
 export type AgentKind = z.infer<typeof agentKindZod>;
 export type BackendMode = z.infer<typeof backendZod>;
 export type PermissionMode = z.infer<typeof permissionModeZod>;
 export type EffortLevel = z.infer<typeof effortLevelZod>;
+export type ResponseFormat = z.infer<typeof responseFormatZod>;
+export type ExposureMode = z.infer<typeof exposureModeZod>;
+export type RemoteVerb = z.infer<typeof remoteVerbZod>;
 export type PluginConfig = z.input<typeof pluginConfigZod>;
 export type ParsedPluginConfig = z.output<typeof pluginConfigZod>;
 export type McpServerConfig = z.infer<typeof mcpServerConfigZod>;
@@ -57,6 +65,8 @@ export type CampaignRunParams = z.infer<typeof campaignRunParamsZod>;
 export type CampaignStatusParams = z.infer<typeof campaignStatusParamsZod>;
 export type ArtifactListParams = z.infer<typeof artifactListParamsZod>;
 export type CampaignActionParams = z.infer<typeof campaignActionParamsZod>;
+export type SiteStatusParams = z.infer<typeof siteStatusParamsZod>;
+export type LogsParams = z.infer<typeof logsParamsZod>;
 export type OrchestrationStepKind = z.infer<typeof orchestrationStepKindZod>;
 export type OrchestrationExecutor = z.infer<typeof orchestrationExecutorZod>;
 export type CampaignTemplate = z.infer<typeof campaignTemplateZod>;
@@ -150,7 +160,108 @@ export type ExposureRecord = {
   conversation: ConversationScope;
   allowPurePipe: boolean;
   allowedAgents: AgentKind[];
+  mode: ExposureMode;
+  allowedVerbs: RemoteVerb[];
+  allowedProjectRoots: string[];
   updatedAt: string;
+};
+
+export type SiteAgentAvailability = {
+  agent: AgentKind;
+  command: string;
+  configured: boolean;
+};
+
+export type SiteSessionSnapshot = {
+  name: string;
+  agent: AgentKind;
+  directory: string;
+  state: SessionState;
+  lastActivity: string;
+  sourceKind?: SessionSourceInfo["kind"];
+};
+
+export type SiteCampaignSnapshot = {
+  id: string;
+  name: string;
+  projectId: string;
+  workerId: string;
+  template: CampaignTemplate;
+  state: CampaignState;
+  currentStepIndex: number;
+  experimentParallelism: number;
+  lastProgressAt: string;
+  lastError?: string;
+};
+
+export type SiteWorkerSnapshot = {
+  id: string;
+  label: string;
+  labels: string[];
+  projectRoots: string[];
+  supportedSteps: OrchestrationStepKind[];
+  executors: OrchestrationExecutor[];
+  defaultAgent?: AgentKind;
+  maxConcurrentRuns: number;
+  activeCampaigns: number;
+};
+
+export type SiteStatus = {
+  siteId: string;
+  label: string;
+  backend: BackendMode;
+  pluginHealth: "ok";
+  openclawRuntime: {
+    available: boolean;
+  };
+  defaultAgent: AgentKind;
+  availableAgents: SiteAgentAvailability[];
+  orchestration: {
+    enabled: boolean;
+    allowLocalCommandExecution: boolean;
+    defaultProjectRoot?: string;
+    projectRoots: string[];
+  };
+  sessions: {
+    maxSessions: number;
+    total: number;
+    active: number;
+    streamOutputSupported: boolean;
+    logTailingSupported: boolean;
+    items?: SiteSessionSnapshot[];
+  };
+  campaigns: {
+    maxCampaigns: number;
+    total: number;
+    active: number;
+    items?: SiteCampaignSnapshot[];
+  };
+  workers: SiteWorkerSnapshot[];
+  exposures: {
+    total: number;
+    currentExposure: ExposureRecord | null;
+    items?: ExposureRecord[];
+  };
+};
+
+export type LogScope = "session" | "campaign" | "run";
+
+export type LogEntry = {
+  id: string;
+  title: string;
+  state?: string;
+  updatedAt: string;
+  text: string;
+};
+
+export type LogsResult = {
+  scope: LogScope;
+  targetId: string;
+  limitChars: number;
+  followRequested: boolean;
+  followSupported: boolean;
+  text: string;
+  entries: LogEntry[];
 };
 
 export type StoredState = {

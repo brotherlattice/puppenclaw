@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -7,6 +7,7 @@ import type { PluginLogger } from "openclaw/plugin-sdk/core";
 
 import type { ISessionManager } from "../manager/interface.js";
 import { PuppenclawError } from "../shared/errors.js";
+import type { SessionStore } from "../shared/store.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import type {
   ArtifactListParams,
@@ -14,8 +15,13 @@ import type {
   CampaignRunParams,
   CampaignStatusParams,
   ContextSyncParams,
+  LogsParams,
+  LogsResult,
   ParsedPluginConfig,
   ProjectCreateParams,
+  SiteAgentAvailability,
+  SiteStatus,
+  SiteStatusParams,
   ToolResult,
   WorkerManifestInput
 } from "../shared/types.js";
@@ -50,6 +56,32 @@ type ShellCommandResult = {
   outputText: string;
 };
 
+type StepAttemptOutcome =
+  | {
+      ok: true;
+      result: StepExecutionResult;
+      attempts: number;
+    }
+  | {
+      ok: false;
+      message: string;
+      outputText: string;
+      attempts: number;
+      failureCode?: string;
+      failureCategory: RunRecord["failureCategory"];
+    };
+
+type StepRunOutcome =
+  | {
+      ok: true;
+      run: RunRecord;
+      artifact: ArtifactRecord;
+    }
+  | {
+      ok: false;
+      run: RunRecord;
+    };
+
 type StepInput = {
   id?: string | undefined;
   title: string;
@@ -62,6 +94,8 @@ type StepInput = {
   agent?: CampaignStepRecord["agent"] | undefined;
   workingDirectory?: string | undefined;
   env?: Record<string, string> | undefined;
+  timeoutMs?: number | undefined;
+  retryLimit?: number | undefined;
 };
 
 function slug(input: string): string {
@@ -75,6 +109,30 @@ function slug(input: string): string {
 function summarizeText(value: string, max = 220): string {
   const trimmed = value.trim();
   return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max)}…`;
+}
+
+function normalizeArtifactContent(content: string): string {
+  return `${content.trimEnd()}\n`;
+}
+
+function hashTextContent(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function trimLogText(value: string, limitChars: number): string {
+  if (value.length <= limitChars) {
+    return value;
+  }
+  return `[truncated]\n${value.slice(-limitChars)}`;
+}
+
+function transcriptToLogText(
+  transcript: Array<{ role: string; text: string; createdAt: string }>
+): string {
+  return transcript
+    .map((entry) => `[${entry.createdAt}] ${entry.role}: ${entry.text}`)
+    .join("\n\n")
+    .trim();
 }
 
 function relativeArtifactPath(params: {
@@ -105,12 +163,13 @@ function describeCampaign(snapshot: CampaignStatusSnapshot): string {
 }
 
 export class OrchestratorRuntime implements IOrchestrator {
-  private readonly activeCommands = new Map<string, ChildProcessWithoutNullStreams>();
+  private readonly activeCommands = new Map<string, Set<ChildProcessWithoutNullStreams>>();
 
   constructor(
     private readonly deps: {
       config: ParsedPluginConfig;
       store: OrchestratorStore;
+      sessionStore: SessionStore;
       sessionManager: ISessionManager;
       logger: PluginLogger;
     }
@@ -218,12 +277,13 @@ export class OrchestratorRuntime implements IOrchestrator {
       extension: "json",
       title: "context-bundle"
     });
-    await this.writeArtifactFile(relativePath, JSON.stringify(bundle, null, 2));
-    const artifact = await this.recordArtifact({
+    const artifact = await this.writeTextArtifact({
       projectId: project.id,
       kind: "context",
       title: "Context Bundle",
-      relativePath
+      summary: `Context bundle with ${loaded.files.length} file(s) for ${project.name}.`,
+      relativePath,
+      content: JSON.stringify(bundle, null, 2)
     });
     this.deps.store.upsertProject({
       ...project,
@@ -243,8 +303,14 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
     const project = this.requireProject(params.projectId);
     const worker = this.requireWorker(params.workerId);
+    const experimentParallelism = params.experimentParallelism ?? 1;
+    const iterations = params.iterations ?? 1;
     this.ensureCampaignCapacity();
-    const steps = this.buildSteps(params);
+    const steps = this.buildSteps({
+      ...params,
+      experimentParallelism,
+      iterations
+    });
     this.ensureWorkerSupports(worker, project, steps);
     const now = nowIso();
     const campaignId = `camp-${randomUUID()}`;
@@ -257,9 +323,11 @@ export class OrchestratorRuntime implements IOrchestrator {
       ...(params.task != null ? { task: params.task } : {}),
       ...(params.evaluationCommand != null ? { evaluationCommand: params.evaluationCommand } : {}),
       experimentCommands: [...params.experimentCommands],
-      iterations: params.iterations,
+      experimentParallelism,
+      iterations,
       steps,
       currentStepIndex: 0,
+      lastProgressAt: now,
       createdAt: now,
       updatedAt: now,
       state: "running"
@@ -305,10 +373,12 @@ export class OrchestratorRuntime implements IOrchestrator {
       );
     }
     const approvedStepId = campaign.waitingApprovalStepId;
+    const resumedAt = nowIso();
     const resumed: CampaignSpecRecord = {
       ...campaign,
       state: "running",
-      updatedAt: nowIso()
+      lastProgressAt: resumedAt,
+      updatedAt: resumedAt
     };
     delete resumed.waitingApprovalStepId;
     this.deps.store.upsertCampaign(resumed);
@@ -321,7 +391,9 @@ export class OrchestratorRuntime implements IOrchestrator {
     const campaign = this.requireCampaign(params.campaignId);
     const active = this.activeCommands.get(campaign.id);
     if (active != null) {
-      active.kill("SIGTERM");
+      for (const child of active) {
+        child.kill("SIGTERM");
+      }
       this.activeCommands.delete(campaign.id);
     }
     if (campaign.acpSessionName != null) {
@@ -343,6 +415,18 @@ export class OrchestratorRuntime implements IOrchestrator {
     return textToolResult(`Cancelled campaign ${cancelled.name}.`, {
       campaign: cancelled
     });
+  }
+
+  async siteStatus(params?: SiteStatusParams): Promise<ToolResult> {
+    await this.prepareRuntime();
+    const status = await this.buildSiteStatus(params ?? { verbose: false });
+    return textToolResult(this.renderSiteStatus(status), status);
+  }
+
+  async logs(params: LogsParams): Promise<ToolResult> {
+    await this.prepareRuntime();
+    const result = await this.buildLogsResult(params);
+    return textToolResult(this.renderLogs(result), result);
   }
 
   private async pruneArtifacts(): Promise<void> {
@@ -560,7 +644,9 @@ export class OrchestratorRuntime implements IOrchestrator {
       approvalRequired: step.approvalRequired ?? false,
       ...(step.agent != null ? { agent: step.agent } : {}),
       ...(step.workingDirectory != null ? { workingDirectory: step.workingDirectory } : {}),
-      env: { ...(step.env ?? {}) }
+      env: { ...(step.env ?? {}) },
+      ...(step.timeoutMs != null ? { timeoutMs: step.timeoutMs } : {}),
+      retryLimit: step.retryLimit ?? 0
     };
   }
 
@@ -571,108 +657,315 @@ export class OrchestratorRuntime implements IOrchestrator {
     let current = campaign;
     const project = this.requireProject(campaign.projectId);
 
-    for (let index = current.currentStepIndex; index < current.steps.length; index += 1) {
+    for (let index = current.currentStepIndex; index < current.steps.length;) {
+      current = this.requireCampaign(current.id);
       const step = current.steps[index];
       if (step == null) {
         break;
       }
       if (current.state === "cancelled") {
-        break;
+        return this.requireSnapshot(current.id);
       }
       if (step.approvalRequired && approvedStepId !== step.id) {
+        const waitingAt = nowIso();
         current = {
           ...current,
           state: "waiting_approval",
           waitingApprovalStepId: step.id,
           currentStepIndex: index,
-          updatedAt: nowIso()
+          lastProgressAt: waitingAt,
+          updatedAt: waitingAt
         };
+        delete current.currentRunId;
         this.deps.store.upsertCampaign(current);
         return this.requireSnapshot(current.id);
       }
 
-      const runId = `run-${randomUUID()}`;
-      const baseRun: RunRecord = {
-        id: runId,
-        campaignId: current.id,
-        projectId: current.projectId,
-        workerId: current.workerId,
-        stepId: step.id,
-        stepTitle: step.title,
-        kind: step.kind,
-        executor: step.executor,
-        state: "running",
-        startedAt: nowIso(),
-        updatedAt: nowIso()
-      };
-      this.deps.store.upsertRun(baseRun);
-      try {
-        const result =
-          step.kind === "research" && this.deps.config.orchestration.gptResearcherCommand != null
-            ? await this.executeResearchCommandStep(current, project, step)
-            : step.executor === "acp"
-              ? await this.executeAcpStep(current, project, step)
-              : await this.executeCommandStep(current, project, step);
-        const relativePath = relativeArtifactPath({
-          projectId: current.projectId,
-          campaignId: current.id,
-          runId,
-          extension: "txt",
-          title: step.title
-        });
-        await this.writeArtifactFile(relativePath, result.outputText);
-        const artifact = await this.recordArtifact({
-          projectId: current.projectId,
-          campaignId: current.id,
-          runId,
-          kind: result.artifactKind,
-          title: result.artifactTitle,
-          relativePath
-        });
-        this.deps.store.upsertRun({
-          ...baseRun,
-          state: "completed",
-          updatedAt: nowIso(),
-          finishedAt: nowIso(),
-          summary: result.summary,
-          outputText: result.outputText,
-          ...(result.exitCode != null ? { exitCode: result.exitCode } : {}),
-          ...(result.command != null ? { command: result.command } : {}),
-          ...(result.sessionName != null ? { sessionName: result.sessionName } : {})
-        });
-        current = {
-          ...current,
-          currentStepIndex: index + 1,
-          ...(result.sessionName != null ? { acpSessionName: result.sessionName } : {}),
-          updatedAt: artifact.createdAt,
-          state: index + 1 >= current.steps.length ? "completed" : "running"
-        };
-        delete current.waitingApprovalStepId;
-        delete current.lastError;
-        this.deps.store.upsertCampaign(current);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.deps.store.upsertRun({
-          ...baseRun,
-          state: "failed",
-          updatedAt: nowIso(),
-          finishedAt: nowIso(),
-          summary: message,
-          outputText: message
-        });
-        current = {
-          ...current,
-          state: "failed",
-          lastError: message,
-          currentStepIndex: index,
-          updatedAt: nowIso()
-        };
-        this.deps.store.upsertCampaign(current);
+      const batch = this.collectParallelExperimentBatch(current, index);
+      if (batch.length > 1) {
+        const outcomes = await Promise.all(
+          batch.map(({ step: batchStep, stepIndex }) =>
+            this.executeStepRun(current, project, batchStep, stepIndex)
+          )
+        );
+        const failed = outcomes.find((outcome) => !outcome.ok);
+        if (failed != null && !failed.ok) {
+          current = this.failCampaign(current, index, failed.run);
+          return this.requireSnapshot(current.id);
+        }
+        const completed = outcomes.filter((outcome): outcome is Extract<StepRunOutcome, { ok: true }> => outcome.ok);
+        const updatedAt = completed.reduce(
+          (latest, outcome) => (outcome.artifact.createdAt > latest ? outcome.artifact.createdAt : latest),
+          current.updatedAt
+        );
+        current = this.completeCampaignStep(
+          current,
+          index + completed.length,
+          updatedAt,
+          completed.at(-1)?.run.sessionName
+        );
+        index = current.currentStepIndex;
+        continue;
+      }
+
+      const outcome = await this.executeStepRun(current, project, step, index);
+      if (!outcome.ok) {
+        current = this.failCampaign(current, index, outcome.run);
         return this.requireSnapshot(current.id);
       }
+      current = this.completeCampaignStep(
+        current,
+        index + 1,
+        outcome.artifact.createdAt,
+        outcome.run.sessionName
+      );
+      index = current.currentStepIndex;
     }
 
     return this.requireSnapshot(current.id);
+  }
+
+  private collectParallelExperimentBatch(
+    campaign: CampaignSpecRecord,
+    startIndex: number
+  ): Array<{ step: CampaignStepRecord; stepIndex: number }> {
+    if (campaign.experimentParallelism <= 1) {
+      return [];
+    }
+    const batch: Array<{ step: CampaignStepRecord; stepIndex: number }> = [];
+    for (
+      let index = startIndex;
+      index < campaign.steps.length && batch.length < campaign.experimentParallelism;
+      index += 1
+    ) {
+      const step = campaign.steps[index];
+      if (
+        step == null ||
+        step.kind !== "experiment" ||
+        step.executor !== "command" ||
+        step.approvalRequired
+      ) {
+        break;
+      }
+      batch.push({ step, stepIndex: index });
+    }
+    return batch;
+  }
+
+  private async executeStepRun(
+    campaign: CampaignSpecRecord,
+    project: ProjectRecord,
+    step: CampaignStepRecord,
+    stepIndex: number
+  ): Promise<StepRunOutcome> {
+    const startedAt = nowIso();
+    const baseRun: RunRecord = {
+      id: `run-${randomUUID()}`,
+      campaignId: campaign.id,
+      projectId: campaign.projectId,
+      workerId: campaign.workerId,
+      stepId: step.id,
+      stepTitle: step.title,
+      stepIndex,
+      kind: step.kind,
+      executor: step.executor,
+      state: "running",
+      startedAt,
+      updatedAt: startedAt,
+      lastProgressAt: startedAt,
+      attempts: 0
+    };
+    this.deps.store.upsertRun(baseRun);
+    this.markCampaignRunActive(campaign, stepIndex, baseRun.id, startedAt);
+
+    const attempt = await this.executeStepWithRetries(campaign, project, step, baseRun);
+    if (!attempt.ok) {
+      const failedAt = nowIso();
+      const run: RunRecord = {
+        ...baseRun,
+        state: "failed",
+        updatedAt: failedAt,
+        lastProgressAt: failedAt,
+        finishedAt: failedAt,
+        summary: attempt.message,
+        outputText: attempt.outputText,
+        attempts: attempt.attempts,
+        ...(attempt.failureCode != null ? { failureCode: attempt.failureCode } : {}),
+        ...(attempt.failureCategory != null ? { failureCategory: attempt.failureCategory } : {})
+      };
+      this.deps.store.upsertRun(run);
+      return { ok: false, run };
+    }
+
+    const relativePath = relativeArtifactPath({
+      projectId: campaign.projectId,
+      campaignId: campaign.id,
+      runId: baseRun.id,
+      extension: "txt",
+      title: step.title
+    });
+    const artifact = await this.writeTextArtifact({
+      projectId: campaign.projectId,
+      campaignId: campaign.id,
+      runId: baseRun.id,
+      stepId: step.id,
+      kind: attempt.result.artifactKind,
+      title: attempt.result.artifactTitle,
+      summary: attempt.result.summary,
+      relativePath,
+      content: attempt.result.outputText
+    });
+    const run: RunRecord = {
+      ...baseRun,
+      state: "completed",
+      updatedAt: artifact.createdAt,
+      lastProgressAt: artifact.createdAt,
+      finishedAt: artifact.createdAt,
+      summary: attempt.result.summary,
+      outputText: attempt.result.outputText,
+      attempts: attempt.attempts,
+      ...(attempt.result.exitCode != null ? { exitCode: attempt.result.exitCode } : {}),
+      ...(attempt.result.command != null ? { command: attempt.result.command } : {}),
+      ...(attempt.result.sessionName != null ? { sessionName: attempt.result.sessionName } : {})
+    };
+    this.deps.store.upsertRun(run);
+    return {
+      ok: true,
+      run,
+      artifact
+    };
+  }
+
+  private async executeStepWithRetries(
+    campaign: CampaignSpecRecord,
+    project: ProjectRecord,
+    step: CampaignStepRecord,
+    baseRun: RunRecord
+  ): Promise<StepAttemptOutcome> {
+    let attempts = 0;
+    while (attempts < step.retryLimit + 1) {
+      attempts += 1;
+      const progressAt = nowIso();
+      this.deps.store.upsertRun({
+        ...baseRun,
+        state: "running",
+        updatedAt: progressAt,
+        lastProgressAt: progressAt,
+        attempts,
+        ...(attempts > 1 ? { summary: `Retry ${attempts} of ${step.retryLimit + 1}` } : {})
+      });
+      try {
+        return {
+          ok: true,
+          attempts,
+          result: await this.executeStep(campaign, project, step)
+        };
+      } catch (error) {
+        const failure = this.describeStepFailure(error);
+        if (attempts >= step.retryLimit + 1) {
+          return {
+            ok: false,
+            attempts,
+            message: failure.message,
+            outputText: failure.outputText,
+            ...(failure.failureCode != null ? { failureCode: failure.failureCode } : {}),
+            failureCategory: failure.failureCategory
+          };
+        }
+        const retryAt = nowIso();
+        this.deps.store.upsertRun({
+          ...baseRun,
+          state: "running",
+          updatedAt: retryAt,
+          lastProgressAt: retryAt,
+          attempts,
+          summary: `Retrying after failure: ${failure.message}`,
+          outputText: failure.outputText,
+          ...(failure.failureCode != null ? { failureCode: failure.failureCode } : {}),
+          ...(failure.failureCategory != null ? { failureCategory: failure.failureCategory } : {})
+        });
+      }
+    }
+    return {
+      ok: false,
+      attempts,
+      message: "Step execution aborted unexpectedly.",
+      outputText: "Step execution aborted unexpectedly.",
+      failureCategory: "unknown"
+    };
+  }
+
+  private async executeStep(
+    campaign: CampaignSpecRecord,
+    project: ProjectRecord,
+    step: CampaignStepRecord
+  ): Promise<StepExecutionResult> {
+    if (step.kind === "research" && this.deps.config.orchestration.gptResearcherCommand != null) {
+      return this.executeResearchCommandStep(campaign, project, step);
+    }
+    if (step.executor === "acp") {
+      return this.executeAcpStep(campaign, project, step);
+    }
+    return this.executeCommandStep(campaign, project, step);
+  }
+
+  private markCampaignRunActive(
+    campaign: CampaignSpecRecord,
+    stepIndex: number,
+    runId: string,
+    updatedAt: string
+  ): void {
+    const next: CampaignSpecRecord = {
+      ...campaign,
+      state: "running",
+      currentStepIndex: stepIndex,
+      currentRunId: runId,
+      lastProgressAt: updatedAt,
+      updatedAt
+    };
+    delete next.waitingApprovalStepId;
+    this.deps.store.upsertCampaign(next);
+  }
+
+  private completeCampaignStep(
+    campaign: CampaignSpecRecord,
+    nextStepIndex: number,
+    updatedAt: string,
+    sessionName?: string
+  ): CampaignSpecRecord {
+    const next: CampaignSpecRecord = {
+      ...campaign,
+      currentStepIndex: nextStepIndex,
+      lastProgressAt: updatedAt,
+      updatedAt,
+      state: nextStepIndex >= campaign.steps.length ? "completed" : "running",
+      ...(sessionName != null ? { acpSessionName: sessionName } : {})
+    };
+    delete next.waitingApprovalStepId;
+    delete next.lastError;
+    delete next.currentRunId;
+    this.deps.store.upsertCampaign(next);
+    return next;
+  }
+
+  private failCampaign(
+    campaign: CampaignSpecRecord,
+    stepIndex: number,
+    run: RunRecord
+  ): CampaignSpecRecord {
+    const updatedAt = run.finishedAt ?? nowIso();
+    const next: CampaignSpecRecord = {
+      ...campaign,
+      state: "failed",
+      lastError: run.summary ?? run.outputText ?? "Campaign step failed.",
+      currentStepIndex: stepIndex,
+      currentRunId: run.id,
+      lastProgressAt: updatedAt,
+      updatedAt
+    };
+    delete next.waitingApprovalStepId;
+    this.deps.store.upsertCampaign(next);
+    return next;
   }
 
   private async executeAcpStep(
@@ -722,7 +1015,8 @@ export class OrchestratorRuntime implements IOrchestrator {
       campaignId: campaign.id,
       command: step.command ?? "",
       cwd,
-      env: step.env
+      env: step.env,
+      ...(step.timeoutMs != null ? { timeoutMs: step.timeoutMs } : {})
     });
     const outputText = result.outputText;
     if (result.exitCode !== 0) {
@@ -764,6 +1058,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         PUPPENCLAW_STEP_TITLE: step.title,
         ...(campaign.task != null ? { PUPPENCLAW_TASK: campaign.task } : {})
       },
+      ...(step.timeoutMs != null ? { timeoutMs: step.timeoutMs } : {}),
       stdinText: await this.buildStepPrompt(project, campaign, step)
     });
     if (result.exitCode !== 0) {
@@ -822,20 +1117,54 @@ export class OrchestratorRuntime implements IOrchestrator {
     return JSON.parse(raw) as ProjectContextBundle;
   }
 
-  private async writeArtifactFile(relativePath: string, content: string): Promise<void> {
+  private async writeArtifactFile(relativePath: string, content: string): Promise<{
+    sizeBytes: number;
+    sha256: string;
+  }> {
     const targetPath = join(this.deps.store.resolveArtifactsDir(), relativePath);
     await ensureDir(dirname(targetPath));
-    await writeFile(targetPath, `${content.trimEnd()}\n`, "utf8");
+    const normalized = normalizeArtifactContent(content);
+    await writeFile(targetPath, normalized, "utf8");
+    return {
+      sizeBytes: Buffer.byteLength(normalized, "utf8"),
+      sha256: hashTextContent(normalized)
+    };
   }
 
-  private async recordArtifact(params: Omit<ArtifactRecord, "id" | "createdAt" | "sizeBytes">): Promise<ArtifactRecord> {
+  private async writeTextArtifact(params: {
+    projectId: string;
+    campaignId?: string;
+    runId?: string;
+    stepId?: string;
+    kind: ArtifactRecord["kind"];
+    title: string;
+    summary?: string;
+    relativePath: string;
+    content: string;
+  }): Promise<ArtifactRecord> {
+    const file = await this.writeArtifactFile(params.relativePath, params.content);
     const artifact: ArtifactRecord = {
       id: `art-${randomUUID()}`,
       createdAt: nowIso(),
-      sizeBytes: 0,
-      ...params
+      projectId: params.projectId,
+      ...(params.campaignId != null ? { campaignId: params.campaignId } : {}),
+      ...(params.runId != null ? { runId: params.runId } : {}),
+      ...(params.stepId != null ? { stepId: params.stepId } : {}),
+      siteId: this.siteId,
+      kind: params.kind,
+      title: params.title,
+      ...(params.summary != null ? { summary: params.summary } : {}),
+      relativePath: params.relativePath,
+      sizeBytes: file.sizeBytes,
+      sha256: file.sha256,
+      files: [
+        {
+          relativePath: params.relativePath,
+          sizeBytes: file.sizeBytes,
+          sha256: file.sha256
+        }
+      ]
     };
-    artifact.sizeBytes = await this.deps.store.captureArtifactSize(artifact.relativePath);
     this.deps.store.upsertArtifact(artifact);
     return artifact;
   }
@@ -846,6 +1175,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     cwd: string;
     env?: Record<string, string>;
     stdinText?: string;
+    timeoutMs?: number;
   }): Promise<ShellCommandResult> {
     const child = spawn("bash", ["-lc", params.command], {
       cwd: params.cwd,
@@ -854,7 +1184,9 @@ export class OrchestratorRuntime implements IOrchestrator {
         ...params.env
       }
     });
-    this.activeCommands.set(params.campaignId, child);
+    const children = this.activeCommands.get(params.campaignId) ?? new Set<ChildProcessWithoutNullStreams>();
+    children.add(child);
+    this.activeCommands.set(params.campaignId, children);
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
@@ -863,20 +1195,291 @@ export class OrchestratorRuntime implements IOrchestrator {
       child.stdin.write(params.stdinText);
     }
     child.stdin.end();
+    let timedOut = false;
+    const timeoutHandle = params.timeoutMs != null
+      ? setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGTERM");
+        }, params.timeoutMs)
+      : null;
     const exitCode = await new Promise<number>((resolveExit, reject) => {
       child.once("error", reject);
       child.once("close", (code) => resolveExit(code ?? 0));
     }).finally(() => {
-      this.activeCommands.delete(params.campaignId);
+      if (timeoutHandle != null) {
+        clearTimeout(timeoutHandle);
+      }
+      children.delete(child);
+      if (children.size === 0) {
+        this.activeCommands.delete(params.campaignId);
+      }
     });
     const stdoutText = Buffer.concat(stdout).toString("utf8").trim();
     const stderrText = Buffer.concat(stderr).toString("utf8").trim();
+    const outputText = [stdoutText, stderrText].filter(Boolean).join("\n").trim();
+    if (timedOut) {
+      throw new PuppenclawError(
+        "COMMAND_STEP_TIMEOUT",
+        `Command step timed out after ${params.timeoutMs}ms: ${summarizeText(outputText || params.command, 400)}`
+      );
+    }
     return {
       exitCode,
       stdout: stdoutText,
       stderr: stderrText,
-      outputText: [stdoutText, stderrText].filter(Boolean).join("\n").trim()
+      outputText
     };
+  }
+
+  private async buildSiteStatus(params: SiteStatusParams): Promise<SiteStatus> {
+    const sessions = this.deps.sessionStore.listSessions();
+    const campaigns = this.deps.store.listCampaigns();
+    const workers = this.deps.store.listWorkers();
+    const exposures = this.deps.sessionStore.listExposures();
+    return {
+      siteId: this.siteId,
+      label: this.deps.config.orchestration.localWorker.label,
+      backend: this.deps.config.backend,
+      pluginHealth: "ok",
+      openclawRuntime: {
+        available: true
+      },
+      defaultAgent: this.deps.config.defaultAgent,
+      availableAgents: this.resolveAvailableAgents(),
+      orchestration: {
+        enabled: this.deps.config.orchestration.enabled,
+        allowLocalCommandExecution: this.deps.config.orchestration.allowLocalCommandExecution,
+        ...(this.deps.config.orchestration.defaultProjectRoot != null
+          ? { defaultProjectRoot: this.deps.config.orchestration.defaultProjectRoot }
+          : {}),
+        projectRoots: this.collectProjectRoots(workers)
+      },
+      sessions: {
+        maxSessions: this.deps.config.maxSessions,
+        total: sessions.length,
+        active: sessions.filter((session) => ["idle", "running", "waiting_input"].includes(session.state)).length,
+        streamOutputSupported: this.deps.config.streamOutput,
+        logTailingSupported: false,
+        ...(params.verbose
+          ? {
+              items: sessions.map((session) => ({
+                name: session.name,
+                agent: session.agent,
+                directory: session.directory,
+                state: session.state,
+                lastActivity: session.lastActivity,
+                ...(session.source != null ? { sourceKind: session.source.kind } : {})
+              }))
+            }
+          : {})
+      },
+      campaigns: {
+        maxCampaigns: this.deps.config.orchestration.maxCampaigns,
+        total: campaigns.length,
+        active: campaigns.filter((campaign) =>
+          campaign.state === "draft" ||
+          campaign.state === "running" ||
+          campaign.state === "waiting_approval"
+        ).length,
+        ...(params.verbose
+          ? {
+              items: campaigns.map((campaign) => ({
+                id: campaign.id,
+                name: campaign.name,
+                projectId: campaign.projectId,
+                workerId: campaign.workerId,
+                template: campaign.template,
+                state: campaign.state,
+                currentStepIndex: campaign.currentStepIndex,
+                experimentParallelism: campaign.experimentParallelism,
+                lastProgressAt: campaign.lastProgressAt,
+                ...(campaign.lastError != null ? { lastError: campaign.lastError } : {})
+              }))
+            }
+          : {})
+      },
+      workers: workers.map((worker) => ({
+        id: worker.id,
+        label: worker.label,
+        labels: worker.labels,
+        projectRoots: worker.projectRoots,
+        supportedSteps: worker.supportedSteps,
+        executors: worker.executors,
+        ...(worker.defaultAgent != null ? { defaultAgent: worker.defaultAgent } : {}),
+        maxConcurrentRuns: worker.maxConcurrentRuns,
+        activeCampaigns: campaigns.filter((campaign) =>
+          campaign.workerId === worker.id &&
+          (campaign.state === "draft" ||
+            campaign.state === "running" ||
+            campaign.state === "waiting_approval")
+        ).length
+      })),
+      exposures: {
+        total: exposures.length,
+        currentExposure: null,
+        ...(params.verbose ? { items: exposures } : {})
+      }
+    };
+  }
+
+  private async buildLogsResult(params: LogsParams): Promise<LogsResult> {
+    if (params.sessionName != null) {
+      const session = this.deps.sessionStore.getSession(params.sessionName);
+      if (session == null) {
+        throw new PuppenclawError("UNKNOWN_SESSION", `Unknown session ${params.sessionName}.`);
+      }
+      const text = trimLogText(transcriptToLogText(session.transcript), params.limitChars);
+      return {
+        scope: "session",
+        targetId: session.name,
+        limitChars: params.limitChars,
+        followRequested: params.follow,
+        followSupported: false,
+        text,
+        entries: [
+          {
+            id: session.name,
+            title: `${session.name} (${session.agent})`,
+            state: session.state,
+            updatedAt: session.lastActivity,
+            text
+          }
+        ]
+      };
+    }
+
+    if (params.runId != null) {
+      const run = this.deps.store.getRun(params.runId);
+      if (run == null) {
+        throw new PuppenclawError("UNKNOWN_RUN", `Unknown run ${params.runId}.`);
+      }
+      const text = trimLogText(run.outputText ?? run.summary ?? "", params.limitChars);
+      return {
+        scope: "run",
+        targetId: run.id,
+        limitChars: params.limitChars,
+        followRequested: params.follow,
+        followSupported: false,
+        text,
+        entries: [
+          {
+            id: run.id,
+            title: run.stepTitle,
+            state: run.state,
+            updatedAt: run.updatedAt,
+            text
+          }
+        ]
+      };
+    }
+
+    const campaign = this.requireCampaign(params.campaignId as string);
+    const runs = this.deps.store.listRuns(campaign.id);
+    const entries = runs.map((run) => {
+      const text = trimLogText(run.outputText ?? run.summary ?? "", params.limitChars);
+      return {
+        id: run.id,
+        title: `${run.stepTitle} (#${run.stepIndex + 1})`,
+        state: run.state,
+        updatedAt: run.updatedAt,
+        text
+      };
+    });
+    const combined = trimLogText(
+      entries
+        .map((entry) => `## ${entry.title}\n${entry.text}`)
+        .join("\n\n"),
+      params.limitChars
+    );
+    return {
+      scope: "campaign",
+      targetId: campaign.id,
+      limitChars: params.limitChars,
+      followRequested: params.follow,
+      followSupported: false,
+      text: combined,
+      entries
+    };
+  }
+
+  private renderSiteStatus(status: SiteStatus): string {
+    return [
+      `Site ${status.label} (${status.siteId})`,
+      `backend: ${status.backend}`,
+      `sessions: ${status.sessions.active}/${status.sessions.total} active (max ${status.sessions.maxSessions})`,
+      `campaigns: ${status.campaigns.active}/${status.campaigns.total} active (max ${status.campaigns.maxCampaigns})`,
+      `workers: ${status.workers.length}`,
+      `exposures: ${status.exposures.total}`
+    ].join("\n");
+  }
+
+  private renderLogs(result: LogsResult): string {
+    return [
+      `Logs for ${result.scope} ${result.targetId}`,
+      result.text || "[no log output recorded]"
+    ].join("\n\n");
+  }
+
+  private resolveAvailableAgents(): SiteAgentAvailability[] {
+    return (["claude", "codex"] as const).map((agent) => ({
+      agent,
+      command:
+        this.deps.config.agentCommands[agent] ??
+        this.deps.config.acpxCommand ??
+        (agent === "claude"
+          ? "npx -y @zed-industries/claude-agent-acp"
+          : "npx @zed-industries/codex-acp"),
+      configured: true
+    }));
+  }
+
+  private collectProjectRoots(workers: WorkerRecord[]): string[] {
+    const projectRoots = new Set<string>();
+    for (const worker of workers) {
+      for (const root of worker.projectRoots) {
+        projectRoots.add(root);
+      }
+    }
+    if (
+      projectRoots.size === 0 &&
+      this.deps.config.orchestration.defaultProjectRoot != null
+    ) {
+      projectRoots.add(resolve(this.deps.config.orchestration.defaultProjectRoot));
+    }
+    return [...projectRoots];
+  }
+
+  private describeStepFailure(error: unknown): {
+    message: string;
+    outputText: string;
+    failureCode?: string;
+    failureCategory: RunRecord["failureCategory"];
+  } {
+    if (error instanceof PuppenclawError) {
+      return {
+        message: error.message,
+        outputText: error.message,
+        failureCode: error.code,
+        failureCategory:
+          error.code.includes("TIMEOUT")
+            ? "timeout"
+            : error.code.includes("VALID")
+              ? "validation"
+              : error.code.includes("COMMAND") || error.code.includes("RESEARCH")
+                ? "execution"
+                : "unknown"
+      };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      message,
+      outputText: message,
+      failureCategory: "unknown"
+    };
+  }
+
+  private get siteId(): string {
+    return this.deps.config.orchestration.localWorker.id;
   }
 
   private requireSnapshot(campaignId: string): CampaignStatusSnapshot {

@@ -1,6 +1,6 @@
 import { join } from "node:path";
 
-import { SESSION_STORE_VERSION } from "./schema.js";
+import { REMOTE_CONTROL_VERBS, SESSION_STORE_VERSION } from "./schema.js";
 import type { ExposureRecord, SessionInfo, StoredState } from "./types.js";
 import { nowIso, readJsonFile, writeJsonFileAtomic } from "./utils.js";
 
@@ -67,20 +67,21 @@ export class SessionStore {
   }
 
   getExposure(bindingId: string): ExposureRecord | null {
-    return this.state.exposures[bindingId] ?? null;
+    const exposure = this.state.exposures[bindingId];
+    return exposure != null ? normalizeExposureRecord(exposure) : null;
   }
 
   listExposures(): ExposureRecord[] {
-    return Object.values(this.state.exposures).sort((left, right) =>
-      right.updatedAt.localeCompare(left.updatedAt)
-    );
+    return Object.values(this.state.exposures)
+      .map((exposure) => normalizeExposureRecord(exposure))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
   async upsertExposure(exposure: ExposureRecord): Promise<void> {
-    this.state.exposures[exposure.bindingId] = {
+    this.state.exposures[exposure.bindingId] = normalizeExposureRecord({
       ...exposure,
       updatedAt: exposure.updatedAt || nowIso()
-    };
+    });
     await this.flush();
   }
 
@@ -96,4 +97,17 @@ export class SessionStore {
   async flush(): Promise<void> {
     await writeJsonFileAtomic(this.statePath, this.state);
   }
+}
+
+function normalizeExposureRecord(exposure: Partial<ExposureRecord> & Pick<ExposureRecord, "bindingId" | "conversation">): ExposureRecord {
+  return {
+    bindingId: exposure.bindingId,
+    conversation: exposure.conversation,
+    allowPurePipe: exposure.allowPurePipe ?? false,
+    allowedAgents: exposure.allowedAgents ?? ["claude", "codex"],
+    mode: exposure.mode ?? "execute",
+    allowedVerbs: exposure.allowedVerbs ?? [...REMOTE_CONTROL_VERBS],
+    allowedProjectRoots: exposure.allowedProjectRoots ?? [],
+    updatedAt: exposure.updatedAt ?? nowIso()
+  };
 }

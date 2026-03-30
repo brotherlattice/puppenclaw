@@ -51,6 +51,8 @@ export type CampaignStepRecord = {
   agent?: AgentKind;
   workingDirectory?: string;
   env: Record<string, string>;
+  timeoutMs?: number;
+  retryLimit: number;
 };
 
 export type CampaignSpecRecord = {
@@ -62,12 +64,15 @@ export type CampaignSpecRecord = {
   task?: string;
   evaluationCommand?: string;
   experimentCommands: string[];
+  experimentParallelism: number;
   iterations: number;
   steps: CampaignStepRecord[];
   acpSessionName?: string;
   currentStepIndex: number;
+  currentRunId?: string;
   waitingApprovalStepId?: string;
   lastError?: string;
+  lastProgressAt: string;
   createdAt: string;
   updatedAt: string;
   state: CampaignState;
@@ -80,17 +85,28 @@ export type RunRecord = {
   workerId: string;
   stepId: string;
   stepTitle: string;
+  stepIndex: number;
   kind: OrchestrationStepKind;
   executor: OrchestrationExecutor;
   state: RunState;
   startedAt: string;
   updatedAt: string;
+  lastProgressAt: string;
   finishedAt?: string;
   summary?: string;
   outputText?: string;
   exitCode?: number;
   command?: string;
   sessionName?: string;
+  attempts: number;
+  failureCode?: string;
+  failureCategory?: "timeout" | "execution" | "validation" | "unknown";
+};
+
+export type ArtifactFileRecord = {
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
 };
 
 export type ArtifactRecord = {
@@ -98,11 +114,28 @@ export type ArtifactRecord = {
   projectId: string;
   campaignId?: string;
   runId?: string;
+  stepId?: string;
+  siteId: string;
   kind: "context" | "report" | "command-output" | "research-dossier";
   title: string;
+  summary?: string;
   relativePath: string;
   createdAt: string;
   sizeBytes: number;
+  sha256: string;
+  files?: ArtifactFileRecord[];
+};
+
+export type CampaignProgressSnapshot = {
+  totalSteps: number;
+  completedSteps: number;
+  failedSteps: number;
+  currentStepIndex: number;
+  experimentParallelism: number;
+  currentStepId?: string;
+  currentStepTitle?: string;
+  currentRunId?: string;
+  lastProgressAt: string;
 };
 
 export type CampaignStatusSnapshot = {
@@ -111,6 +144,7 @@ export type CampaignStatusSnapshot = {
   worker: WorkerRecord | null;
   runs: RunRecord[];
   artifacts: ArtifactRecord[];
+  progress: CampaignProgressSnapshot;
 };
 
 export interface IOrchestrator {
@@ -122,4 +156,6 @@ export interface IOrchestrator {
   listArtifacts(params: import("../shared/types.js").ArtifactListParams): Promise<import("../shared/types.js").ToolResult>;
   approve(params: import("../shared/types.js").CampaignActionParams): Promise<import("../shared/types.js").ToolResult>;
   cancel(params: import("../shared/types.js").CampaignActionParams): Promise<import("../shared/types.js").ToolResult>;
+  siteStatus(params?: import("../shared/types.js").SiteStatusParams): Promise<import("../shared/types.js").ToolResult>;
+  logs(params: import("../shared/types.js").LogsParams): Promise<import("../shared/types.js").ToolResult>;
 }

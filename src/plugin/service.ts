@@ -120,6 +120,14 @@ export async function getPuppenclawOrchestrator(): Promise<IOrchestrator> {
   return state.orchestrator;
 }
 
+export async function getPuppenclawOrchestratorStore(): Promise<OrchestratorStore> {
+  await ensureInitialized();
+  if (state.orchestratorStore == null) {
+    throw new Error("Puppenclaw orchestrator store is unavailable");
+  }
+  return state.orchestratorStore;
+}
+
 export function getConfiguredPluginConfig(): ParsedPluginConfig {
   return state.pluginConfig ?? readPluginConfig({});
 }
@@ -178,6 +186,7 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
             config: getConfiguredPluginConfig(),
             logger,
             store: state.orchestratorStore,
+            sessionStore: state.store,
             sessionManager: state.manager
           });
   })();

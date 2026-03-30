@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 import type {
   OpenClawPluginApi,
   PluginCommandContext,
@@ -13,8 +15,10 @@ import {
   costParamsZod,
   exposeParamsZod,
   forkParamsZod,
+  logsParamsZod,
   projectCreateParamsZod,
   resumeParamsZod,
+  siteStatusParamsZod,
   sendParamsZod,
   startParamsZod,
   statusParamsZod,
@@ -26,6 +30,7 @@ import type {
   CommandParseResult,
   ConversationScope,
   ExposureRecord,
+  RemoteVerb,
   SessionInfo
 } from "../shared/types.js";
 import { nowIso } from "../shared/utils.js";
@@ -35,6 +40,7 @@ import {
   getConfiguredPluginConfig,
   getPuppenclawManager,
   getPuppenclawOrchestrator,
+  getPuppenclawOrchestratorStore,
   getPuppenclawOutputRouter,
   getPuppenclawStore,
   patchStoredSession
@@ -75,6 +81,42 @@ function flattenResultText(result: { content: Array<{ text: string }> }): string
   return summarizeToolResultText(result);
 }
 
+const READ_ONLY_VERBS = new Set<RemoteVerb>([
+  "campaign-status",
+  "artifacts",
+  "site-status",
+  "logs",
+  "status",
+  "cost"
+]);
+
+function renderCommandResult(
+  result: { content: Array<{ text: string }>; details: unknown },
+  format?: "text" | "json",
+  streamedText?: string
+): string {
+  if (format === "json") {
+    return JSON.stringify(result.details, null, 2);
+  }
+  return [streamedText?.trim(), flattenResultText(result)].filter(Boolean).join("\n\n");
+}
+
+function renderCommandError(error: unknown, format?: "text" | "json"): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (format === "json") {
+    return JSON.stringify({ error: message }, null, 2);
+  }
+  return message;
+}
+
+function rootAllowed(exposure: ExposureRecord, projectRoot: string | null | undefined): boolean {
+  if (projectRoot == null || exposure.allowedProjectRoots.length === 0) {
+    return true;
+  }
+  const resolvedProjectRoot = resolve(projectRoot);
+  return exposure.allowedProjectRoots.some((root) => resolvedProjectRoot.startsWith(resolve(root)));
+}
+
 function renderHelp(): string {
   return [
     "Usage: /puppenclaw <verb> [json]",
@@ -94,9 +136,11 @@ function renderHelp(): string {
     "artifacts {\"campaignId\":\"camp-...\"}",
     "approve {\"campaignId\":\"camp-...\"}",
     "cancel {\"campaignId\":\"camp-...\"}",
+    "site-status {\"verbose\":true}",
+    "logs {\"campaignId\":\"camp-...\",\"limitChars\":12000}",
     "bind",
     "unbind",
-    "expose {\"agents\":[\"claude\",\"codex\"],\"allowPurePipe\":true}",
+    "expose {\"agents\":[\"claude\",\"codex\"],\"allowPurePipe\":true,\"mode\":\"execute\",\"allowedVerbs\":[\"campaign\",\"campaign-status\",\"logs\"],\"allowedProjectRoots\":[\"/workspace\"]}",
     "hide"
   ].join("\n");
 }
@@ -183,8 +227,15 @@ async function requireBinding(ctx: PluginCommandContext): Promise<PluginConversa
 
 async function requirePurePipeExposure(
   ctx: PluginCommandContext,
-  agent: AgentKind | null
-): Promise<PluginConversationBinding> {
+  params: {
+    verb: RemoteVerb;
+    agent?: AgentKind | null;
+    projectRoot?: string | null;
+  }
+): Promise<{
+  binding: PluginConversationBinding;
+  exposure: ExposureRecord;
+}> {
   const config = getConfiguredPluginConfig();
   if (!config.remoteControl.purePipe.enabled) {
     throw new Error("Pure-pipe remote control is disabled in Puppenclaw config.");
@@ -197,10 +248,19 @@ async function requirePurePipeExposure(
       "This remote conversation has not been exposed for deterministic Puppenclaw control."
     );
   }
-  if (agent != null && !exposure.allowedAgents.includes(agent)) {
-    throw new Error(`Pure-pipe control is not exposed for agent ${agent}.`);
+  if (!exposure.allowedVerbs.includes(params.verb)) {
+    throw new Error(`Pure-pipe control is not exposed for verb ${params.verb}.`);
   }
-  return binding;
+  if (!READ_ONLY_VERBS.has(params.verb) && exposure.mode !== "execute") {
+    throw new Error(`Pure-pipe control is read-only for binding ${binding.bindingId}.`);
+  }
+  if (params.agent != null && !exposure.allowedAgents.includes(params.agent)) {
+    throw new Error(`Pure-pipe control is not exposed for agent ${params.agent}.`);
+  }
+  if (!rootAllowed(exposure, params.projectRoot)) {
+    throw new Error(`Pure-pipe control is not exposed for project root ${params.projectRoot}.`);
+  }
+  return { binding, exposure };
 }
 
 async function annotateCommandSession(binding: PluginConversationBinding, name: string): Promise<void> {
@@ -227,6 +287,33 @@ async function resolveSessionForRemoteVerb(name: string): Promise<SessionInfo> {
     throw new Error(`Unknown session ${name}.`);
   }
   return session;
+}
+
+async function resolveProjectRoot(projectId: string): Promise<string> {
+  const store = await getPuppenclawOrchestratorStore();
+  const project = store.getProject(projectId);
+  if (project == null) {
+    throw new Error(`Unknown project ${projectId}.`);
+  }
+  return project.rootDir;
+}
+
+async function resolveCampaignProjectRoot(campaignId: string): Promise<string> {
+  const store = await getPuppenclawOrchestratorStore();
+  const campaign = store.getCampaign(campaignId);
+  if (campaign == null) {
+    throw new Error(`Unknown campaign ${campaignId}.`);
+  }
+  return resolveProjectRoot(campaign.projectId);
+}
+
+async function resolveRunProjectRoot(runId: string): Promise<string> {
+  const store = await getPuppenclawOrchestratorStore();
+  const run = store.getRun(runId);
+  if (run == null) {
+    throw new Error(`Unknown run ${runId}.`);
+  }
+  return resolveProjectRoot(run.projectId);
 }
 
 async function handleBindingCommand(ctx: PluginCommandContext): Promise<{ text: string }> {
@@ -258,12 +345,15 @@ async function handleExposeCommand(ctx: PluginCommandContext, payloadText: strin
     conversation: bindingToScope(binding),
     allowPurePipe: parsed.allowPurePipe,
     allowedAgents: exposureAgentsOrAll(parsed.agents),
+    mode: parsed.mode,
+    allowedVerbs: [...parsed.allowedVerbs],
+    allowedProjectRoots: parsed.allowedProjectRoots.map((entry) => resolve(entry)),
     updatedAt: nowIso()
   };
   const store = await getPuppenclawStore();
   await store.upsertExposure(exposure);
   return {
-    text: `Exposed pure-pipe control for ${exposure.allowedAgents.join(", ")} on binding ${binding.bindingId}.`
+    text: `Exposed ${exposure.mode} pure-pipe control for ${exposure.allowedAgents.join(", ")} on binding ${binding.bindingId}.`
   };
 }
 
@@ -297,6 +387,7 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx: PluginCommandContext) => {
+      let requestedFormat: "text" | "json" | undefined;
       try {
         const parsed = parseCommandArgs(ctx.args);
         if (!parsed.ok) {
@@ -320,74 +411,185 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
         const orchestrator = await getPuppenclawOrchestrator();
         const router = await getPuppenclawOutputRouter();
         const remote = sessionRequiresRemoteAuthorization(ctx);
+        const config = getConfiguredPluginConfig();
 
         switch (parsed.verb) {
           case "project": {
-            const result = await orchestrator.createProject(
-              projectCreateParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
-            );
-            return { text: flattenResultText(result) };
+            const params = projectCreateParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              await requirePurePipeExposure(ctx, {
+                verb: "project",
+                projectRoot: resolve(config.orchestration.defaultProjectRoot ?? process.cwd(), params.rootDir)
+              });
+            }
+            const result = await orchestrator.createProject(params);
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "worker": {
-            const result = await orchestrator.registerWorker(
-              workerManifestZod.parse(parseJsonPayload(parsed.payloadText, {}))
-            );
-            return { text: flattenResultText(result) };
+            const params = workerManifestZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              const { exposure } = await requirePurePipeExposure(ctx, { verb: "worker" });
+              if (exposure.allowedProjectRoots.length > 0) {
+                if (params.projectRoots.length === 0) {
+                  throw new Error("Remote worker registration must declare projectRoots when project-root restrictions are active.");
+                }
+                for (const root of params.projectRoots) {
+                  if (!rootAllowed(exposure, root)) {
+                    throw new Error(`Remote worker registration is not allowed for project root ${root}.`);
+                  }
+                }
+              }
+            }
+            const result = await orchestrator.registerWorker(params);
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "sync": {
-            const result = await orchestrator.syncContext(
-              contextSyncParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
-            );
-            return { text: flattenResultText(result) };
+            const params = contextSyncParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              await requirePurePipeExposure(ctx, {
+                verb: "sync",
+                projectRoot: await resolveProjectRoot(params.projectId)
+              });
+            }
+            const result = await orchestrator.syncContext(params);
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "campaign": {
+            const params = campaignRunParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
-              await requirePurePipeExposure(ctx, null);
+              await requirePurePipeExposure(ctx, {
+                verb: "campaign",
+                projectRoot: await resolveProjectRoot(params.projectId)
+              });
             }
-            const result = await orchestrator.runCampaign(
-              campaignRunParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
-            );
-            return { text: flattenResultText(result) };
+            const result = await orchestrator.runCampaign(params);
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "campaign-status": {
+            const params = campaignStatusParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
-              await requirePurePipeExposure(ctx, null);
+              const auth = await requirePurePipeExposure(ctx, {
+                verb: "campaign-status",
+                projectRoot:
+                  params.campaignId != null
+                    ? await resolveCampaignProjectRoot(params.campaignId)
+                    : params.projectId != null
+                      ? await resolveProjectRoot(params.projectId)
+                      : null
+              });
+              if (
+                params.campaignId == null &&
+                params.projectId == null &&
+                auth.exposure.allowedProjectRoots.length > 0
+              ) {
+                throw new Error("campaign-status requires campaignId or projectId when project-root restrictions are active.");
+              }
             }
-            const result = await orchestrator.status(
-              campaignStatusParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
-            );
-            return { text: flattenResultText(result) };
+            const result = await orchestrator.status(params);
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "artifacts": {
+            const params = artifactListParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
-              await requirePurePipeExposure(ctx, null);
+              const auth = await requirePurePipeExposure(ctx, {
+                verb: "artifacts",
+                projectRoot:
+                  params.campaignId != null
+                    ? await resolveCampaignProjectRoot(params.campaignId)
+                    : params.projectId != null
+                      ? await resolveProjectRoot(params.projectId)
+                      : null
+              });
+              if (
+                params.campaignId == null &&
+                params.projectId == null &&
+                auth.exposure.allowedProjectRoots.length > 0
+              ) {
+                throw new Error("artifacts requires campaignId or projectId when project-root restrictions are active.");
+              }
             }
-            const result = await orchestrator.listArtifacts(
-              artifactListParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
-            );
-            return { text: flattenResultText(result) };
+            const result = await orchestrator.listArtifacts(params);
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "approve": {
+            const params = campaignActionParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
-              await requirePurePipeExposure(ctx, null);
+              await requirePurePipeExposure(ctx, {
+                verb: "approve",
+                projectRoot: await resolveCampaignProjectRoot(params.campaignId)
+              });
             }
-            const result = await orchestrator.approve(
-              campaignActionParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
-            );
-            return { text: flattenResultText(result) };
+            const result = await orchestrator.approve(params);
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "cancel": {
+            const params = campaignActionParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
-              await requirePurePipeExposure(ctx, null);
+              await requirePurePipeExposure(ctx, {
+                verb: "cancel",
+                projectRoot: await resolveCampaignProjectRoot(params.campaignId)
+              });
             }
-            const result = await orchestrator.cancel(
-              campaignActionParamsZod.parse(parseJsonPayload(parsed.payloadText, {}))
-            );
-            return { text: flattenResultText(result) };
+            const result = await orchestrator.cancel(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "site-status": {
+            const params = siteStatusParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            const exposureResult = remote
+              ? await requirePurePipeExposure(ctx, { verb: "site-status" })
+              : null;
+            const result = await orchestrator.siteStatus(params);
+            if (exposureResult != null && result.details != null && typeof result.details === "object") {
+              const details = result.details as {
+                exposures?: {
+                  currentExposure?: ExposureRecord | null;
+                };
+              };
+              if (details.exposures != null) {
+                details.exposures.currentExposure = exposureResult.exposure;
+              }
+            }
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "logs": {
+            const params = logsParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              const projectRoot =
+                params.sessionName != null
+                  ? (await resolveSessionForRemoteVerb(params.sessionName)).directory
+                  : params.campaignId != null
+                    ? await resolveCampaignProjectRoot(params.campaignId)
+                    : await resolveRunProjectRoot(params.runId as string);
+              await requirePurePipeExposure(ctx, {
+                verb: "logs",
+                projectRoot
+              });
+            }
+            const result = await orchestrator.logs(params);
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "start": {
             const params = startParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
-            const binding = remote ? await requirePurePipeExposure(ctx, params.agent) : await ctx.getCurrentConversationBinding();
+            requestedFormat = params.format;
+            const binding = remote
+              ? (
+                  await requirePurePipeExposure(ctx, {
+                    verb: "start",
+                    agent: params.agent,
+                    projectRoot: params.directory
+                  })
+                ).binding
+              : await ctx.getCurrentConversationBinding();
             const { result, streamedText } = await withCommandOutputRoute(router, params.name, () =>
               manager.start(params)
             );
@@ -395,80 +597,112 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
               await annotateCommandSession(binding, params.name);
             }
             return {
-              text: [streamedText, flattenResultText(result)].filter(Boolean).join("\n\n")
+              text: renderCommandResult(result, requestedFormat, streamedText)
             };
           }
           case "send": {
             const params = sendParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
               const session = await resolveSessionForRemoteVerb(params.name);
-              await requirePurePipeExposure(ctx, session.agent);
+              await requirePurePipeExposure(ctx, {
+                verb: "send",
+                agent: session.agent,
+                projectRoot: session.directory
+              });
             }
             const { result, streamedText } = await withCommandOutputRoute(router, params.name, () =>
               manager.send(params)
             );
             return {
-              text: [streamedText, flattenResultText(result)].filter(Boolean).join("\n\n")
+              text: renderCommandResult(result, requestedFormat, streamedText)
             };
           }
           case "status": {
             const params = statusParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote && params.name != null) {
               const session = await resolveSessionForRemoteVerb(params.name);
-              await requirePurePipeExposure(ctx, session.agent);
+              await requirePurePipeExposure(ctx, {
+                verb: "status",
+                agent: session.agent,
+                projectRoot: session.directory
+              });
             } else if (remote) {
-              await requirePurePipeExposure(ctx, null);
+              const auth = await requirePurePipeExposure(ctx, { verb: "status" });
+              if (auth.exposure.allowedProjectRoots.length > 0) {
+                throw new Error("status requires a specific session name when project-root restrictions are active.");
+              }
             }
             const result = await manager.status(params);
-            return { text: flattenResultText(result) };
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "stop": {
             const params = stopParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
               const session = await resolveSessionForRemoteVerb(params.name);
-              await requirePurePipeExposure(ctx, session.agent);
+              await requirePurePipeExposure(ctx, {
+                verb: "stop",
+                agent: session.agent,
+                projectRoot: session.directory
+              });
             }
             const result = await manager.stop(params);
-            return { text: flattenResultText(result) };
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "resume": {
             const params = resumeParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
               const session = await resolveSessionForRemoteVerb(params.name);
-              await requirePurePipeExposure(ctx, session.agent);
+              await requirePurePipeExposure(ctx, {
+                verb: "resume",
+                agent: session.agent,
+                projectRoot: session.directory
+              });
             }
             const result = await manager.resume(params);
-            return { text: flattenResultText(result) };
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "fork": {
             const params = forkParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             const binding = remote
-              ? await requirePurePipeExposure(
-                  ctx,
-                  (await resolveSessionForRemoteVerb(params.source)).agent
-                )
+              ? (
+                  await requirePurePipeExposure(ctx, {
+                    verb: "fork",
+                    agent: (await resolveSessionForRemoteVerb(params.source)).agent,
+                    projectRoot: (await resolveSessionForRemoteVerb(params.source)).directory
+                  })
+                ).binding
               : await ctx.getCurrentConversationBinding();
             const result = await manager.fork(params);
             if (binding != null) {
               await annotateCommandSession(binding, params.target);
             }
-            return { text: flattenResultText(result) };
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           case "cost": {
             const params = costParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
             if (remote) {
               const session = await resolveSessionForRemoteVerb(params.name);
-              await requirePurePipeExposure(ctx, session.agent);
+              await requirePurePipeExposure(ctx, {
+                verb: "cost",
+                agent: session.agent,
+                projectRoot: session.directory
+              });
             }
             const result = await manager.cost(params);
-            return { text: flattenResultText(result) };
+            return { text: renderCommandResult(result, requestedFormat) };
           }
           default:
             return { text: renderHelp() };
         }
       } catch (error) {
         return {
-          text: error instanceof Error ? error.message : String(error)
+          text: renderCommandError(error, requestedFormat)
         };
       }
     }
