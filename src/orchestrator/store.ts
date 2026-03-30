@@ -1,6 +1,6 @@
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 
 import type {
   ArtifactRecord,
@@ -13,6 +13,7 @@ import type {
 import { ensureDir } from "../shared/utils.js";
 
 type JsonValue = ProjectRecord | WorkerRecord | CampaignSpecRecord | RunRecord | ArtifactRecord;
+const NODE_SQLITE_SPECIFIER = `node${":sqlite"}`;
 
 function parseJson<T extends JsonValue>(value: unknown): T {
   if (typeof value !== "string") {
@@ -23,12 +24,13 @@ function parseJson<T extends JsonValue>(value: unknown): T {
 
 export class OrchestratorStore {
   private constructor(
-    private readonly db: DatabaseSync,
+    private readonly db: DatabaseSyncType,
     readonly rootDir: string
   ) {}
 
   static async open(rootDir: string): Promise<OrchestratorStore> {
     await ensureDir(rootDir);
+    const { DatabaseSync } = await import(NODE_SQLITE_SPECIFIER);
     const db = new DatabaseSync(join(rootDir, "orchestrator.sqlite"));
     const store = new OrchestratorStore(db, rootDir);
     store.migrate();

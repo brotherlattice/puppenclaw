@@ -74,6 +74,8 @@ Then restart the OpenClaw gateway.
 
 This path is the one a later Codex session should use when bootstrapping from source.
 
+In local plugin mode, Puppenclaw stores its runtime state under the OpenClaw plugin state directory for that gateway instance. It should not create or use a repo-local `orchestrator/` directory in the checkout.
+
 ## Install From a Packed Tarball
 
 If you want a release-style artifact instead of installing from the repo path:

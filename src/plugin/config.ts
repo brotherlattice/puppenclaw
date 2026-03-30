@@ -15,7 +15,7 @@ export function resolvePluginDataDir(params: {
   resolvePath?: (input: string) => string;
 }): string {
   const pluginId = params.pluginId ?? PLUGIN_ID;
-  return params.resolvePath != null ? params.resolvePath(pluginId) : join(params.stateDir, pluginId);
+  return join(params.stateDir, pluginId);
 }
 
 export function resolveRuntimeSessionDir(dataDir: string): string {
