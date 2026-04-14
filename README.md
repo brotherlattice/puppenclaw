@@ -59,6 +59,87 @@ Default ACP adapter commands:
 
 Puppenclaw does not log you into model providers for you. Make sure the ACP adapter you plan to use already works on that machine before blaming Puppenclaw.
 
+## How Puppenclaw launches Codex and Claude
+
+Puppenclaw launches ACP agents in two layers:
+
+- `acpxCommand`
+  - the outer ACP launcher binary
+  - example: `/absolute/path/to/acpx`
+- `agentCommands`
+  - the actual ACP adapters that `acpx` runs
+  - examples:
+    - `npx @zed-industries/codex-acp`
+    - `npx -y @zed-industries/claude-agent-acp`
+
+The execution path is:
+
+```text
+/puppenclaw start -> Puppenclaw -> acpx -> codex-acp or claude-agent-acp
+```
+
+Important:
+
+- `acpxCommand` is not the agent adapter command
+- `agentCommands` are not a replacement for `acpxCommand`
+- the ACP adapters run inside the OpenClaw gateway/plugin host environment
+- that means the adapter sees the gateway's `HOME`, `PATH`, and auth files unless you override them in `agentCommands`
+
+Preferred setup:
+
+- run OpenClaw/Puppenclaw in an isolated `HOME`
+- seed the required Codex and Claude auth into that same `HOME`
+- keep `agentCommands` as the normal ACP adapter commands
+
+Local development fallback:
+
+- wrap `agentCommands` with `env HOME=/home/your-user ...` if you intentionally want Puppenclaw to reuse your existing shell auth
+
+Example local config:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "puppenclaw": {
+        "enabled": true,
+        "config": {
+          "backend": "local",
+          "acpxCommand": "/absolute/path/to/acpx",
+          "defaultAgent": "codex",
+          "agentCommands": {
+            "codex": "npx @zed-industries/codex-acp",
+            "claude": "npx -y @zed-industries/claude-agent-acp"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Local development fallback example:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "puppenclaw": {
+        "enabled": true,
+        "config": {
+          "backend": "local",
+          "acpxCommand": "/absolute/path/to/acpx",
+          "agentCommands": {
+            "codex": "env HOME=/home/your-user npx @zed-industries/codex-acp",
+            "claude": "env HOME=/home/your-user npx -y @zed-industries/claude-agent-acp"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
 ## Install From This Repo
 
 From a clean checkout:
@@ -114,6 +195,7 @@ Minimal local mode:
         "enabled": true,
         "config": {
           "backend": "local",
+          "acpxCommand": "/absolute/path/to/acpx",
           "defaultAgent": "codex",
           "permissionMode": "approve-reads",
           "maxSessions": 5,
@@ -166,6 +248,7 @@ Daemon mode:
         "config": {
           "backend": "daemon",
           "daemonUrl": "http://127.0.0.1:18795",
+          "acpxCommand": "/absolute/path/to/acpx",
           "defaultAgent": "codex",
           "permissionMode": "approve-reads",
           "streamOutput": true,
@@ -198,6 +281,12 @@ Daemon mode:
 - `backend`
   - `local`: plugin process talks to ACP adapters directly
   - `daemon`: plugin talks to a standalone Puppenclaw HTTP daemon
+- `acpxCommand`
+  - path or command used to start the ACP launcher
+  - Puppenclaw calls this first, then passes the selected adapter command through it
+- `agentCommands`
+  - per-agent ACP adapter commands
+  - use wrapper commands here when adapter auth must come from a different `HOME`
 - `orchestration.maxCampaigns`
   - maximum number of active campaigns in `draft`, `running`, or `waiting_approval`
 - `orchestration.artifactRetentionHours`
@@ -425,6 +514,36 @@ Examples:
 
 Use the orchestration surface first when the work is project-shaped. Use raw sessions when the operator explicitly wants direct ACP control.
 
+## ACP Verification
+
+Before blaming Puppenclaw, prove the ACP stack from the same `HOME` and `cwd`
+that the gateway will use.
+
+1. Verify `acpx` itself exists:
+
+```bash
+/absolute/path/to/acpx --help
+```
+
+2. Verify the adapter can create a session from the same environment:
+
+```bash
+HOME=/path/to/openclaw-home /absolute/path/to/acpx --format json --json-strict --cwd /absolute/path/to/project codex sessions new --name smoke-test
+HOME=/path/to/openclaw-home /absolute/path/to/acpx --format json --json-strict --cwd /absolute/path/to/project claude sessions new --name smoke-test
+```
+
+3. Verify the adapter can answer a prompt from the same environment:
+
+```bash
+HOME=/path/to/openclaw-home printf '%s' 'Reply with exactly OK and stop.' | /absolute/path/to/acpx --format json --json-strict --cwd /absolute/path/to/project --approve-reads --non-interactive-permissions deny codex prompt --session smoke-test --file -
+HOME=/path/to/openclaw-home printf '%s' 'Reply with exactly OK and stop.' | /absolute/path/to/acpx --format json --json-strict --cwd /absolute/path/to/project --approve-reads --non-interactive-permissions deny claude prompt --session smoke-test --file -
+```
+
+4. Only after those succeed, run `/puppenclaw start`.
+
+If your OpenClaw gateway uses an isolated `HOME`, run these checks with that
+same `HOME`, not your normal shell profile.
+
 ## oc2oc Integration
 
 Current state:
@@ -472,9 +591,17 @@ Example remote setup flow inside an `oc2oc` conversation:
 
 ### ACP adapter starts fail
 
-- Verify the configured `agentCommands` work outside Puppenclaw
-- Verify provider authentication for the ACP adapter
-- Keep in mind Puppenclaw does not configure provider auth on your behalf
+- `spawn acpx ENOENT`
+  - `acpx` is not installed or `acpxCommand` is wrong
+- `Authentication required`
+  - the ACP adapter cannot see valid auth from the gateway/plugin `HOME`
+  - either seed auth into that `HOME` or wrap `agentCommands` with an explicit `HOME=...`
+- `acpx exited with code 4`
+  - rerun the same `acpx` command manually with the same `HOME` and `cwd` as the gateway
+  - treat it as an adapter/runtime error until the direct `acpx` test succeeds
+- `No acpx session found`
+  - the ACP session was never created or is not visible from the current `HOME`
+- In all cases, verify the configured `agentCommands` work outside Puppenclaw from the same environment the gateway uses
 
 ## Development
 

@@ -93,4 +93,37 @@ describe("AcpxSessionManager", () => {
     expect(sendDetails.session.state).toBe("waiting_input");
     expect(sendDetails.session.pendingQuestion).toBe("Need input from the user?");
   });
+
+  it("creates a runtime session when acpx status reports no-session", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-no-session-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const result = await manager.start({
+      agent: "codex",
+      name: "fresh-session",
+      directory: workspaceDir,
+      task: "Reply with exactly OK.",
+      contextFiles: []
+    });
+    const details = result.details as {
+      session: SessionInfo;
+      output: string;
+    };
+    expect(details.session.state).toBe("idle");
+    expect(details.output).toContain("Handled:");
+  });
 });

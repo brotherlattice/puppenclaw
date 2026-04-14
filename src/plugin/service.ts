@@ -160,7 +160,8 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
       throw new Error("Puppenclaw logger is unavailable");
     }
     if (state.dataDir == null) {
-      const fallbackStateDir = ctx?.stateDir ?? join(process.cwd(), ".puppenclaw");
+      const fallbackStateDir =
+        ctx?.stateDir ?? process.env.OPENCLAW_STATE_DIR ?? join(process.cwd(), ".puppenclaw");
       state.dataDir = resolvePluginDataDir({
         stateDir: fallbackStateDir,
         ...(state.resolvePath != null ? { resolvePath: state.resolvePath } : {})

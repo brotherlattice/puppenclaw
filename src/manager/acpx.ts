@@ -92,6 +92,21 @@ function toErrorRecord(event: JsonRecord | undefined): { code?: string; message:
   };
 }
 
+function isNoSessionStatus(event: JsonRecord | null): boolean {
+  if (event == null) {
+    return false;
+  }
+  const status = asTrimmedString(event.status).toLowerCase();
+  if (status === "no-session") {
+    return true;
+  }
+  const action = asTrimmedString(event.action).toLowerCase();
+  return (
+    action === "status_snapshot" &&
+    asTrimmedString(event.summary).toLowerCase() === "no active session"
+  );
+}
+
 function buildPermissionArgs(mode: PermissionMode): string[] {
   if (mode === "approve-all") {
     return ["--approve-all"];
@@ -785,6 +800,9 @@ export class AcpxSessionManager implements ISessionManager {
       return { exists: false };
     }
     const detail = events.find((event) => toErrorRecord(event) == null) ?? null;
+    if (isNoSessionStatus(detail)) {
+      return { exists: false };
+    }
     return {
       exists: detail != null,
       ...(detail != null ? { status: asOptionalString(detail.status) ?? "unknown", raw: detail } : {})

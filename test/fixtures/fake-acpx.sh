@@ -109,7 +109,7 @@ emit_error() {
 if [[ "${command[0]:-}" == "status" && "${command[1]:-}" == "--session" && -n "${command[2]:-}" ]]; then
   name="${command[2]}"
   if ! session_exists "$name"; then
-    emit_error "NO_SESSION" "No session named $name"
+    emit_json '{"action":"status_snapshot","status":"no-session","summary":"no active session"}'
     exit 0
   fi
   status="$(read_session_status "$name")"
@@ -152,7 +152,8 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
   input="$(cat)"
   normalized_input="$(trim_whitespace "$input")"
   if ! session_exists "$name"; then
-    write_session "$name" "alive" "$agent"
+    emit_json "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32002,\"message\":\"No acpx session found\",\"data\":{\"acpxCode\":\"NO_SESSION\",\"origin\":\"cli\",\"sessionId\":\"unknown\"}}}"
+    exit 4
   fi
   emit_json "{\"type\":\"usage_update\",\"used\":${#normalized_input},\"size\":4096}"
   if [[ "$normalized_input" == *"FAIL_TURN"* ]]; then
