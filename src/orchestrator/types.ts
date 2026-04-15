@@ -2,8 +2,11 @@ import type {
   AgentKind,
   CampaignState,
   CampaignTemplate,
+  EffortLevel,
   OrchestrationExecutor,
   OrchestrationStepKind,
+  PermissionMode,
+  PlanningProfile,
   RunState,
   WorkerManifestInput
 } from "../shared/types.js";
@@ -13,6 +16,11 @@ export type ProjectRecord = {
   name: string;
   rootDir: string;
   description?: string;
+  defaultAgent?: AgentKind;
+  planningProfile?: PlanningProfile;
+  permissionMode?: PermissionMode;
+  effort?: EffortLevel;
+  model?: string;
   createdAt: string;
   updatedAt: string;
   lastContextSyncAt?: string;

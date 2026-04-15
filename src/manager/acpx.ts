@@ -17,6 +17,7 @@ import type {
   ForkParams,
   ParsedPluginConfig,
   PermissionMode,
+  PlanningProfile,
   PromptEvent,
   ResumeParams,
   SendParams,
@@ -437,6 +438,7 @@ export class AcpxSessionManager implements ISessionManager {
       directory,
       permissionMode: params.permissionMode ?? this.deps.config.permissionMode,
       ...(params.effort != null ? { effort: params.effort } : {}),
+      ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {}),
       ...(params.model != null ? { model: params.model } : {}),
       createdAt: now
     });
@@ -446,7 +448,8 @@ export class AcpxSessionManager implements ISessionManager {
       ...this.resolveCapabilityWarnings({
         agent: params.agent,
         ...(params.model != null ? { model: params.model } : {}),
-        ...(params.effort != null ? { effort: params.effort } : {})
+        ...(params.effort != null ? { effort: params.effort } : {}),
+        ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {})
       })
     ]);
 
@@ -457,7 +460,18 @@ export class AcpxSessionManager implements ISessionManager {
     });
 
     const context = await loadContextFiles(directory, params.contextFiles);
-    const promptText = [params.task.trim(), context.promptText].filter(Boolean).join("\n\n");
+    const promptText = [
+      this.buildPlanningPromptPrefix({
+        agent: params.agent,
+        ...(params.planningProfile ?? session.planningProfile
+          ? { planningProfile: params.planningProfile ?? session.planningProfile }
+          : {})
+      }),
+      params.task.trim(),
+      context.promptText
+    ]
+      .filter(Boolean)
+      .join("\n\n");
     const turn = await this.runTurn({
       session,
       promptText,
@@ -604,6 +618,7 @@ export class AcpxSessionManager implements ISessionManager {
       task: forkPrompt,
       permissionMode: source.permissionMode,
       effort: params.effort ?? source.effort,
+      planningProfile: source.planningProfile,
       model: params.model ?? source.model,
       contextFiles: []
     });
@@ -674,6 +689,7 @@ export class AcpxSessionManager implements ISessionManager {
     directory: string;
     permissionMode: PermissionMode;
     effort?: EffortLevel;
+    planningProfile?: PlanningProfile;
     model?: string;
     createdAt: string;
   }): SessionInfo {
@@ -686,6 +702,7 @@ export class AcpxSessionManager implements ISessionManager {
       lastActivity: params.createdAt,
       permissionMode: params.permissionMode,
       ...(params.effort != null ? { effort: params.effort } : {}),
+      ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {}),
       ...(params.model != null ? { model: params.model } : {}),
       warnings: [],
       transcript: [],
@@ -710,6 +727,7 @@ export class AcpxSessionManager implements ISessionManager {
     agent: AgentKind;
     model?: string;
     effort?: EffortLevel;
+    planningProfile?: PlanningProfile;
   }): string[] {
     const warnings: string[] = [];
     if (params.model != null) {
@@ -720,6 +738,11 @@ export class AcpxSessionManager implements ISessionManager {
     if (params.effort != null) {
       warnings.push(
         `Requested effort "${params.effort}" is recorded for orchestration, but ACP adapters may ignore it.`
+      );
+    }
+    if (params.planningProfile != null) {
+      warnings.push(
+        `Planning profile "${params.planningProfile}" is enforced through the synthesized prompt, not a guaranteed ACP runtime mode.`
       );
     }
     if (Object.keys(this.deps.config.mcpServers).length > 0) {
@@ -735,6 +758,34 @@ export class AcpxSessionManager implements ISessionManager {
 
   private resolveRawAgentCommand(agent: AgentKind): string {
     return this.deps.config.agentCommands[agent] ?? DEFAULT_ACPX_AGENT_COMMANDS[agent];
+  }
+
+  private buildPlanningPromptPrefix(params: {
+    agent: AgentKind;
+    planningProfile?: PlanningProfile;
+  }): string | undefined {
+    const profile = params.planningProfile;
+    if (profile == null) {
+      return undefined;
+    }
+    const lines = [
+      `You are running through Puppenclaw on the ${params.agent} backend.`,
+      "Plan before implementation, keep ownership explicit, and only return to the human on a real decision boundary."
+    ];
+    if (profile === "deep") {
+      lines.push(
+        "Use a deep planning pass first: clarify scope, architecture, major file or system changes, validation strategy, and open decision boundaries before coding."
+      );
+    } else if (profile === "quick") {
+      lines.push(
+        "Use a short planning pass first: summarize the implementation approach, main changes, and validation steps before coding."
+      );
+    } else {
+      lines.push(
+        "Planning profile is off: keep planning concise, but do not skip clarification when key requirements are missing."
+      );
+    }
+    return lines.join("\n");
   }
 
   private buildVerbArgs(

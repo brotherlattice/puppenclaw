@@ -54,7 +54,12 @@ describe("OrchestratorRuntime", () => {
 
     const project = await runtime.createProject({
       name: "demo-project",
-      rootDir: workspaceDir
+      rootDir: workspaceDir,
+      defaultAgent: "codex",
+      planningProfile: "deep",
+      permissionMode: "approve-all",
+      effort: "high",
+      model: "openai/gpt-5.4"
     });
     expect(project.content[0]?.text).toContain("Created project");
 
@@ -172,6 +177,18 @@ describe("OrchestratorRuntime", () => {
     };
     expect(campaignLogDetails.scope).toBe("campaign");
     expect(campaignLogDetails.entries.length).toBe(details.runs.length);
+
+    const orchestratedSession = sessionStore.listSessions().find((session) => session.name === sessionName);
+    expect(orchestratedSession?.agent).toBe("codex");
+    expect(orchestratedSession?.planningProfile).toBe("deep");
+    expect(orchestratedSession?.permissionMode).toBe("approve-all");
+    expect(orchestratedSession?.effort).toBe("high");
+    expect(orchestratedSession?.model).toBe("openai/gpt-5.4");
+    expect(
+      orchestratedSession?.transcript.some((entry) =>
+        entry.role === "user" && entry.text.includes("deep planning pass first")
+      )
+    ).toBe(true);
   });
 
   it("pauses for approval and resumes when approved", async () => {

@@ -10,14 +10,18 @@ import { PuppenclawError } from "../shared/errors.js";
 import type { SessionStore } from "../shared/store.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import type {
+  AgentKind,
   ArtifactListParams,
   CampaignActionParams,
   CampaignRunParams,
   CampaignStatusParams,
   ContextSyncParams,
+  EffortLevel,
   LogsParams,
   LogsResult,
+  PermissionMode,
   ParsedPluginConfig,
+  PlanningProfile,
   ProjectCreateParams,
   SiteAgentAvailability,
   SiteStatus,
@@ -228,6 +232,11 @@ export class OrchestratorRuntime implements IOrchestrator {
       name: params.name,
       rootDir,
       ...(params.description != null ? { description: params.description } : {}),
+      ...(params.defaultAgent != null ? { defaultAgent: params.defaultAgent } : {}),
+      ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {}),
+      ...(params.permissionMode != null ? { permissionMode: params.permissionMode } : {}),
+      ...(params.effort != null ? { effort: params.effort } : {}),
+      ...(params.model != null ? { model: params.model } : {}),
       createdAt: now,
       updatedAt: now
     };
@@ -974,13 +983,18 @@ export class OrchestratorRuntime implements IOrchestrator {
     step: CampaignStepRecord
   ): Promise<StepExecutionResult> {
     const sessionName = campaign.acpSessionName ?? `${slug(campaign.name)}-${campaign.id.slice(-8)}`;
-    const prompt = await this.buildStepPrompt(project, campaign, step);
+    const selectedAgent = step.agent ?? project.defaultAgent ?? this.deps.config.defaultAgent;
+    const prompt = await this.buildStepPrompt(project, campaign, step, selectedAgent);
     const result = campaign.acpSessionName == null
       ? await this.deps.sessionManager.start({
-          agent: step.agent ?? this.deps.config.defaultAgent,
+          agent: selectedAgent,
           name: sessionName,
           directory: project.rootDir,
           task: prompt,
+          ...(project.permissionMode != null ? { permissionMode: project.permissionMode } : {}),
+          ...(project.effort != null ? { effort: project.effort } : {}),
+          ...(project.model != null ? { model: project.model } : {}),
+          ...(project.planningProfile != null ? { planningProfile: project.planningProfile } : {}),
           contextFiles: step.contextFiles
         })
       : await this.deps.sessionManager.send({
@@ -1059,7 +1073,12 @@ export class OrchestratorRuntime implements IOrchestrator {
         ...(campaign.task != null ? { PUPPENCLAW_TASK: campaign.task } : {})
       },
       ...(step.timeoutMs != null ? { timeoutMs: step.timeoutMs } : {}),
-      stdinText: await this.buildStepPrompt(project, campaign, step)
+      stdinText: await this.buildStepPrompt(
+        project,
+        campaign,
+        step,
+        project.defaultAgent ?? this.deps.config.defaultAgent
+      )
     });
     if (result.exitCode !== 0) {
       throw new PuppenclawError(
@@ -1077,17 +1096,75 @@ export class OrchestratorRuntime implements IOrchestrator {
     };
   }
 
+  private buildExecutorExecutionEnvelope(params: {
+    agent: AgentKind;
+    planningProfile: PlanningProfile;
+    permissionMode?: PermissionMode;
+    effort?: EffortLevel;
+    model?: string;
+  }): string {
+    const lines = [
+      `You are the ${params.agent} execution backend for a Puppenclaw orchestration run.`,
+      "Plan before writing code, then implement the project end to end unless blocked by a real decision boundary.",
+      "Escalate only for scope changes, architecture forks, destructive or risky operations, missing auth/access, or unresolved ambiguity.",
+      "When you continue autonomously, keep ownership and next actions explicit in your output."
+    ];
+    if (params.planningProfile === "deep") {
+      lines.push(
+        "Use a deep planning pass first: refine requirements, define scope and non-scope, outline architecture, name affected files or systems, and state the test plan before implementation."
+      );
+    } else if (params.planningProfile === "quick") {
+      lines.push(
+        "Use a short planning pass first: summarize the implementation approach, major file or system changes, and validation steps before coding."
+      );
+    } else {
+      lines.push(
+        "Planning profile is off: keep planning concise, but still avoid blind implementation when key requirements are missing."
+      );
+    }
+    if (params.agent === "codex") {
+      lines.push(
+        "Craft your first response as a strong implementation brief optimized for Codex plan-mode execution: concrete scope, constraints, steps, tests, and explicit ownership."
+      );
+    } else {
+      lines.push(
+        "Use focused Claude Code behavior: keep the strategic plan explicit, keep repository-specific constraints visible, and preserve clear decision boundaries."
+      );
+    }
+    if (params.permissionMode != null) {
+      lines.push(`Operator permission mode: ${params.permissionMode}.`);
+    }
+    if (params.effort != null) {
+      lines.push(`Requested reasoning effort: ${params.effort}.`);
+    }
+    if (params.model != null) {
+      lines.push(`Requested model preference: ${params.model}.`);
+    }
+    return lines.join("\n");
+  }
+
   private async buildStepPrompt(
     project: ProjectRecord,
     campaign: CampaignSpecRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    agent: AgentKind
   ): Promise<string> {
     const latestContext = await this.readLatestContextBundle(project.id);
+    const planningProfile = project.planningProfile ?? "quick";
     const blocks = [
+      this.buildExecutorExecutionEnvelope({
+        agent,
+        planningProfile,
+        ...(project.permissionMode != null ? { permissionMode: project.permissionMode } : {}),
+        ...(project.effort != null ? { effort: project.effort } : {}),
+        ...(project.model != null ? { model: project.model } : {})
+      }),
       `Project: ${project.name}`,
       `Root: ${project.rootDir}`,
       `Campaign: ${campaign.name} (${campaign.template})`,
-      `Step: ${step.title} [${step.kind}]`
+      `Step: ${step.title} [${step.kind}]`,
+      `Execution backend: ${agent}`,
+      `Planning profile: ${planningProfile}`
     ];
     if (campaign.task != null) {
       blocks.push(`Top-level task:\n${campaign.task}`);

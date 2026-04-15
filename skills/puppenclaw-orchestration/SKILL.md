@@ -29,8 +29,35 @@ metadata:
   - `puppenclaw_campaign_approve`
   - `puppenclaw_campaign_cancel`
 - Create or reuse a project before running a campaign.
+- Store project defaults when they are stable:
+  - `defaultAgent`
+  - `planningProfile`
+  - `permissionMode`
+  - `effort`
+  - `model`
 - Sync `AGENTS.md`, `README.md`, small design notes, and other high-signal files into context first.
 - Use named workers with constrained project roots and explicit capabilities.
+
+## High-performance coding orchestration
+
+- Use OpenClaw as the orchestrator, not just a transport pipe into Codex or Claude.
+- Refine vague ideas before starting ACP execution.
+- Produce a detailed execution brief before the backend run:
+  - goal
+  - scope and non-scope
+  - constraints
+  - architecture direction
+  - files or systems likely to change
+  - tests and validation
+  - explicit decision boundaries that should return to the human
+- Prefer `planningProfile: "deep"` for full-project implementation work.
+- Use `planningProfile: "quick"` for smaller but still multi-file implementation loops.
+- Use `planningProfile: "off"` only when requirements are already explicit and low-risk.
+- Prefer backend-specific executor skills:
+  - `codex-plan-executor`
+  - `claude-code-plan-executor`
+- Use `project-refinement` before execution when the request is still underspecified.
+- Use `implementation-review-gate` to decide whether the human must be brought back into the loop.
 
 ## Campaign selection
 
@@ -46,6 +73,7 @@ metadata:
 - Reuse an existing session for the same `agent + directory` before starting a new one.
 - Prefer `agent: "codex"` for Codex-oriented coding loops.
 - Prefer `agent: "claude"` when the operator explicitly wants Claude Code behavior.
+- If using raw sessions for substantial work, still inject a planning-first brief rather than forwarding raw user text.
 
 ## oc2oc-mediated control
 

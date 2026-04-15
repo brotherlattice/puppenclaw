@@ -126,4 +126,40 @@ describe("AcpxSessionManager", () => {
     expect(details.session.state).toBe("idle");
     expect(details.output).toContain("Handled:");
   });
+
+  it("records planning profiles and injects a plan-first execution prefix", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-planning-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const result = await manager.start({
+      agent: "claude",
+      name: "planner",
+      directory: workspaceDir,
+      task: "Implement the whole project end to end.",
+      planningProfile: "deep",
+      contextFiles: []
+    });
+    const details = result.details as {
+      session: SessionInfo;
+      output: string;
+    };
+
+    expect(details.session.planningProfile).toBe("deep");
+    expect(details.output).toContain("deep planning pass first");
+    expect(details.output).toContain("only return to the human");
+  });
 });

@@ -49,6 +49,7 @@ export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
 export const permissionModeZod = z.enum(["approve-reads", "approve-all", "deny-all"]);
 export const effortLevelZod = z.enum(["low", "medium", "high"]);
+export const planningProfileZod = z.enum(["off", "quick", "deep"]);
 export const responseFormatZod = z.enum(["text", "json"]);
 export const exposureModeZod = z.enum(["read-only", "execute"]);
 export const remoteVerbZod = z.enum(REMOTE_CONTROL_VERBS);
@@ -231,6 +232,11 @@ export const projectCreateParamsZod = z
     name: nonEmptyString,
     rootDir: nonEmptyString,
     description: z.string().trim().optional(),
+    defaultAgent: agentKindZod.optional(),
+    planningProfile: planningProfileZod.optional(),
+    permissionMode: permissionModeZod.optional(),
+    effort: effortLevelZod.optional(),
+    model: nonEmptyString.optional(),
     format: responseFormatZod.optional()
   })
   .strict();
@@ -358,6 +364,7 @@ export const startParamsZod = z
     format: responseFormatZod.optional(),
     permissionMode: permissionModeZod.optional(),
     effort: effortLevelZod.optional(),
+    planningProfile: planningProfileZod.optional(),
     model: nonEmptyString.optional(),
     contextFiles: z.array(nonEmptyString).default([])
   })
@@ -634,6 +641,9 @@ export const toolStartSchema = Type.Object({
   effort: Type.Optional(
     Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])
   ),
+  planningProfile: Type.Optional(
+    Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])
+  ),
   model: Type.Optional(Type.String({ minLength: 1 })),
   contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 })))
 });
@@ -682,6 +692,21 @@ export const toolProjectCreateSchema = Type.Object({
   name: Type.String({ minLength: 1 }),
   rootDir: Type.String({ minLength: 1 }),
   description: Type.Optional(Type.String()),
+  defaultAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
+  planningProfile: Type.Optional(
+    Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])
+  ),
+  permissionMode: Type.Optional(
+    Type.Union([
+      Type.Literal("approve-reads"),
+      Type.Literal("approve-all"),
+      Type.Literal("deny-all")
+    ])
+  ),
+  effort: Type.Optional(
+    Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])
+  ),
+  model: Type.Optional(Type.String({ minLength: 1 })),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
 });
 

@@ -19,6 +19,7 @@ import type {
   orchestrationExecutorZod,
   orchestrationStepKindZod,
   permissionModeZod,
+  planningProfileZod,
   pluginConfigZod,
   projectCreateParamsZod,
   remoteControlConfigZod,
@@ -41,6 +42,7 @@ export type AgentKind = z.infer<typeof agentKindZod>;
 export type BackendMode = z.infer<typeof backendZod>;
 export type PermissionMode = z.infer<typeof permissionModeZod>;
 export type EffortLevel = z.infer<typeof effortLevelZod>;
+export type PlanningProfile = z.infer<typeof planningProfileZod>;
 export type ResponseFormat = z.infer<typeof responseFormatZod>;
 export type ExposureMode = z.infer<typeof exposureModeZod>;
 export type RemoteVerb = z.infer<typeof remoteVerbZod>;
@@ -128,6 +130,7 @@ export type SessionInfo = {
   lastActivity: string;
   permissionMode: PermissionMode;
   effort?: EffortLevel;
+  planningProfile?: PlanningProfile;
   model?: string;
   tokenUsage?: TokenUsage;
   pendingQuestion?: string;
