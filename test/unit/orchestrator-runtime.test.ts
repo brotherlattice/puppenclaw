@@ -288,16 +288,20 @@ describe("OrchestratorRuntime", () => {
       steps: []
     });
 
-    const details = campaign.details as {
+    const startedDetails = campaign.details as {
       campaign: {
         id: string;
         state: string;
         template: string;
+        waitingApprovalStepId?: string;
         fusion: {
           baseCommit: string;
           preferredAgent: string;
           bundleArtifactId: string;
+          planArtifactId?: string;
           dossierArtifactId?: string;
+          approvalState: string;
+          currentPhase: string;
           worktrees: {
             codex: { path: string; branch: string };
             claude: { path: string; branch: string };
@@ -318,29 +322,127 @@ describe("OrchestratorRuntime", () => {
       }>;
     };
 
-    expect(details.campaign.template).toBe("puppenfusion");
+    expect(startedDetails.campaign.template).toBe("puppenfusion");
+    expect(startedDetails.campaign.state).toBe("waiting_approval");
+    expect(startedDetails.campaign.waitingApprovalStepId).toBe("fusion-plan-approval");
+    expect(startedDetails.campaign.fusion.preferredAgent).toBe("codex");
+    expect(startedDetails.campaign.fusion.bundleArtifactId).toBeTruthy();
+    expect(startedDetails.campaign.fusion.planArtifactId).toBeTruthy();
+    expect(startedDetails.campaign.fusion.approvalState).toBe("waiting");
+    expect(startedDetails.campaign.fusion.currentPhase).toBe("plan");
+    expect(startedDetails.runs).toHaveLength(2);
+    expect(startedDetails.runs.filter((run) => run.sessionName != null)).toHaveLength(2);
+    expect(startedDetails.artifacts.filter((artifact) => artifact.kind === "fusion-plan-review")).toHaveLength(2);
+    expect(startedDetails.artifacts.some((artifact) => artifact.kind === "fusion-plan")).toBe(true);
+
+    const approved = await runtime.approve({
+      campaignId: startedDetails.campaign.id
+    });
+    const details = approved.details as {
+      campaign: {
+        id: string;
+        state: string;
+        fusion: {
+          baseCommit: string;
+          preferredAgent: string;
+          bundleArtifactId: string;
+          planArtifactId?: string;
+          dossierArtifactId?: string;
+          approvalState: string;
+          integrationState: string;
+          resolverUsed: boolean;
+          currentPhase: string;
+          lastCompletedPhase?: string;
+          candidateStates: Record<string, {
+            status: string;
+            candidateCommit?: string;
+            validationArtifactId?: string;
+          }>;
+          phaseSummaries: Array<{
+            phase: string;
+          }>;
+          events: Array<{
+            type: string;
+          }>;
+          worktrees: {
+            codex: { path: string; branch: string };
+            claude: { path: string; branch: string };
+            merged: { path: string; branch: string };
+          };
+        };
+      };
+      runs: Array<{
+        state: string;
+        sessionName?: string;
+        stepId: string;
+      }>;
+      artifacts: Array<{
+        id: string;
+        kind: string;
+        stepId?: string;
+        sha256: string;
+      }>;
+    };
+
     expect(details.campaign.state).toBe("completed");
-    expect(details.campaign.fusion.preferredAgent).toBe("codex");
-    expect(details.campaign.fusion.bundleArtifactId).toBeTruthy();
+    expect(details.campaign.fusion.approvalState).toBe("approved");
+    expect(details.campaign.fusion.integrationState).toBe("succeeded");
+    expect(details.campaign.fusion.resolverUsed).toBe(false);
     expect(details.campaign.fusion.dossierArtifactId).toBeTruthy();
-    expect(details.runs.length).toBe(8);
-    expect(details.runs.filter((run) => run.sessionName != null)).toHaveLength(5);
+    expect(details.campaign.fusion.lastCompletedPhase).toBe("merged_eval");
+    expect(details.runs.length).toBe(11);
+    expect(details.runs.filter((run) => run.sessionName != null)).toHaveLength(6);
+    expect(details.runs.some((run) => run.stepId.startsWith("fusion-merge-"))).toBe(false);
     expect(details.artifacts.some((artifact) => artifact.kind === "fusion-bundle")).toBe(true);
+    expect(details.artifacts.filter((artifact) => artifact.kind === "fusion-plan-review")).toHaveLength(2);
+    expect(details.artifacts.some((artifact) => artifact.kind === "fusion-plan")).toBe(true);
     expect(details.artifacts.filter((artifact) => artifact.kind === "implementation-memo")).toHaveLength(2);
+    expect(details.artifacts.filter((artifact) => artifact.kind === "fusion-candidate")).toHaveLength(4);
     expect(details.artifacts.filter((artifact) => artifact.kind === "peer-review")).toHaveLength(2);
-    expect(details.artifacts.filter((artifact) => artifact.kind === "candidate-diff")).toHaveLength(3);
     expect(details.artifacts.some((artifact) => artifact.kind === "fusion-dossier")).toBe(true);
-    expect(details.artifacts.some((artifact) => artifact.kind === "merge-summary")).toBe(true);
+    expect(details.artifacts.some((artifact) => artifact.kind === "integration-report")).toBe(true);
     expect(details.artifacts.every((artifact) => artifact.sha256.length > 0)).toBe(true);
 
-    expect(runGit(details.campaign.fusion.worktrees.codex.path, ["rev-parse", "HEAD"])).toBe(details.campaign.fusion.baseCommit);
-    expect(runGit(details.campaign.fusion.worktrees.claude.path, ["rev-parse", "HEAD"])).toBe(details.campaign.fusion.baseCommit);
-    expect(runGit(details.campaign.fusion.worktrees.merged.path, ["rev-parse", "HEAD"])).toBe(details.campaign.fusion.baseCommit);
+    const codexCommit = details.campaign.fusion.candidateStates.codex?.candidateCommit;
+    const claudeCommit = details.campaign.fusion.candidateStates.claude?.candidateCommit;
+    expect(codexCommit).toBeTruthy();
+    expect(claudeCommit).toBeTruthy();
+    expect(details.campaign.fusion.candidateStates.codex?.validationArtifactId).toBeTruthy();
+    expect(details.campaign.fusion.candidateStates.claude?.validationArtifactId).toBeTruthy();
+    expect(details.campaign.fusion.phaseSummaries.map((summary) => summary.phase).sort()).toEqual([
+      "candidate_eval",
+      "implement",
+      "integration",
+      "merged_eval",
+      "peer_review",
+      "plan"
+    ]);
+    expect(details.campaign.fusion.events.some((event) => event.type === "fusion_plan_ready")).toBe(true);
+    expect(details.campaign.fusion.events.some((event) => event.type === "fusion_approved")).toBe(true);
+    expect(details.campaign.fusion.events.some((event) => event.type === "fusion_integration_succeeded")).toBe(true);
+
+    expect(runGit(details.campaign.fusion.worktrees.codex.path, ["rev-parse", "HEAD"])).toBe(codexCommit);
+    expect(runGit(details.campaign.fusion.worktrees.claude.path, ["rev-parse", "HEAD"])).toBe(claudeCommit);
+    const mergedHead = runGit(details.campaign.fusion.worktrees.merged.path, ["rev-parse", "HEAD"]);
+    expect(mergedHead).not.toBe(details.campaign.fusion.baseCommit);
+    runGit(details.campaign.fusion.worktrees.merged.path, [
+      "merge-base",
+      "--is-ancestor",
+      codexCommit as string,
+      mergedHead
+    ]);
+    runGit(details.campaign.fusion.worktrees.merged.path, [
+      "merge-base",
+      "--is-ancestor",
+      claudeCommit as string,
+      mergedHead
+    ]);
 
     const sessions = sessionStore.listSessions();
+    expect(sessions.filter((session) => session.name.includes("fusion-plan"))).toHaveLength(2);
     expect(sessions.filter((session) => session.name.includes("fusion-implement"))).toHaveLength(2);
     expect(sessions.filter((session) => session.name.includes("fusion-review"))).toHaveLength(2);
-    expect(sessions.some((session) => session.name.includes("fusion-merge"))).toBe(true);
+    expect(sessions.some((session) => session.name.includes("fusion-merge"))).toBe(false);
   });
 
   it("pauses for approval and resumes when approved", async () => {

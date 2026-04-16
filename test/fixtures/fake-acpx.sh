@@ -160,7 +160,30 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
     emit_error "SIM_FAIL" "Simulated turn failure"
     exit 0
   fi
-  if [[ "$normalized_input" == *"ASK_USER"* ]]; then
+  if [[ "$normalized_input" == *"PUPPENFUSION_ROLE: planning"* ]]; then
+    if [[ "$normalized_input" == *"PUPPENFUSION_CANDIDATE: codex"* ]]; then
+      reply=$'## Scope\nImplement the requested feature with minimal risk.\n## Architecture\nPrefer a direct module change.\n## Files\n- src.ts\n- codex-plan.txt\n## Validation\n- Run the configured evaluation command.\n## Risks\n- Keep scope bounded to the sealed bundle.'
+    else
+      reply=$'## Scope\nImplement the requested feature cleanly from the sealed bundle.\n## Architecture\nFavor explicit structure and readable changes.\n## Files\n- src.ts\n- claude-plan.txt\n## Validation\n- Run the configured evaluation command.\n## Risks\n- Avoid widening scope beyond the approved plan.'
+    fi
+  elif [[ "$normalized_input" == *"PUPPENFUSION_ROLE: implementation"* ]]; then
+    if [[ "$normalized_input" == *"PUPPENFUSION_CANDIDATE: codex"* ]]; then
+      printf '%s\n' 'codex candidate output' > "$cwd/codex-candidate.txt"
+      reply=$'## Summary\nImplemented the Codex candidate.\n## Changed Areas\n- Added codex-candidate.txt\n## Decisions\n- Keep the change isolated to Codex-owned output.\n## Risks\n- Minimal.\n## Validation\n- Ready for evaluation.'
+    else
+      printf '%s\n' 'claude candidate output' > "$cwd/claude-candidate.txt"
+      reply=$'## Summary\nImplemented the Claude candidate.\n## Changed Areas\n- Added claude-candidate.txt\n## Decisions\n- Keep the change isolated to Claude-owned output.\n## Risks\n- Minimal.\n## Validation\n- Ready for evaluation.'
+    fi
+  elif [[ "$normalized_input" == *"PUPPENFUSION_ROLE: peer_review"* ]]; then
+    if [[ "$normalized_input" == *"PUPPENFUSION_CANDIDATE: codex"* ]]; then
+      reply=$'## Verdict\nAccept with small follow-up.\n## Strengths\n- The Claude candidate is readable.\n## Weaknesses\n- The change could expose more rationale.\n## Risks\n- Low.\n## Merge Guidance\n- Keep the file-level change and preserve the bounded scope.'
+    else
+      reply=$'## Verdict\nAccept with small follow-up.\n## Strengths\n- The Codex candidate is direct.\n## Weaknesses\n- The change could expose more rationale.\n## Risks\n- Low.\n## Merge Guidance\n- Keep the file-level change and preserve the bounded scope.'
+    fi
+  elif [[ "$normalized_input" == *"PUPPENFUSION_ROLE: merge"* ]]; then
+    printf '%s\n' 'resolved merged output' > "$cwd/merged-candidate.txt"
+    reply=$'## Summary\nResolved the fusion merge in the merged worktree.\n## Incorporated from Codex\n- Preserved the direct candidate change.\n## Incorporated from Claude\n- Preserved the readable candidate change.\n## Remaining Risks\n- Low.\n## Validation\n- Ready for evaluation.'
+  elif [[ "$normalized_input" == *"ASK_USER"* ]]; then
     reply="Need input from the user?"
   else
     reply="Handled: $normalized_input"

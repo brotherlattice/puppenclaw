@@ -36,6 +36,10 @@ import type {
   ArtifactRecord,
   FusionCandidate,
   FusionCampaignRecord,
+  FusionCandidateRecord,
+  FusionEventRecord,
+  FusionPhase,
+  FusionPhaseSummaryRecord,
   FusionStepConfig,
   FusionWorktreeRecord,
   CampaignSpecRecord,
@@ -134,6 +138,18 @@ type FusionBundle = {
   contextPromptText?: string;
   preferredAgent: FusionCandidate;
   decisionPolicy: string;
+};
+
+type FusionIntegrationReport = {
+  status: "succeeded" | "conflict";
+  baseCommit: string;
+  mergedHead: string;
+  mergedBranch: string;
+  mergedWorktreePath: string;
+  mergedCandidateCommits: string[];
+  candidateBranches: Record<FusionCandidate, string>;
+  createdAt: string;
+  notes: string[];
 };
 
 function slug(input: string): string {
@@ -651,6 +667,34 @@ export class OrchestratorRuntime implements IOrchestrator {
     const steps: CampaignStepRecord[] = [];
     for (const candidate of FUSION_CANDIDATES) {
       steps.push(this.normalizeStep({
+        id: `fusion-plan-${candidate}`,
+        title: `Plan with ${candidate}`,
+        kind: "plan",
+        executor: "acp",
+        agent: candidate,
+        phaseGroup: "fusion-plan",
+        sessionScope: "step",
+        workingDirectory: worktrees[candidate].path,
+        instruction: `Create a planning-only proposal from the sealed puppenfusion bundle. Do not implement yet.`,
+        fusion: {
+          role: "planning",
+          candidate
+        }
+      }, steps.length));
+    }
+    steps.push(this.normalizeStep({
+      id: "fusion-plan-approval",
+      title: "Approve synthesized fusion plan",
+      kind: "judge",
+      executor: "command",
+      approvalRequired: true,
+      command: ":",
+      fusion: {
+        role: "approval_gate"
+      }
+    }, steps.length));
+    for (const candidate of FUSION_CANDIDATES) {
+      steps.push(this.normalizeStep({
         id: `fusion-implement-${candidate}`,
         title: `Implement with ${candidate}`,
         kind: "code",
@@ -659,7 +703,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         phaseGroup: "fusion-implement",
         sessionScope: "step",
         workingDirectory: worktrees[candidate].path,
-        instruction: `Implement the sealed puppenfusion task in the ${candidate} candidate worktree and end with a structured implementation memo.`,
+        instruction: `Implement the approved puppenfusion plan in the ${candidate} candidate worktree and end with a structured implementation memo.`,
         fusion: {
           role: "implementation",
           candidate
@@ -716,14 +760,25 @@ export class OrchestratorRuntime implements IOrchestrator {
       }, steps.length));
     }
     steps.push(this.normalizeStep({
+      id: "fusion-integrate",
+      title: "Automatically integrate fusion candidates",
+      kind: "handoff",
+      executor: "command",
+      workingDirectory: worktrees.merged.path,
+      command: ":",
+      fusion: {
+        role: "integration"
+      }
+    }, steps.length));
+    steps.push(this.normalizeStep({
       id: `fusion-merge-${preferredAgent}`,
-      title: `Merge with ${preferredAgent}`,
+      title: `Resolve fusion integration with ${preferredAgent}`,
       kind: "code",
       executor: "acp",
       agent: preferredAgent,
       sessionScope: "step",
       workingDirectory: worktrees.merged.path,
-      instruction: `Merge the strongest ideas from both candidates into one final implementation.`,
+      instruction: `Resolve the fusion integration conflict and produce one final merged implementation.`,
       fusion: {
         role: "merge",
         candidate: preferredAgent
@@ -748,7 +803,14 @@ export class OrchestratorRuntime implements IOrchestrator {
         useExternalArbiter,
         bundleArtifactId: bundleArtifact.id,
         bundleHash: bundleArtifact.sha256,
-        worktrees
+        currentPhase: "plan",
+        approvalState: "not_required",
+        integrationState: "pending",
+        resolverUsed: false,
+        worktrees,
+        candidateStates: {},
+        events: [],
+        phaseSummaries: []
       },
       steps
     };
@@ -1158,6 +1220,9 @@ export class OrchestratorRuntime implements IOrchestrator {
     project: ProjectRecord,
     step: CampaignStepRecord
   ): Promise<StepExecutionResult> {
+    if (campaign.template === "puppenfusion" && step.fusion?.role === "integration") {
+      return this.executeFusionIntegrationStep(campaign, step);
+    }
     if (step.kind === "research" && this.deps.config.orchestration.gptResearcherCommand != null) {
       return this.executeResearchCommandStep(campaign, project, step);
     }
@@ -1232,32 +1297,504 @@ export class OrchestratorRuntime implements IOrchestrator {
     if (campaign.template !== "puppenfusion" || campaign.fusion == null) {
       return campaign;
     }
-
-    if (steps.some((step) => step.fusion?.role === "peer_review")) {
-      return this.synthesizeFusionDossier(campaign, project);
+    const mergedEvalStep = steps.find((step) => step.id === "fusion-eval-merged");
+    if (mergedEvalStep != null) {
+      const current = this.finishFusionMergedEval(campaign, mergedEvalStep);
+      this.deps.store.upsertCampaign(current);
+      return current;
     }
+    const firstStep = steps[0];
+    const role = firstStep?.fusion?.role;
+    if (firstStep == null || role == null) {
+      return campaign;
+    }
+    let current = campaign;
+    if (role === "planning") {
+      current = await this.synthesizeFusionPlan(current, project, steps);
+    } else if (role === "approval_gate") {
+      current = this.markFusionApproved(current, steps);
+    } else if (role === "implementation") {
+      current = await this.recordFusionCandidates(current, project, steps);
+    } else if (role === "candidate_eval") {
+      current = await this.recordFusionCandidates(current, project, steps);
+      current = {
+        ...current,
+        fusion: {
+          ...current.fusion!,
+          currentPhase: "peer_review",
+          lastCompletedPhase: "candidate_eval"
+        }
+      };
+      current = this.recordFusionPhaseSummary(current, "candidate_eval", steps, [], "peer_review");
+    } else if (role === "peer_review") {
+      current = await this.synthesizeFusionDossier(current, project, steps);
+    } else if (role === "external_arbiter") {
+      current = this.attachFusionArbiterArtifact(current, steps);
+    } else if (role === "integration") {
+      current = await this.applyFusionIntegrationResult(current, firstStep);
+    } else if (role === "merge") {
+      current = this.finishFusionResolverMerge(current, firstStep);
+    } else {
+      return campaign;
+    }
+    this.deps.store.upsertCampaign(current);
+    return current;
+  }
 
-    if (steps.some((step) => step.fusion?.role === "external_arbiter")) {
-      const arbiterStep = steps.find((step) => step.fusion?.role === "external_arbiter");
-      const artifact = this.findLatestArtifact(campaign.id, {
-        ...(arbiterStep?.id != null ? { stepId: arbiterStep.id } : {}),
-        kind: "report"
-      });
-      if (artifact == null) {
-        return campaign;
+  private async synthesizeFusionPlan(
+    campaign: CampaignSpecRecord,
+    project: ProjectRecord,
+    steps: CampaignStepRecord[]
+  ): Promise<CampaignSpecRecord> {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    const codexPlan = await this.readFusionArtifactText(campaign.id, {
+      stepId: "fusion-plan-codex",
+      kind: "fusion-plan-review"
+    });
+    const claudePlan = await this.readFusionArtifactText(campaign.id, {
+      stepId: "fusion-plan-claude",
+      kind: "fusion-plan-review"
+    });
+    const bundleText = await this.readArtifactText(campaign.id, campaign.fusion.bundleArtifactId);
+    const synthesizedPlan = [
+      "# Puppenfusion Plan",
+      "",
+      `Project: ${project.name}`,
+      `Campaign: ${campaign.name}`,
+      `Base commit: ${campaign.fusion.baseCommit}`,
+      "",
+      "## Canonical Direction",
+      "Use the two plan reviews below as inputs. Preserve common structure, prefer lower-risk changes where they disagree, and keep scope bounded to the sealed bundle.",
+      "",
+      "## Approval Gate",
+      "Human approval is required before implementation starts.",
+      "",
+      "## Sealed Bundle",
+      bundleText,
+      "",
+      "## Codex Plan",
+      codexPlan,
+      "",
+      "## Claude Plan",
+      claudePlan
+    ].join("\n");
+    const artifact = await this.writeTextArtifact({
+      projectId: project.id,
+      campaignId: campaign.id,
+      kind: "fusion-plan",
+      title: "Fusion plan",
+      summary: `Synthesized fusion plan for ${campaign.name}.`,
+      relativePath: relativeArtifactPath({
+        projectId: project.id,
+        campaignId: campaign.id,
+        extension: "md",
+        title: "fusion-plan"
+      }),
+      content: synthesizedPlan
+    });
+    let next: CampaignSpecRecord = {
+      ...campaign,
+      fusion: {
+        ...campaign.fusion,
+        planArtifactId: artifact.id,
+        currentPhase: "plan",
+        lastCompletedPhase: "plan",
+        approvalState: "waiting"
       }
-      const next: CampaignSpecRecord = {
+    };
+    next = this.appendFusionEvent(next, {
+      type: "fusion_plan_ready",
+      phase: "plan",
+      message: "Synthesized fusion plan is ready for approval."
+    });
+    next = this.appendFusionEvent(next, {
+      type: "fusion_waiting_approval",
+      phase: "plan",
+      message: "Waiting for approval before implementation starts."
+    });
+    return this.recordFusionPhaseSummary(next, "plan", steps, [artifact.id], "implement");
+  }
+
+  private markFusionApproved(
+    campaign: CampaignSpecRecord,
+    steps: CampaignStepRecord[]
+  ): CampaignSpecRecord {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    const approvedAt = nowIso();
+    const next = this.appendFusionEvent(
+      {
         ...campaign,
         fusion: {
           ...campaign.fusion,
-          externalArbiterArtifactId: artifact.id
+          approvalState: "approved",
+          approvalGrantedAt: approvedAt,
+          currentPhase: "implement"
+        }
+      },
+      {
+        type: "fusion_approved",
+        phase: "plan",
+        message: "Human approval granted for fusion implementation."
+      }
+    );
+    return this.recordFusionPhaseSummary(next, "plan", steps, [], "implement");
+  }
+
+  private async recordFusionCandidates(
+    campaign: CampaignSpecRecord,
+    project: ProjectRecord,
+    steps: CampaignStepRecord[]
+  ): Promise<CampaignSpecRecord> {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    const role = steps[0]?.fusion?.role;
+    if (role !== "implementation" && role !== "candidate_eval") {
+      return campaign;
+    }
+    let next = campaign;
+    const candidateArtifactIds: string[] = [];
+    for (const step of steps) {
+      const candidate = step.fusion?.candidate;
+      if (candidate == null) {
+        continue;
+      }
+      const record = await this.buildFusionCandidateRecord(next, candidate);
+      const artifact = await this.writeTextArtifact({
+        projectId: project.id,
+        campaignId: campaign.id,
+        stepId: `fusion-implement-${candidate}`,
+        kind: "fusion-candidate",
+        title: `${candidate} fusion candidate`,
+        summary: record.summary,
+        relativePath: relativeArtifactPath({
+          projectId: project.id,
+          campaignId: campaign.id,
+          extension: "json",
+          title: `${candidate}-fusion-candidate`
+        }),
+        content: JSON.stringify(record, null, 2)
+      });
+      candidateArtifactIds.push(artifact.id);
+      next = {
+        ...next,
+        fusion: {
+          ...next.fusion!,
+          candidateStates: {
+            ...next.fusion!.candidateStates,
+            [candidate]: {
+              ...record,
+              artifactId: artifact.id
+            }
+          }
         }
       };
-      this.deps.store.upsertCampaign(next);
-      return next;
+      if (role === "implementation") {
+        next = this.appendFusionEvent(next, {
+          type: record.status === "interrupted" ? "fusion_candidate_interrupted" : "fusion_candidate_completed",
+          phase: "implement",
+          candidate,
+          message: `${candidate} candidate completed with status ${record.status}.`
+        });
+      }
     }
+    if (role === "implementation") {
+      next = {
+        ...next,
+        fusion: {
+          ...next.fusion!,
+          currentPhase: this.hasFusionCandidateEval(next) ? "candidate_eval" : "peer_review",
+          lastCompletedPhase: "implement"
+        }
+      };
+      return this.recordFusionPhaseSummary(
+        next,
+        "implement",
+        steps,
+        candidateArtifactIds,
+        this.hasFusionCandidateEval(next) ? "candidate_eval" : "peer_review"
+      );
+    }
+    return next;
+  }
 
-    return campaign;
+  private async buildFusionCandidateRecord(
+    campaign: CampaignSpecRecord,
+    candidate: FusionCandidate
+  ): Promise<FusionCandidateRecord> {
+    if (campaign.fusion == null) {
+      throw new PuppenclawError("FUSION_STATE_MISSING", "Missing puppenfusion campaign state.");
+    }
+    const worktree = campaign.fusion.worktrees[candidate];
+    const memoArtifact = this.findLatestArtifact(campaign.id, {
+      stepId: `fusion-implement-${candidate}`,
+      kind: "implementation-memo"
+    });
+    if (memoArtifact == null) {
+      throw new PuppenclawError(
+        "FUSION_MEMO_MISSING",
+        `Missing implementation memo for ${candidate}.`
+      );
+    }
+    const diffArtifact = this.findLatestArtifact(campaign.id, {
+      stepId: `fusion-implement-${candidate}`,
+      kind: "candidate-diff"
+    });
+    const validationArtifact = this.findLatestArtifact(campaign.id, {
+      stepId: `fusion-eval-${candidate}`,
+      kind: "command-output"
+    });
+    const memoText = await this.readArtifactText(campaign.id, memoArtifact.id);
+    const head = await this.readGitStdout(worktree.path, ["rev-parse", "HEAD"]);
+    const status = await this.readGitStdout(worktree.path, ["status", "--porcelain=v1", "--untracked-files=all"]);
+    return {
+      status:
+        status.trim().length > 0
+          ? "interrupted"
+          : head === campaign.fusion.baseCommit
+            ? "noop"
+            : "candidate",
+      agent: candidate,
+      baseCommit: campaign.fusion.baseCommit,
+      ...(head !== campaign.fusion.baseCommit ? { candidateCommit: head } : {}),
+      worktreePath: worktree.path,
+      summary: memoArtifact.summary ?? summarizeText(memoText, 220),
+      memoArtifactId: memoArtifact.id,
+      ...(diffArtifact != null ? { diffArtifactId: diffArtifact.id } : {}),
+      ...(validationArtifact != null ? { validationArtifactId: validationArtifact.id } : {}),
+      createdAt: nowIso()
+    };
+  }
+
+  private attachFusionArbiterArtifact(
+    campaign: CampaignSpecRecord,
+    steps: CampaignStepRecord[]
+  ): CampaignSpecRecord {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    const arbiterStep = steps.find((step) => step.fusion?.role === "external_arbiter");
+    const artifact = this.findLatestArtifact(campaign.id, {
+      ...(arbiterStep?.id != null ? { stepId: arbiterStep.id } : {}),
+      kind: "report"
+    });
+    if (artifact == null) {
+      return campaign;
+    }
+    return this.recordFusionPhaseSummary(
+      {
+        ...campaign,
+        fusion: {
+          ...campaign.fusion,
+          externalArbiterArtifactId: artifact.id,
+          currentPhase: "integration"
+        }
+      },
+      "peer_review",
+      steps,
+      [
+        artifact.id,
+        ...(campaign.fusion.dossierArtifactId != null ? [campaign.fusion.dossierArtifactId] : [])
+      ],
+      "integration"
+    );
+  }
+
+  private async applyFusionIntegrationResult(
+    campaign: CampaignSpecRecord,
+    step: CampaignStepRecord
+  ): Promise<CampaignSpecRecord> {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    const artifact = this.findLatestArtifact(campaign.id, {
+      stepId: step.id,
+      kind: "integration-report"
+    });
+    if (artifact == null) {
+      return campaign;
+    }
+    const report = JSON.parse(await this.readArtifactText(campaign.id, artifact.id)) as FusionIntegrationReport;
+    let next: CampaignSpecRecord = {
+      ...campaign,
+      fusion: {
+        ...campaign.fusion,
+        integrationState: report.status,
+        lastCompletedPhase: "integration",
+        currentPhase: this.hasMergedEval(campaign) ? "merged_eval" : "integration"
+      }
+    };
+    next = this.appendFusionEvent(next, {
+      type: report.status === "succeeded" ? "fusion_integration_succeeded" : "fusion_integration_conflict",
+      phase: "integration",
+      message:
+        report.status === "succeeded"
+          ? "Automatic local integration succeeded."
+          : "Automatic local integration hit a conflict and requires resolver fallback."
+    });
+    next = this.recordFusionPhaseSummary(
+      next,
+      "integration",
+      [step],
+      [artifact.id],
+      this.hasMergedEval(campaign) ? "merged_eval" : undefined
+    );
+    if (report.status === "succeeded") {
+      const resolverIndex = next.steps.findIndex((candidateStep, index) =>
+        index >= next.currentStepIndex && candidateStep.fusion?.role === "merge"
+      );
+      if (resolverIndex >= 0) {
+        const skippedTo = resolverIndex + 1;
+        next = {
+          ...next,
+          currentStepIndex: skippedTo,
+          state: skippedTo >= next.steps.length ? "completed" : "running",
+          lastProgressAt: artifact.createdAt,
+          updatedAt: artifact.createdAt
+        };
+      }
+    } else {
+      next = {
+        ...next,
+        lastProgressAt: artifact.createdAt,
+        updatedAt: artifact.createdAt
+      };
+    }
+    return next;
+  }
+
+  private finishFusionResolverMerge(
+    campaign: CampaignSpecRecord,
+    step: CampaignStepRecord
+  ): CampaignSpecRecord {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    const integrationArtifact = this.findLatestArtifact(campaign.id, {
+      stepId: "fusion-integrate",
+      kind: "integration-report"
+    });
+    return this.recordFusionPhaseSummary(
+      {
+        ...campaign,
+        fusion: {
+          ...campaign.fusion,
+          integrationState: "resolved",
+          resolverUsed: true,
+          lastCompletedPhase: "integration",
+          currentPhase: this.hasMergedEval(campaign) ? "merged_eval" : "integration"
+        }
+      },
+      "integration",
+      [step],
+      integrationArtifact != null ? [integrationArtifact.id] : [],
+      this.hasMergedEval(campaign) ? "merged_eval" : undefined
+    );
+  }
+
+  private finishFusionMergedEval(
+    campaign: CampaignSpecRecord,
+    step: CampaignStepRecord
+  ): CampaignSpecRecord {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    return this.recordFusionPhaseSummary(
+      {
+        ...campaign,
+        fusion: {
+          ...campaign.fusion,
+          currentPhase: "merged_eval",
+          lastCompletedPhase: "merged_eval"
+        }
+      },
+      "merged_eval",
+      [step]
+    );
+  }
+
+  private appendFusionEvent(
+    campaign: CampaignSpecRecord,
+    event: Omit<FusionEventRecord, "createdAt">
+  ): CampaignSpecRecord {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    return {
+      ...campaign,
+      fusion: {
+        ...campaign.fusion,
+        events: [
+          ...campaign.fusion.events,
+          {
+            ...event,
+            createdAt: nowIso()
+          }
+        ]
+      }
+    };
+  }
+
+  private recordFusionPhaseSummary(
+    campaign: CampaignSpecRecord,
+    phase: FusionPhase,
+    steps: CampaignStepRecord[],
+    extraArtifactIds: string[] = [],
+    nextPhase?: FusionPhase
+  ): CampaignSpecRecord {
+    if (campaign.fusion == null) {
+      return campaign;
+    }
+    const stepIds = new Set(steps.map((step) => step.id));
+    const artifactIds = [
+      ...new Set([
+        ...this.deps.store
+          .listArtifacts({ campaignId: campaign.id })
+          .filter((artifact) => artifact.stepId != null && stepIds.has(artifact.stepId))
+          .map((artifact) => artifact.id),
+        ...extraArtifactIds
+      ])
+    ];
+    const participatingAgents = [
+      ...new Set(
+        steps
+          .map((step) => step.agent ?? step.fusion?.candidate ?? step.fusion?.targetCandidate)
+          .filter((value): value is FusionCandidate => value != null)
+      )
+    ];
+    const previous = campaign.fusion.phaseSummaries.find((entry) => entry.phase === phase);
+    const summary: FusionPhaseSummaryRecord = {
+      phase,
+      createdAt: nowIso(),
+      participatingAgents: [...new Set([...(previous?.participatingAgents ?? []), ...participatingAgents])],
+      completedCount: (previous?.completedCount ?? 0) + steps.length,
+      failedCount: previous?.failedCount ?? 0,
+      skippedCount: previous?.skippedCount ?? 0,
+      artifactIds: [...new Set([...(previous?.artifactIds ?? []), ...artifactIds])],
+      ...(nextPhase != null ? { nextPhase } : previous?.nextPhase != null ? { nextPhase: previous.nextPhase } : {})
+    };
+    return {
+      ...campaign,
+      fusion: {
+        ...campaign.fusion,
+        phaseSummaries: [
+          ...campaign.fusion.phaseSummaries.filter((entry) => entry.phase !== phase),
+          summary
+        ]
+      }
+    };
+  }
+
+  private hasFusionCandidateEval(campaign: CampaignSpecRecord): boolean {
+    return campaign.steps.some((step) => step.fusion?.role === "candidate_eval");
+  }
+
+  private hasMergedEval(campaign: CampaignSpecRecord): boolean {
+    return campaign.steps.some((step) => step.id === "fusion-eval-merged");
   }
 
   private failCampaign(
@@ -1266,7 +1803,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     run: RunRecord
   ): CampaignSpecRecord {
     const updatedAt = run.finishedAt ?? nowIso();
-    const next: CampaignSpecRecord = {
+    let next: CampaignSpecRecord = {
       ...campaign,
       state: "failed",
       lastError: run.summary ?? run.outputText ?? "Campaign step failed.",
@@ -1276,6 +1813,18 @@ export class OrchestratorRuntime implements IOrchestrator {
       updatedAt
     };
     delete next.waitingApprovalStepId;
+    const failedStep = campaign.steps[stepIndex];
+    if (
+      next.fusion != null &&
+      (failedStep?.fusion?.role === "candidate_eval" || failedStep?.id === "fusion-eval-merged")
+    ) {
+      next = this.appendFusionEvent(next, {
+        type: "fusion_validation_failed",
+        phase: failedStep.id === "fusion-eval-merged" ? "merged_eval" : "candidate_eval",
+        ...(failedStep.fusion?.candidate != null ? { candidate: failedStep.fusion.candidate } : {}),
+        message: run.summary ?? "Fusion validation failed."
+      });
+    }
     this.deps.store.upsertCampaign(next);
     return next;
   }
@@ -1318,37 +1867,153 @@ export class OrchestratorRuntime implements IOrchestrator {
           kind: "candidate-diff",
           title: `${selectedAgent} candidate diff`
         }));
+        await this.finalizeFusionWorktreeCommit(
+          step.workingDirectory ?? project.rootDir,
+          `puppenfusion(${selectedAgent}): candidate for ${campaign.name}`
+        );
       } else if (step.fusion.role === "merge") {
         extraArtifacts.push(await this.captureFusionDiffArtifact(campaign, project, step, {
           kind: "candidate-diff",
           title: "Merged candidate diff"
         }));
+        await this.finalizeFusionWorktreeCommit(
+          step.workingDirectory ?? project.rootDir,
+          `puppenfusion(${selectedAgent}): resolve integration for ${campaign.name}`
+        );
       }
+    }
+    let artifactKind: ArtifactRecord["kind"];
+    let artifactTitle: string;
+    if (step.fusion?.role === "planning") {
+      artifactKind = "fusion-plan-review";
+      artifactTitle = `${selectedAgent} fusion plan`;
+    } else if (step.fusion?.role === "implementation") {
+      artifactKind = "implementation-memo";
+      artifactTitle = `${selectedAgent} implementation memo`;
+    } else if (step.fusion?.role === "peer_review") {
+      artifactKind = "peer-review";
+      artifactTitle = `${selectedAgent} peer review`;
+    } else if (step.fusion?.role === "merge") {
+      artifactKind = "merge-summary";
+      artifactTitle = `${selectedAgent} merged implementation summary`;
+    } else if (step.kind === "research") {
+      artifactKind = "research-dossier";
+      artifactTitle = step.title;
+    } else {
+      artifactKind = "report";
+      artifactTitle = step.title;
     }
     return {
       summary: summarizeText(outputText),
       outputText,
-      artifactKind:
-        step.fusion?.role === "implementation"
-          ? "implementation-memo"
-          : step.fusion?.role === "peer_review"
-            ? "peer-review"
-            : step.fusion?.role === "merge"
-              ? "merge-summary"
-              : step.kind === "research"
-                ? "research-dossier"
-                : "report",
-      artifactTitle:
-        step.fusion?.role === "implementation"
-          ? `${selectedAgent} implementation memo`
-          : step.fusion?.role === "peer_review"
-            ? `${selectedAgent} peer review`
-            : step.fusion?.role === "merge"
-              ? `${selectedAgent} merged implementation summary`
-              : step.title,
+      artifactKind,
+      artifactTitle,
       sessionName,
       ...(sessionScope === "campaign" ? { nextCampaignSessionName: sessionName } : {}),
       ...(extraArtifacts.length > 0 ? { extraArtifacts } : {})
+    };
+  }
+
+  private async executeFusionIntegrationStep(
+    campaign: CampaignSpecRecord,
+    step: CampaignStepRecord
+  ): Promise<StepExecutionResult> {
+    const fusion = campaign.fusion;
+    if (fusion == null) {
+      throw new PuppenclawError("FUSION_STATE_MISSING", "Missing puppenfusion campaign state.");
+    }
+    const mergedWorktree = fusion.worktrees.merged;
+    const notes: string[] = [];
+    await this.runGit(mergedWorktree.path, ["reset", "--hard", fusion.baseCommit]);
+    let mergedHead = fusion.baseCommit;
+    const mergedCandidateCommits: string[] = [];
+    for (const candidate of FUSION_CANDIDATES) {
+      const branch = fusion.worktrees[candidate].branch;
+      const candidateCommit = await this.readGitStdout(fusion.worktrees[candidate].path, ["rev-parse", "HEAD"]);
+      if (candidateCommit === fusion.baseCommit) {
+        notes.push(`${candidate}: no candidate commit to integrate`);
+        continue;
+      }
+      const mergeResult = await this.runGit(mergedWorktree.path, [
+        "merge",
+        "--no-ff",
+        "--no-edit",
+        branch
+      ]);
+      if (mergeResult.exitCode !== 0) {
+        const mergeHeadCheck = await this.runGit(mergedWorktree.path, [
+          "rev-parse",
+          "-q",
+          "--verify",
+          "MERGE_HEAD"
+        ]);
+        const hasMergeHead = mergeHeadCheck.exitCode === 0;
+        if (hasMergeHead) {
+          await this.runGit(mergedWorktree.path, ["merge", "--abort"]).catch(() => undefined);
+        }
+        await this.runGit(mergedWorktree.path, ["reset", "--hard", fusion.baseCommit]);
+        const report: FusionIntegrationReport = {
+          status: "conflict",
+          baseCommit: fusion.baseCommit,
+          mergedHead: fusion.baseCommit,
+          mergedBranch: mergedWorktree.branch,
+          mergedWorktreePath: mergedWorktree.path,
+          mergedCandidateCommits,
+          candidateBranches: {
+            codex: fusion.worktrees.codex.branch,
+            claude: fusion.worktrees.claude.branch
+          },
+          createdAt: nowIso(),
+          notes: [
+            ...notes,
+            `Conflict while merging ${candidate} (${branch}).`,
+            summarizeText(mergeResult.outputText, 400)
+          ]
+        };
+        return {
+          summary: "Automatic local integration hit a merge conflict. Resolver backend required.",
+          outputText: JSON.stringify(report, null, 2),
+          artifactKind: "integration-report",
+          artifactTitle: "Fusion integration report"
+        };
+      }
+      mergedCandidateCommits.push(candidateCommit);
+      mergedHead = await this.readGitStdout(mergedWorktree.path, ["rev-parse", "HEAD"]);
+      notes.push(`${candidate}: merged ${candidateCommit} into ${mergedHead}`);
+    }
+    for (const candidateCommit of mergedCandidateCommits) {
+      const reachability = await this.runGit(mergedWorktree.path, [
+        "merge-base",
+        "--is-ancestor",
+        candidateCommit,
+        mergedHead
+      ]);
+      if (reachability.exitCode !== 0) {
+        throw new PuppenclawError(
+          "FUSION_INTEGRATION_REACHABILITY_FAILED",
+          `Merged head ${mergedHead} does not contain candidate commit ${candidateCommit}.`
+        );
+      }
+    }
+    const report: FusionIntegrationReport = {
+      status: "succeeded",
+      baseCommit: fusion.baseCommit,
+      mergedHead,
+      mergedBranch: mergedWorktree.branch,
+      mergedWorktreePath: mergedWorktree.path,
+      mergedCandidateCommits,
+      candidateBranches: {
+        codex: fusion.worktrees.codex.branch,
+        claude: fusion.worktrees.claude.branch
+      },
+      createdAt: nowIso(),
+      notes
+    };
+    return {
+      summary: "Automatic local integration succeeded.",
+      outputText: JSON.stringify(report, null, 2),
+      artifactKind: "integration-report",
+      artifactTitle: "Fusion integration report"
     };
   }
 
@@ -1553,13 +2218,37 @@ export class OrchestratorRuntime implements IOrchestrator {
       `Base ref: ${fusion.baseRef}`,
       `Base commit: ${fusion.baseCommit}`,
       `Bundle hash: ${shortHash(fusion.bundleHash)}`,
-      `Working tree: ${step.workingDirectory ?? project.rootDir}`
+      `Working tree: ${step.workingDirectory ?? project.rootDir}`,
+      `PUPPENFUSION_ROLE: ${stepFusion.role}`,
+      ...(stepFusion.candidate != null ? [`PUPPENFUSION_CANDIDATE: ${stepFusion.candidate}`] : []),
+      ...(stepFusion.targetCandidate != null
+        ? [`PUPPENFUSION_TARGET: ${stepFusion.targetCandidate}`]
+        : [])
     ];
 
+    if (stepFusion.role === "planning") {
+      blocks.push(
+        "You are participating in the planning round of a puppenfusion run.",
+        "Do not implement yet.",
+        "Produce a structured planning proposal with these headings exactly:",
+        "## Scope",
+        "## Architecture",
+        "## Files",
+        "## Validation",
+        "## Risks",
+        `Sealed bundle:\n${bundleText}`
+      );
+      return blocks.join("\n\n");
+    }
+
     if (stepFusion.role === "implementation") {
+      const approvedPlanText = fusion.planArtifactId != null
+        ? await this.readArtifactText(campaign.id, fusion.planArtifactId)
+        : "[approved fusion plan missing]";
       blocks.push(
         "You are one of two independent implementation backends in a puppenfusion run.",
         "Treat the sealed bundle below as the full source of truth.",
+        "Use the approved fusion plan as an execution constraint.",
         "Implement the task in your assigned worktree.",
         "End your output with a structured implementation memo using these headings exactly:",
         "## Summary",
@@ -1567,7 +2256,8 @@ export class OrchestratorRuntime implements IOrchestrator {
         "## Decisions",
         "## Risks",
         "## Validation",
-        `Sealed bundle:\n${bundleText}`
+        `Sealed bundle:\n${bundleText}`,
+        `Approved fusion plan:\n${approvedPlanText}`
       );
       return blocks.join("\n\n");
     }
@@ -1580,6 +2270,10 @@ export class OrchestratorRuntime implements IOrchestrator {
       const targetMemo = await this.readFusionArtifactText(campaign.id, {
         stepId: `fusion-implement-${target}`,
         kind: "implementation-memo"
+      });
+      const targetCandidate = await this.readFusionArtifactText(campaign.id, {
+        stepId: `fusion-implement-${target}`,
+        kind: "fusion-candidate"
       });
       const targetDiff = await this.readFusionArtifactText(campaign.id, {
         stepId: `fusion-implement-${target}`,
@@ -1598,6 +2292,10 @@ export class OrchestratorRuntime implements IOrchestrator {
         "## Risks",
         "## Merge Guidance",
         `Sealed bundle:\n${bundleText}`,
+        fusion.planArtifactId != null
+          ? `Approved fusion plan:\n${await this.readArtifactText(campaign.id, fusion.planArtifactId)}`
+          : "Approved fusion plan:\n[missing]",
+        `Candidate handoff:\n${targetCandidate}`,
         `Candidate implementation memo:\n${targetMemo}`,
         `Candidate diff snapshot:\n${targetDiff}`,
         targetValidation != null
@@ -1608,6 +2306,17 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
 
     if (stepFusion.role === "merge") {
+      const planText = fusion.planArtifactId != null
+        ? await this.readArtifactText(campaign.id, fusion.planArtifactId)
+        : "[approved fusion plan missing]";
+      const codexCandidate = await this.readFusionArtifactText(campaign.id, {
+        stepId: "fusion-implement-codex",
+        kind: "fusion-candidate"
+      });
+      const claudeCandidate = await this.readFusionArtifactText(campaign.id, {
+        stepId: "fusion-implement-claude",
+        kind: "fusion-candidate"
+      });
       const codexMemo = await this.readFusionArtifactText(campaign.id, {
         stepId: "fusion-implement-codex",
         kind: "implementation-memo"
@@ -1643,6 +2352,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       }
       blocks.push(
         `You are the fixed preferred backend (${fusion.preferredAgent}) for the final puppenfusion merge run.`,
+        "Automatic local integration hit a conflict or unresolved path.",
         "Implement the strongest combined result in the merged worktree.",
         "Do not merely compare. Produce the integrated implementation.",
         "End with a structured merge summary using these headings exactly:",
@@ -1652,13 +2362,20 @@ export class OrchestratorRuntime implements IOrchestrator {
         "## Remaining Risks",
         "## Validation",
         `Sealed bundle:\n${bundleText}`,
+        `Approved fusion plan:\n${planText}`,
+        `Codex candidate handoff:\n${codexCandidate}`,
+        `Claude candidate handoff:\n${claudeCandidate}`,
         `Codex implementation memo:\n${codexMemo}`,
         `Claude implementation memo:\n${claudeMemo}`,
         `Codex diff snapshot:\n${codexDiff}`,
         `Claude diff snapshot:\n${claudeDiff}`,
         `Codex review of Claude:\n${codexReview}`,
         `Claude review of Codex:\n${claudeReview}`,
-        `OpenClaw fusion dossier:\n${dossierText}`
+        `OpenClaw fusion dossier:\n${dossierText}`,
+        `Integration report:\n${await this.readFusionArtifactText(campaign.id, {
+          stepId: "fusion-integrate",
+          kind: "integration-report"
+        })}`
       );
       return blocks.join("\n\n");
     }
@@ -1733,11 +2450,23 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   private async synthesizeFusionDossier(
     campaign: CampaignSpecRecord,
-    project: ProjectRecord
+    project: ProjectRecord,
+    steps: CampaignStepRecord[]
   ): Promise<CampaignSpecRecord> {
     if (campaign.fusion == null) {
       return campaign;
     }
+    const planText = campaign.fusion.planArtifactId != null
+      ? await this.readArtifactText(campaign.id, campaign.fusion.planArtifactId)
+      : "[fusion plan missing]";
+    const codexCandidate = await this.readFusionArtifactText(campaign.id, {
+      stepId: "fusion-implement-codex",
+      kind: "fusion-candidate"
+    });
+    const claudeCandidate = await this.readFusionArtifactText(campaign.id, {
+      stepId: "fusion-implement-claude",
+      kind: "fusion-candidate"
+    });
     const codexMemo = await this.readFusionArtifactText(campaign.id, {
       stepId: "fusion-implement-codex",
       kind: "implementation-memo"
@@ -1770,6 +2499,15 @@ export class OrchestratorRuntime implements IOrchestrator {
       `Base commit: ${campaign.fusion.baseCommit}`,
       `Preferred merge backend: ${campaign.fusion.preferredAgent}`,
       ``,
+      `## Approved Fusion Plan`,
+      summarizeText(planText, 1_400),
+      ``,
+      `## Codex Candidate Handoff`,
+      summarizeText(codexCandidate, 1_400),
+      ``,
+      `## Claude Candidate Handoff`,
+      summarizeText(claudeCandidate, 1_400),
+      ``,
       `## Codex Candidate`,
       summarizeText(codexMemo, 1_200),
       ``,
@@ -1789,7 +2527,8 @@ export class OrchestratorRuntime implements IOrchestrator {
       `## Merge Guidance`,
       `- Preserve ideas that both implementations or both reviews converge on.`,
       `- Prefer the lower-risk path when only one candidate argues for a change.`,
-      `- Use the fixed preferred backend only for the final merge run, not as evidence weighting.`,
+      `- Keep automatic local integration as the default path when the candidates merge cleanly.`,
+      `- Use the fixed preferred backend only when automatic integration reports a conflict or unresolved path.`,
       `- Return to the human only if the merge reveals a real scope, safety, or architecture fork.`
     ].join("\n");
     const relativePath = relativeArtifactPath({
@@ -1811,11 +2550,22 @@ export class OrchestratorRuntime implements IOrchestrator {
       ...campaign,
       fusion: {
         ...campaign.fusion,
-        dossierArtifactId: artifact.id
+        dossierArtifactId: artifact.id,
+        currentPhase: "integration",
+        lastCompletedPhase: "peer_review"
       }
     };
-    this.deps.store.upsertCampaign(next);
-    return next;
+    return this.recordFusionPhaseSummary(
+      this.appendFusionEvent(next, {
+        type: "fusion_review_completed",
+        phase: "peer_review",
+        message: "Peer review round completed and fusion dossier synthesized."
+      }),
+      "peer_review",
+      steps,
+      [artifact.id],
+      "integration"
+    );
   }
 
   private async captureFusionDiffArtifact(
@@ -1999,8 +2749,39 @@ export class OrchestratorRuntime implements IOrchestrator {
       command: "git",
       args,
       cwd,
-      env: {}
+      env: {
+        GIT_AUTHOR_NAME: "Puppenclaw",
+        GIT_AUTHOR_EMAIL: "puppenclaw@example.com",
+        GIT_COMMITTER_NAME: "Puppenclaw",
+        GIT_COMMITTER_EMAIL: "puppenclaw@example.com"
+      }
     });
+  }
+
+  private async finalizeFusionWorktreeCommit(cwd: string, message: string): Promise<void> {
+    const status = await this.readGitStdout(cwd, ["status", "--porcelain=v1", "--untracked-files=all"]);
+    if (status.trim().length === 0) {
+      return;
+    }
+    await this.runGit(cwd, ["add", "-A"]);
+    const result = await this.runProcess({
+      campaignId: "git",
+      command: "git",
+      args: ["commit", "-m", message],
+      cwd,
+      env: {
+        GIT_AUTHOR_NAME: "Puppenclaw",
+        GIT_AUTHOR_EMAIL: "puppenclaw@example.com",
+        GIT_COMMITTER_NAME: "Puppenclaw",
+        GIT_COMMITTER_EMAIL: "puppenclaw@example.com"
+      }
+    });
+    if (result.exitCode !== 0) {
+      throw new PuppenclawError(
+        "GIT_COMMIT_FAILED",
+        `git commit failed: ${summarizeText(result.outputText, 400)}`
+      );
+    }
   }
 
   private async writeArtifactFile(relativePath: string, content: string): Promise<{

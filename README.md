@@ -503,20 +503,27 @@ Use when you want both Codex and Claude to work from the same sealed project bri
 Behavior:
 - requires a clean git worktree at campaign start
 - creates separate local-only worktrees for the Codex candidate, the Claude candidate, and the final merged candidate
-- gives both implementation runs the same sealed bundle:
+- gives both planning and implementation runs the same sealed bundle:
   - task
   - scope and non-scope
   - constraints
   - validation plan
   - synced project context
   - exact base commit
+- runs a planning round first:
+  - Codex produces a structured plan review
+  - Claude produces a structured plan review
+  - OpenClaw synthesizes one canonical fusion plan
+- pauses for approval after the synthesized fusion plan and before implementation starts
 - requires both implementation runs to emit a structured implementation memo
+- records a structured candidate handoff artifact for each backend with commit and validation metadata
 - runs fresh cross-review sessions:
   - Codex reviews the Claude candidate
   - Claude reviews the Codex candidate
 - synthesizes a fusion dossier from both memos and both peer reviews
 - optionally sends that dossier to an external arbiter command if configured
-- runs one final merge pass with the fixed `fusionPreferredAgent`
+- attempts automatic local git integration first, without PRs or manual merging
+- only falls back to one final resolver merge pass with the fixed `fusionPreferredAgent` when automatic integration reports a conflict or unresolved path
 
 Use `fusionPreferredAgent` to choose which backend performs the final merge run. If omitted, Puppenclaw falls back to the project's `fusionPreferredAgent`, then `defaultAgent`, then the plugin default agent.
 

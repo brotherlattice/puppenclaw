@@ -69,8 +69,28 @@ export type CampaignStepRecord = {
 
 export type FusionCandidate = Extract<AgentKind, "claude" | "codex">;
 
+export type FusionPhase =
+  | "plan"
+  | "implement"
+  | "candidate_eval"
+  | "peer_review"
+  | "integration"
+  | "merged_eval";
+
+export type FusionApprovalState = "not_required" | "waiting" | "approved";
+
+export type FusionIntegrationState = "pending" | "succeeded" | "conflict" | "resolved";
+
 export type FusionStepConfig = {
-  role: "implementation" | "candidate_eval" | "peer_review" | "external_arbiter" | "merge";
+  role:
+    | "planning"
+    | "approval_gate"
+    | "implementation"
+    | "candidate_eval"
+    | "peer_review"
+    | "external_arbiter"
+    | "integration"
+    | "merge";
   candidate?: FusionCandidate;
   targetCandidate?: FusionCandidate;
 };
@@ -90,11 +110,63 @@ export type FusionCampaignRecord = {
   useExternalArbiter: boolean;
   bundleArtifactId: string;
   bundleHash: string;
+  currentPhase: FusionPhase;
+  approvalState: FusionApprovalState;
+  integrationState: FusionIntegrationState;
+  resolverUsed: boolean;
   worktrees: Record<FusionCandidate, FusionWorktreeRecord> & {
     merged: FusionWorktreeRecord;
   };
+  planArtifactId?: string;
   dossierArtifactId?: string;
   externalArbiterArtifactId?: string;
+  approvalGrantedAt?: string;
+  lastCompletedPhase?: FusionPhase;
+  candidateStates: Partial<Record<FusionCandidate, FusionCandidateRecord>>;
+  events: FusionEventRecord[];
+  phaseSummaries: FusionPhaseSummaryRecord[];
+};
+
+export type FusionCandidateRecord = {
+  status: "candidate" | "noop" | "abort" | "interrupted";
+  agent: FusionCandidate;
+  baseCommit: string;
+  worktreePath: string;
+  summary: string;
+  memoArtifactId: string;
+  diffArtifactId?: string;
+  validationArtifactId?: string;
+  createdAt: string;
+  artifactId?: string;
+  candidateCommit?: string;
+};
+
+export type FusionEventRecord = {
+  type:
+    | "fusion_plan_ready"
+    | "fusion_approved"
+    | "fusion_candidate_completed"
+    | "fusion_candidate_interrupted"
+    | "fusion_review_completed"
+    | "fusion_integration_succeeded"
+    | "fusion_integration_conflict"
+    | "fusion_validation_failed"
+    | "fusion_waiting_approval";
+  createdAt: string;
+  message: string;
+  phase: FusionPhase;
+  candidate?: FusionCandidate;
+};
+
+export type FusionPhaseSummaryRecord = {
+  phase: FusionPhase;
+  createdAt: string;
+  participatingAgents: string[];
+  completedCount: number;
+  failedCount: number;
+  skippedCount: number;
+  artifactIds: string[];
+  nextPhase?: FusionPhase;
 };
 
 export type CampaignSpecRecord = {
@@ -165,9 +237,13 @@ export type ArtifactRecord = {
     | "command-output"
     | "research-dossier"
     | "fusion-bundle"
+    | "fusion-plan"
+    | "fusion-plan-review"
+    | "fusion-candidate"
     | "implementation-memo"
     | "peer-review"
     | "fusion-dossier"
+    | "integration-report"
     | "merge-summary"
     | "candidate-diff";
   title: string;
