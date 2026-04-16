@@ -17,6 +17,7 @@ export type ProjectRecord = {
   rootDir: string;
   description?: string;
   defaultAgent?: AgentKind;
+  fusionPreferredAgent?: AgentKind;
   planningProfile?: PlanningProfile;
   permissionMode?: PermissionMode;
   effort?: EffortLevel;
@@ -57,10 +58,43 @@ export type CampaignStepRecord = {
   contextFiles: string[];
   approvalRequired: boolean;
   agent?: AgentKind;
+  phaseGroup?: string;
+  sessionScope?: "campaign" | "step";
   workingDirectory?: string;
   env: Record<string, string>;
   timeoutMs?: number;
   retryLimit: number;
+  fusion?: FusionStepConfig;
+};
+
+export type FusionCandidate = Extract<AgentKind, "claude" | "codex">;
+
+export type FusionStepConfig = {
+  role: "implementation" | "candidate_eval" | "peer_review" | "external_arbiter" | "merge";
+  candidate?: FusionCandidate;
+  targetCandidate?: FusionCandidate;
+};
+
+export type FusionWorktreeRecord = {
+  agent: FusionCandidate;
+  path: string;
+  branch: string;
+  baseRef: string;
+  baseCommit: string;
+};
+
+export type FusionCampaignRecord = {
+  baseRef: string;
+  baseCommit: string;
+  preferredAgent: FusionCandidate;
+  useExternalArbiter: boolean;
+  bundleArtifactId: string;
+  bundleHash: string;
+  worktrees: Record<FusionCandidate, FusionWorktreeRecord> & {
+    merged: FusionWorktreeRecord;
+  };
+  dossierArtifactId?: string;
+  externalArbiterArtifactId?: string;
 };
 
 export type CampaignSpecRecord = {
@@ -84,6 +118,7 @@ export type CampaignSpecRecord = {
   createdAt: string;
   updatedAt: string;
   state: CampaignState;
+  fusion?: FusionCampaignRecord;
 };
 
 export type RunRecord = {
@@ -124,7 +159,17 @@ export type ArtifactRecord = {
   runId?: string;
   stepId?: string;
   siteId: string;
-  kind: "context" | "report" | "command-output" | "research-dossier";
+  kind:
+    | "context"
+    | "report"
+    | "command-output"
+    | "research-dossier"
+    | "fusion-bundle"
+    | "implementation-memo"
+    | "peer-review"
+    | "fusion-dossier"
+    | "merge-summary"
+    | "candidate-diff";
   title: string;
   summary?: string;
   relativePath: string;

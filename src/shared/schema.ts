@@ -71,7 +71,8 @@ export const campaignTemplateZod = z.enum([
   "literature_review",
   "baseline_from_scratch",
   "ablation_campaign",
-  "self_improvement_loop"
+  "self_improvement_loop",
+  "puppenfusion"
 ]);
 export const campaignStateZod = z.enum([
   "draft",
@@ -148,6 +149,7 @@ export const orchestrationConfigZod = z
     allowLocalCommandExecution: z.boolean().default(true),
     defaultProjectRoot: nonEmptyString.optional(),
     gptResearcherCommand: nonEmptyString.optional(),
+    fusionArbiterCommand: nonEmptyString.optional(),
     localWorker: z
       .object({
         id: idString.default("local"),
@@ -233,6 +235,7 @@ export const projectCreateParamsZod = z
     rootDir: nonEmptyString,
     description: z.string().trim().optional(),
     defaultAgent: agentKindZod.optional(),
+    fusionPreferredAgent: agentKindZod.optional(),
     planningProfile: planningProfileZod.optional(),
     permissionMode: permissionModeZod.optional(),
     effort: effortLevelZod.optional(),
@@ -262,6 +265,8 @@ export const campaignStepParamsZod = z
     contextFiles: z.array(nonEmptyString).default([]),
     approvalRequired: z.boolean().default(false),
     agent: agentKindZod.optional(),
+    phaseGroup: nonEmptyString.optional(),
+    sessionScope: z.enum(["campaign", "step"]).optional(),
     workingDirectory: nonEmptyString.optional(),
     env: z.record(z.string(), z.string()).default({}),
     timeoutMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).optional(),
@@ -293,6 +298,9 @@ export const campaignRunParamsZod = z
     format: responseFormatZod.optional(),
     template: campaignTemplateZod.default("custom"),
     task: nonEmptyString.optional(),
+    fusionPreferredAgent: agentKindZod.optional(),
+    useExternalArbiter: z.boolean().optional(),
+    fusionBaseRef: nonEmptyString.optional(),
     evaluationCommand: z.string().trim().optional(),
     experimentCommands: z.array(nonEmptyString).default([]),
     experimentParallelism: z.number().int().min(1).max(16).default(1),
@@ -556,6 +564,9 @@ export const pluginManifestConfigSchema = {
         gptResearcherCommand: {
           type: "string"
         },
+        fusionArbiterCommand: {
+          type: "string"
+        },
         localWorker: {
           type: "object",
           additionalProperties: false,
@@ -693,6 +704,9 @@ export const toolProjectCreateSchema = Type.Object({
   rootDir: Type.String({ minLength: 1 }),
   description: Type.Optional(Type.String()),
   defaultAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
+  fusionPreferredAgent: Type.Optional(
+    Type.Union([Type.Literal("claude"), Type.Literal("codex")])
+  ),
   planningProfile: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])
   ),
@@ -769,6 +783,8 @@ const toolCampaignStepSchema = Type.Object({
   contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   approvalRequired: Type.Optional(Type.Boolean()),
   agent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
+  phaseGroup: Type.Optional(Type.String({ minLength: 1 })),
+  sessionScope: Type.Optional(Type.Union([Type.Literal("campaign"), Type.Literal("step")])),
   workingDirectory: Type.Optional(Type.String({ minLength: 1 })),
   env: Type.Optional(Type.Object({}, { additionalProperties: Type.String() })),
   timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 86400000 })),
@@ -786,10 +802,16 @@ export const toolCampaignRunSchema = Type.Object({
       Type.Literal("literature_review"),
       Type.Literal("baseline_from_scratch"),
       Type.Literal("ablation_campaign"),
-      Type.Literal("self_improvement_loop")
+      Type.Literal("self_improvement_loop"),
+      Type.Literal("puppenfusion")
     ])
   ),
   task: Type.Optional(Type.String({ minLength: 1 })),
+  fusionPreferredAgent: Type.Optional(
+    Type.Union([Type.Literal("claude"), Type.Literal("codex")])
+  ),
+  useExternalArbiter: Type.Optional(Type.Boolean()),
+  fusionBaseRef: Type.Optional(Type.String({ minLength: 1 })),
   evaluationCommand: Type.Optional(Type.String()),
   experimentCommands: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   experimentParallelism: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),

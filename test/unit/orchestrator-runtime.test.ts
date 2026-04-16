@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -9,6 +10,24 @@ import { OrchestratorStore } from "../../src/orchestrator/store.js";
 import { OutputRouter } from "../../src/plugin/output-router.js";
 import { createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
 import { SessionStore } from "../../src/shared/store.js";
+
+function runGit(cwd: string, args: string[]): string {
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Puppenclaw Test",
+      GIT_AUTHOR_EMAIL: "puppenclaw@example.com",
+      GIT_COMMITTER_NAME: "Puppenclaw Test",
+      GIT_COMMITTER_EMAIL: "puppenclaw@example.com"
+    }
+  });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+  return result.stdout.trim();
+}
 
 describe("OrchestratorRuntime", () => {
   it("creates projects, syncs context, and runs a baseline campaign", async () => {
@@ -189,6 +208,139 @@ describe("OrchestratorRuntime", () => {
         entry.role === "user" && entry.text.includes("deep planning pass first")
       )
     ).toBe(true);
+  });
+
+  it("runs puppenfusion in isolated worktrees and produces fusion artifacts", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-fusion-");
+    await writeFile(join(workspaceDir, "AGENTS.md"), "Follow the repo conventions.\n", "utf8");
+    await writeFile(join(workspaceDir, "README.md"), "# Fusion Demo\n", "utf8");
+    await writeFile(join(workspaceDir, "src.ts"), "export const value = 1;\n", "utf8");
+    await writeFile(
+      join(workspaceDir, ".gitignore"),
+      [".orchestrator/", "state.json", ".fake-acpx-state/"].join("\n") + "\n",
+      "utf8"
+    );
+    runGit(workspaceDir, ["init"]);
+    runGit(workspaceDir, ["add", "."]);
+    runGit(workspaceDir, ["commit", "-m", "initial"]);
+
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const outputRouter = new OutputRouter({
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    });
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand,
+        defaultAgent: "claude"
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store: sessionStore,
+      outputRouter
+    });
+    const runtime = new OrchestratorRuntime({
+      config: makeConfig({
+        acpxCommand,
+        defaultAgent: "claude"
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      sessionStore,
+      store: await OrchestratorStore.open(join(workspaceDir, ".orchestrator")),
+      sessionManager: manager
+    });
+
+    await runtime.createProject({
+      name: "fusion-project",
+      rootDir: workspaceDir,
+      defaultAgent: "claude",
+      fusionPreferredAgent: "codex",
+      planningProfile: "deep"
+    });
+    await runtime.syncContext({
+      projectId: "fusion-project",
+      includeFiles: ["AGENTS.md", "README.md"]
+    });
+
+    const campaign = await runtime.runCampaign({
+      projectId: "fusion-project",
+      workerId: "local",
+      name: "fusion-run",
+      template: "puppenfusion",
+      task: "Implement the feature cleanly from the sealed bundle.",
+      fusionPreferredAgent: "codex",
+      evaluationCommand: "printf 'tests-ok\\n'",
+      experimentCommands: [],
+      experimentParallelism: 1,
+      iterations: 1,
+      steps: []
+    });
+
+    const details = campaign.details as {
+      campaign: {
+        id: string;
+        state: string;
+        template: string;
+        fusion: {
+          baseCommit: string;
+          preferredAgent: string;
+          bundleArtifactId: string;
+          dossierArtifactId?: string;
+          worktrees: {
+            codex: { path: string; branch: string };
+            claude: { path: string; branch: string };
+            merged: { path: string; branch: string };
+          };
+        };
+      };
+      runs: Array<{
+        state: string;
+        sessionName?: string;
+        stepId: string;
+      }>;
+      artifacts: Array<{
+        id: string;
+        kind: string;
+        stepId?: string;
+        sha256: string;
+      }>;
+    };
+
+    expect(details.campaign.template).toBe("puppenfusion");
+    expect(details.campaign.state).toBe("completed");
+    expect(details.campaign.fusion.preferredAgent).toBe("codex");
+    expect(details.campaign.fusion.bundleArtifactId).toBeTruthy();
+    expect(details.campaign.fusion.dossierArtifactId).toBeTruthy();
+    expect(details.runs.length).toBe(8);
+    expect(details.runs.filter((run) => run.sessionName != null)).toHaveLength(5);
+    expect(details.artifacts.some((artifact) => artifact.kind === "fusion-bundle")).toBe(true);
+    expect(details.artifacts.filter((artifact) => artifact.kind === "implementation-memo")).toHaveLength(2);
+    expect(details.artifacts.filter((artifact) => artifact.kind === "peer-review")).toHaveLength(2);
+    expect(details.artifacts.filter((artifact) => artifact.kind === "candidate-diff")).toHaveLength(3);
+    expect(details.artifacts.some((artifact) => artifact.kind === "fusion-dossier")).toBe(true);
+    expect(details.artifacts.some((artifact) => artifact.kind === "merge-summary")).toBe(true);
+    expect(details.artifacts.every((artifact) => artifact.sha256.length > 0)).toBe(true);
+
+    expect(runGit(details.campaign.fusion.worktrees.codex.path, ["rev-parse", "HEAD"])).toBe(details.campaign.fusion.baseCommit);
+    expect(runGit(details.campaign.fusion.worktrees.claude.path, ["rev-parse", "HEAD"])).toBe(details.campaign.fusion.baseCommit);
+    expect(runGit(details.campaign.fusion.worktrees.merged.path, ["rev-parse", "HEAD"])).toBe(details.campaign.fusion.baseCommit);
+
+    const sessions = sessionStore.listSessions();
+    expect(sessions.filter((session) => session.name.includes("fusion-implement"))).toHaveLength(2);
+    expect(sessions.filter((session) => session.name.includes("fusion-review"))).toHaveLength(2);
+    expect(sessions.some((session) => session.name.includes("fusion-merge"))).toBe(true);
   });
 
   it("pauses for approval and resumes when approved", async () => {

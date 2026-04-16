@@ -31,6 +31,7 @@ metadata:
 - Create or reuse a project before running a campaign.
 - Store project defaults when they are stable:
   - `defaultAgent`
+  - `fusionPreferredAgent`
   - `planningProfile`
   - `permissionMode`
   - `effort`
@@ -65,6 +66,7 @@ metadata:
 - Prefer `literature_review` for citation-conscious research dossiers.
 - Prefer `ablation_campaign` when the operator already has concrete experiment commands.
 - Prefer `self_improvement_loop` when iterative plan -> code -> eval -> review cycles are desired.
+- Prefer `puppenfusion` when the operator wants Codex and Claude to receive the same sealed input, review each other's outputs, and merge the strongest parts into one final candidate.
 - Use `custom` only when the built-in templates do not fit.
 
 ## Raw session fallback

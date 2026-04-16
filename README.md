@@ -5,7 +5,7 @@ Puppenclaw is a native OpenClaw plugin that turns ACP-backed coding agents into 
 Today it provides:
 - named Claude Code or Codex ACP sessions
 - project registration and context capture
-- campaign templates for baseline work, literature review, ablations, and self-improvement loops
+- campaign templates for baseline work, literature review, ablations, self-improvement loops, and Codex-vs-Claude fusion runs
 - artifact capture and approval gates
 - optional daemon mode
 - `oc2oc`-aware remote control paths for mediated delegation between OpenClaw peers
@@ -23,6 +23,7 @@ Puppenclaw does **not** yet implement a full typed orchestration transport insid
   - `baseline_from_scratch`
   - `ablation_campaign`
   - `self_improvement_loop`
+  - `puppenfusion`
   - `custom`
 - Approval gating and resume
 - Artifact listing and retention pruning
@@ -434,6 +435,12 @@ Because `rootDir` is relative here, Puppenclaw resolves it under `orchestration.
 /puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"baseline","template":"baseline_from_scratch","task":"Implement the first working baseline for this repo.","evaluationCommand":"npm test"}
 ```
 
+Or run a fusion campaign that gives Codex and Claude the same sealed input bundle, cross-reviews both outputs, and performs a final merge pass:
+
+```text
+/puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"fusion-pass","template":"puppenfusion","task":"Implement the feature end to end.","evaluationCommand":"npm test","fusionPreferredAgent":"codex"}
+```
+
 8. Inspect status
 
 ```text
@@ -488,6 +495,36 @@ Repeats:
 - review
 
 Control loop size with `iterations`.
+
+### `puppenfusion`
+
+Use when you want both Codex and Claude to work from the same sealed project brief, then fuse the results into a stronger final implementation.
+
+Behavior:
+- requires a clean git worktree at campaign start
+- creates separate local-only worktrees for the Codex candidate, the Claude candidate, and the final merged candidate
+- gives both implementation runs the same sealed bundle:
+  - task
+  - scope and non-scope
+  - constraints
+  - validation plan
+  - synced project context
+  - exact base commit
+- requires both implementation runs to emit a structured implementation memo
+- runs fresh cross-review sessions:
+  - Codex reviews the Claude candidate
+  - Claude reviews the Codex candidate
+- synthesizes a fusion dossier from both memos and both peer reviews
+- optionally sends that dossier to an external arbiter command if configured
+- runs one final merge pass with the fixed `fusionPreferredAgent`
+
+Use `fusionPreferredAgent` to choose which backend performs the final merge run. If omitted, Puppenclaw falls back to the project's `fusionPreferredAgent`, then `defaultAgent`, then the plugin default agent.
+
+Example:
+
+```text
+/puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"feature-fusion","template":"puppenfusion","task":"Implement the feature end to end.","evaluationCommand":"npm test","fusionPreferredAgent":"claude","useExternalArbiter":true}
+```
 
 ### `custom`
 
