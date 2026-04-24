@@ -23,3 +23,5 @@ pnpm-debug.log*
 .puppenclaw-daemon/
 .fake-acpx-state/
 .fake-acpx-state.json
+CLAUDE.md
+.claude
