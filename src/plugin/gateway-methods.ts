@@ -7,6 +7,9 @@ import {
   campaignStatusParamsZod,
   contextSyncParamsZod,
   projectCreateParamsZod,
+  reassessmentReportParamsZod,
+  reassessmentStartParamsZod,
+  reassessmentStatusParamsZod,
   workerManifestZod
 } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
@@ -20,7 +23,10 @@ export const PUPPENCLAW_GATEWAY_METHODS = {
   status: "puppenclaw.campaignStatus",
   artifacts: "puppenclaw.artifacts",
   approve: "puppenclaw.campaignApprove",
-  cancel: "puppenclaw.campaignCancel"
+  cancel: "puppenclaw.campaignCancel",
+  startReassessment: "puppenclaw.reassessmentStart",
+  reassessmentStatus: "puppenclaw.reassessmentStatus",
+  reassessmentReport: "puppenclaw.reassessmentReport"
 } as const;
 
 export function registerPuppenclawGatewayMethods(api: OpenClawPluginApi): void {
@@ -65,6 +71,21 @@ export function registerPuppenclawGatewayMethods(api: OpenClawPluginApi): void {
   api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.cancel, handle(async ({ params }) => {
     return getPuppenclawOrchestrator().then((runtime) =>
       runtime.cancel(campaignActionParamsZod.parse(params))
+    );
+  }));
+  api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.startReassessment, handle(async ({ params }) => {
+    return getPuppenclawOrchestrator().then((runtime) =>
+      runtime.startReassessment(reassessmentStartParamsZod.parse(params))
+    );
+  }));
+  api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.reassessmentStatus, handle(async ({ params }) => {
+    return getPuppenclawOrchestrator().then((runtime) =>
+      runtime.reassessmentStatus(reassessmentStatusParamsZod.parse(params ?? {}))
+    );
+  }));
+  api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.reassessmentReport, handle(async ({ params }) => {
+    return getPuppenclawOrchestrator().then((runtime) =>
+      runtime.reassessmentReport(reassessmentReportParamsZod.parse(params))
     );
   }));
 }

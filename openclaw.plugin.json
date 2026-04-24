@@ -138,6 +138,9 @@
           "gptResearcherCommand": {
             "type": "string"
           },
+          "fusionArbiterCommand": {
+            "type": "string"
+          },
           "localWorker": {
             "type": "object",
             "additionalProperties": false,

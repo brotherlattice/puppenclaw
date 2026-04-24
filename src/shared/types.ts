@@ -22,6 +22,11 @@ import type {
   planningProfileZod,
   pluginConfigZod,
   projectCreateParamsZod,
+  reassessmentProviderZod,
+  reassessmentReportParamsZod,
+  reassessmentStartParamsZod,
+  reassessmentStateZod,
+  reassessmentStatusParamsZod,
   remoteControlConfigZod,
   resumeParamsZod,
   runStateZod,
@@ -73,6 +78,11 @@ export type OrchestrationStepKind = z.infer<typeof orchestrationStepKindZod>;
 export type OrchestrationExecutor = z.infer<typeof orchestrationExecutorZod>;
 export type CampaignTemplate = z.infer<typeof campaignTemplateZod>;
 export type CampaignState = z.infer<typeof campaignStateZod>;
+export type ReassessmentProvider = z.infer<typeof reassessmentProviderZod>;
+export type ReassessmentState = z.infer<typeof reassessmentStateZod>;
+export type ReassessmentStartParams = z.infer<typeof reassessmentStartParamsZod>;
+export type ReassessmentStatusParams = z.infer<typeof reassessmentStatusParamsZod>;
+export type ReassessmentReportParams = z.infer<typeof reassessmentReportParamsZod>;
 export type RunState = z.infer<typeof runStateZod>;
 
 export type ToolTextBlock = {

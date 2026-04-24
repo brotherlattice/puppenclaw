@@ -28,6 +28,9 @@ metadata:
   - `puppenclaw_artifacts`
   - `puppenclaw_campaign_approve`
   - `puppenclaw_campaign_cancel`
+  - `puppenclaw_reassessment_start`
+  - `puppenclaw_reassessment_status`
+  - `puppenclaw_reassessment_report`
 - Create or reuse a project before running a campaign.
 - Store project defaults when they are stable:
   - `defaultAgent`
@@ -67,6 +70,7 @@ metadata:
 - Prefer `ablation_campaign` when the operator already has concrete experiment commands.
 - Prefer `self_improvement_loop` when iterative plan -> code -> eval -> review cycles are desired.
 - Prefer `puppenfusion` when the operator wants Codex and Claude to receive the same sealed input, review each other's outputs, and merge the strongest parts into one final candidate.
+- Prefer reassessment tools when the operator wants a newer model to inspect prior sessions for conservative old-model mistake patches.
 - Use `custom` only when the built-in templates do not fit.
 
 ## Raw session fallback

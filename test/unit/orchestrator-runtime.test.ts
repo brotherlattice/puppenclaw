@@ -210,6 +210,142 @@ describe("OrchestratorRuntime", () => {
     ).toBe(true);
   });
 
+  it("reassesses prior sessions on an isolated branch and records a report", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-reassess-");
+    await writeFile(join(workspaceDir, "README.md"), "# Reassess Demo\n", "utf8");
+    await writeFile(
+      join(workspaceDir, ".gitignore"),
+      [".orchestrator/", "state.json", ".fake-acpx-state/"].join("\n") + "\n",
+      "utf8"
+    );
+    runGit(workspaceDir, ["init"]);
+    runGit(workspaceDir, ["add", "."]);
+    runGit(workspaceDir, ["commit", "-m", "initial"]);
+
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    await sessionStore.upsertSession({
+      name: "old-codex-session",
+      agent: "codex",
+      directory: workspaceDir,
+      state: "completed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastActivity: "2026-01-01T00:10:00.000Z",
+      permissionMode: "approve-all",
+      model: "old-model",
+      warnings: [],
+      transcript: [
+        {
+          role: "user",
+          text: "Please implement the missing reassessment fix.",
+          createdAt: "2026-01-01T00:00:00.000Z"
+        },
+        {
+          role: "assistant",
+          text: "I misunderstood and did not add the required file.",
+          createdAt: "2026-01-01T00:05:00.000Z"
+        }
+      ]
+    });
+    const outputRouter = new OutputRouter({
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    });
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store: sessionStore,
+      outputRouter
+    });
+    const runtime = new OrchestratorRuntime({
+      config: makeConfig({
+        acpxCommand
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      sessionStore,
+      store: await OrchestratorStore.open(join(workspaceDir, ".orchestrator")),
+      sessionManager: manager
+    });
+
+    await runtime.createProject({
+      name: "reassess-project",
+      rootDir: workspaceDir,
+      defaultAgent: "codex",
+      permissionMode: "approve-all"
+    });
+
+    const result = await runtime.startReassessment({
+      projectId: "reassess-project",
+      workerId: "local",
+      targetModel: "new-model",
+      providers: ["puppenclaw"],
+      validationCommand: "test -f reassessment-fix.txt",
+      limit: 10
+    });
+    const details = result.details as {
+      id: string;
+      state: string;
+      branch: string;
+      worktreePath: string;
+      validationExitCode: number;
+      patchCommit?: string;
+      importedSessions: Array<{
+        provider: string;
+      }>;
+      artifactIds: {
+        report?: string;
+        patch?: string;
+        validation?: string;
+      };
+    };
+
+    expect(details.state).toBe("completed");
+    expect(details.branch).toContain("puppenclaw-reassess-");
+    expect(details.validationExitCode).toBe(0);
+    expect(details.patchCommit).toBeTruthy();
+    expect(details.importedSessions.some((session) => session.provider === "puppenclaw")).toBe(true);
+    expect(details.artifactIds.report).toBeTruthy();
+    expect(details.artifactIds.patch).toBeTruthy();
+    expect(details.artifactIds.validation).toBeTruthy();
+    expect(runGit(workspaceDir, ["status", "--porcelain=v1"])).toBe("");
+    expect(runGit(details.worktreePath, ["branch", "--show-current"])).toBe(details.branch);
+
+    const report = await runtime.reassessmentReport({
+      reassessmentId: details.id
+    });
+    expect(report.content[0]?.text).toContain("Model Reassessment Output");
+    expect(report.content[0]?.text).toContain("old-model mistake");
+
+    const repeat = await runtime.startReassessment({
+      projectId: "reassess-project",
+      workerId: "local",
+      targetModel: "new-model",
+      providers: ["puppenclaw"],
+      validationCommand: "true",
+      limit: 10
+    });
+    const repeatDetails = repeat.details as {
+      importedSessions: unknown[];
+      warnings: string[];
+    };
+    expect(repeatDetails.importedSessions).toHaveLength(0);
+    expect(repeatDetails.warnings.some((warning) => warning.includes("already reassessed"))).toBe(true);
+  });
+
   it("runs puppenfusion in isolated worktrees and produces fusion artifacts", async () => {
     const workspaceDir = await createTempDir("puppenclaw-fusion-");
     await writeFile(join(workspaceDir, "AGENTS.md"), "Follow the repo conventions.\n", "utf8");
@@ -342,6 +478,7 @@ describe("OrchestratorRuntime", () => {
       campaign: {
         id: string;
         state: string;
+        lastError?: string;
         fusion: {
           baseCommit: string;
           preferredAgent: string;
@@ -384,7 +521,7 @@ describe("OrchestratorRuntime", () => {
       }>;
     };
 
-    expect(details.campaign.state).toBe("completed");
+    expect(details.campaign.state, details.campaign.lastError).toBe("completed");
     expect(details.campaign.fusion.approvalState).toBe("approved");
     expect(details.campaign.fusion.integrationState).toBe("succeeded");
     expect(details.campaign.fusion.resolverUsed).toBe(false);

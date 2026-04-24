@@ -17,6 +17,9 @@ import {
   forkParamsZod,
   logsParamsZod,
   projectCreateParamsZod,
+  reassessmentReportParamsZod,
+  reassessmentStartParamsZod,
+  reassessmentStatusParamsZod,
   resumeParamsZod,
   siteStatusParamsZod,
   sendParamsZod,
@@ -191,6 +194,33 @@ export async function createDaemonServer(params: {
 
   app.post("/orchestrator/cancel", async (request) =>
     ok(await orchestrator.cancel(campaignActionParamsZod.parse(request.body)))
+  );
+
+  app.post("/orchestrator/reassessment", async (request) =>
+    ok(await orchestrator.startReassessment(reassessmentStartParamsZod.parse(request.body)))
+  );
+
+  app.get("/orchestrator/reassessment/status", async (request) =>
+    ok(
+      await orchestrator.reassessmentStatus(
+        reassessmentStatusParamsZod.parse({
+          reassessmentId: (request.query as { reassessmentId?: string }).reassessmentId,
+          projectId: (request.query as { projectId?: string }).projectId,
+          format: (request.query as { format?: "text" | "json" }).format
+        })
+      )
+    )
+  );
+
+  app.get("/orchestrator/reassessment/report", async (request) =>
+    ok(
+      await orchestrator.reassessmentReport(
+        reassessmentReportParamsZod.parse({
+          reassessmentId: (request.query as { reassessmentId?: string }).reassessmentId,
+          format: (request.query as { format?: "text" | "json" }).format
+        })
+      )
+    )
   );
 
   app.get("/site/status", async (request) =>

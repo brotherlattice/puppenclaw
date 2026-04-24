@@ -183,6 +183,9 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
   elif [[ "$normalized_input" == *"PUPPENFUSION_ROLE: merge"* ]]; then
     printf '%s\n' 'resolved merged output' > "$cwd/merged-candidate.txt"
     reply=$'## Summary\nResolved the fusion merge in the merged worktree.\n## Incorporated from Codex\n- Preserved the direct candidate change.\n## Incorporated from Claude\n- Preserved the readable candidate change.\n## Remaining Risks\n- Low.\n## Validation\n- Ready for evaluation.'
+  elif [[ "$normalized_input" == *"PUPPENCLAW_REASSESSMENT"* ]]; then
+    printf '%s\n' 'conservative reassessment fix' > "$cwd/reassessment-fix.txt"
+    reply=$'## Executive judgment\nPatched one obvious old-model mistake.\n## Imported sessions reviewed\n- Reviewed imported fixtures.\n## Findings by importance\n- functionality: missing reassessment-fix.txt was an obvious prior omission.\n## Patches made\n- Added reassessment-fix.txt.\n## Findings intentionally not patched\n- No refactor-only findings patched.\n## Validation instructions and residual risk\n- Run the configured validation command.'
   elif [[ "$normalized_input" == *"ASK_USER"* ]]; then
     reply="Need input from the user?"
   else

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { buildPluginManifest, pluginConfigZod } from "../../src/shared/schema.js";
+import {
+  buildPluginManifest,
+  pluginConfigZod,
+  reassessmentStartParamsZod,
+  REMOTE_CONTROL_VERBS
+} from "../../src/shared/schema.js";
 
 describe("plugin manifest and config schema", () => {
   it("emits orchestration config in the generated manifest", () => {
@@ -19,5 +24,18 @@ describe("plugin manifest and config schema", () => {
     expect(parsed.orchestration.enabled).toBe(true);
     expect(parsed.orchestration.localWorker.id).toBe("local");
     expect(parsed.orchestration.allowLocalCommandExecution).toBe(true);
+  });
+
+  it("parses reassessment defaults and exposes remote verbs", () => {
+    const parsed = reassessmentStartParamsZod.parse({
+      projectId: "demo",
+      workerId: "local",
+      targetModel: "new-model"
+    });
+    expect(parsed.providers).toEqual(["puppenclaw", "codex", "claude"]);
+    expect(parsed.limit).toBe(20);
+    expect(REMOTE_CONTROL_VERBS).toContain("reassess");
+    expect(REMOTE_CONTROL_VERBS).toContain("reassess-status");
+    expect(REMOTE_CONTROL_VERBS).toContain("reassess-report");
   });
 });

@@ -14,6 +14,9 @@ import {
   forkParamsZod,
   logsParamsZod,
   projectCreateParamsZod,
+  reassessmentReportParamsZod,
+  reassessmentStartParamsZod,
+  reassessmentStatusParamsZod,
   resumeParamsZod,
   sendParamsZod,
   siteStatusParamsZod,
@@ -29,6 +32,9 @@ import {
   toolForkSchema,
   toolLogsSchema,
   toolProjectCreateSchema,
+  toolReassessmentReportSchema,
+  toolReassessmentStartSchema,
+  toolReassessmentStatusSchema,
   toolResumeSchema,
   toolSendSchema,
   toolSiteStatusSchema,
@@ -142,6 +148,36 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const orchestrator = await getPuppenclawOrchestrator();
         return orchestrator.cancel(campaignActionParamsZod.parse(rawParams));
+      }
+    },
+    {
+      name: "puppenclaw_reassessment_start",
+      label: "Start Puppenclaw reassessment",
+      description: "Reassess prior Puppenclaw, Codex, and Claude Code sessions with a target model, patch conservatively on a new branch, and validate.",
+      parameters: toolReassessmentStartSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const orchestrator = await getPuppenclawOrchestrator();
+        return orchestrator.startReassessment(reassessmentStartParamsZod.parse(rawParams));
+      }
+    },
+    {
+      name: "puppenclaw_reassessment_status",
+      label: "Puppenclaw reassessment status",
+      description: "Inspect model reassessment runs and their branch, validation, and artifact status.",
+      parameters: toolReassessmentStatusSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const orchestrator = await getPuppenclawOrchestrator();
+        return orchestrator.reassessmentStatus(reassessmentStatusParamsZod.parse(rawParams ?? {}));
+      }
+    },
+    {
+      name: "puppenclaw_reassessment_report",
+      label: "Puppenclaw reassessment report",
+      description: "Fetch the full conservative patch report for a model reassessment run.",
+      parameters: toolReassessmentReportSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const orchestrator = await getPuppenclawOrchestrator();
+        return orchestrator.reassessmentReport(reassessmentReportParamsZod.parse(rawParams));
       }
     },
     {

@@ -7,6 +7,8 @@ import type {
   OrchestrationStepKind,
   PermissionMode,
   PlanningProfile,
+  ReassessmentProvider,
+  ReassessmentState,
   RunState,
   WorkerManifestInput
 } from "../shared/types.js";
@@ -245,7 +247,11 @@ export type ArtifactRecord = {
     | "fusion-dossier"
     | "integration-report"
     | "merge-summary"
-    | "candidate-diff";
+    | "candidate-diff"
+    | "reassessment-plan"
+    | "reassessment-report"
+    | "reassessment-validation"
+    | "reassessment-patch";
   title: string;
   summary?: string;
   relativePath: string;
@@ -253,6 +259,52 @@ export type ArtifactRecord = {
   sizeBytes: number;
   sha256: string;
   files?: ArtifactFileRecord[];
+};
+
+export type ImportedReassessmentSession = {
+  id: string;
+  provider: ReassessmentProvider;
+  title: string;
+  sourcePath?: string;
+  projectRoot?: string;
+  detectedModel?: string;
+  createdAt?: string;
+  updatedAt: string;
+  transcriptHash: string;
+  transcriptChars: number;
+  transcriptPreview: string;
+};
+
+export type ReassessmentArtifactIds = {
+  plan?: string;
+  patch?: string;
+  validation?: string;
+  report?: string;
+};
+
+export type ReassessmentRecord = {
+  id: string;
+  projectId: string;
+  workerId: string;
+  state: ReassessmentState;
+  targetModel: string;
+  targetAgent: AgentKind;
+  providers: ReassessmentProvider[];
+  baseRef: string;
+  baseCommit?: string;
+  branch?: string;
+  worktreePath?: string;
+  validationCommand?: string;
+  validationExitCode?: number;
+  patchCommit?: string;
+  importedSessions: ImportedReassessmentSession[];
+  warnings: string[];
+  artifactIds: ReassessmentArtifactIds;
+  reportText?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
 };
 
 export type CampaignProgressSnapshot = {
@@ -285,6 +337,9 @@ export interface IOrchestrator {
   listArtifacts(params: import("../shared/types.js").ArtifactListParams): Promise<import("../shared/types.js").ToolResult>;
   approve(params: import("../shared/types.js").CampaignActionParams): Promise<import("../shared/types.js").ToolResult>;
   cancel(params: import("../shared/types.js").CampaignActionParams): Promise<import("../shared/types.js").ToolResult>;
+  startReassessment(params: import("../shared/types.js").ReassessmentStartParams): Promise<import("../shared/types.js").ToolResult>;
+  reassessmentStatus(params: import("../shared/types.js").ReassessmentStatusParams): Promise<import("../shared/types.js").ToolResult>;
+  reassessmentReport(params: import("../shared/types.js").ReassessmentReportParams): Promise<import("../shared/types.js").ToolResult>;
   siteStatus(params?: import("../shared/types.js").SiteStatusParams): Promise<import("../shared/types.js").ToolResult>;
   logs(params: import("../shared/types.js").LogsParams): Promise<import("../shared/types.js").ToolResult>;
 }

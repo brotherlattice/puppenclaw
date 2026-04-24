@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -17,7 +18,7 @@ export async function ensureDir(path: string): Promise<void> {
 
 export async function writeJsonFileAtomic(path: string, value: unknown): Promise<void> {
   await ensureDir(dirname(path));
-  const tmpPath = `${path}.tmp`;
+  const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   await rename(tmpPath, path);
 }

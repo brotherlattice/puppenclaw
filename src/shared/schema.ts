@@ -27,6 +27,9 @@ export const REMOTE_CONTROL_VERBS = [
   "artifacts",
   "approve",
   "cancel",
+  "reassess",
+  "reassess-status",
+  "reassess-report",
   "site-status",
   "logs",
   "start",
@@ -82,6 +85,8 @@ export const campaignStateZod = z.enum([
   "failed",
   "cancelled"
 ]);
+export const reassessmentProviderZod = z.enum(["puppenclaw", "codex", "claude"]);
+export const reassessmentStateZod = z.enum(["running", "completed", "failed"]);
 export const runStateZod = z.enum([
   "pending",
   "queued",
@@ -330,6 +335,36 @@ export const artifactListParamsZod = z
 export const campaignActionParamsZod = z
   .object({
     campaignId: idString,
+    format: responseFormatZod.optional()
+  })
+  .strict();
+
+export const reassessmentStartParamsZod = z
+  .object({
+    projectId: idString,
+    workerId: idString,
+    targetModel: nonEmptyString,
+    targetAgent: agentKindZod.optional(),
+    providers: z.array(reassessmentProviderZod).default(["puppenclaw", "codex", "claude"]),
+    validationCommand: z.string().trim().optional(),
+    baseRef: nonEmptyString.optional(),
+    limit: z.number().int().min(1).max(200).default(20),
+    format: responseFormatZod.optional()
+  })
+  .strict();
+
+export const reassessmentStatusParamsZod = z
+  .object({
+    reassessmentId: idString.optional(),
+    projectId: idString.optional(),
+    format: responseFormatZod.optional()
+  })
+  .strict()
+  .default({});
+
+export const reassessmentReportParamsZod = z
+  .object({
+    reassessmentId: idString,
     format: responseFormatZod.optional()
   })
   .strict();
@@ -833,6 +868,37 @@ export const toolArtifactsSchema = Type.Object({
 
 export const toolCampaignActionSchema = Type.Object({
   campaignId: Type.String({ minLength: 1 }),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolReassessmentStartSchema = Type.Object({
+  projectId: Type.String({ minLength: 1 }),
+  workerId: Type.String({ minLength: 1 }),
+  targetModel: Type.String({ minLength: 1 }),
+  targetAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
+  providers: Type.Optional(
+    Type.Array(
+      Type.Union([
+        Type.Literal("puppenclaw"),
+        Type.Literal("codex"),
+        Type.Literal("claude")
+      ])
+    )
+  ),
+  validationCommand: Type.Optional(Type.String()),
+  baseRef: Type.Optional(Type.String({ minLength: 1 })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolReassessmentStatusSchema = Type.Object({
+  reassessmentId: Type.Optional(Type.String({ minLength: 1 })),
+  projectId: Type.Optional(Type.String({ minLength: 1 })),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolReassessmentReportSchema = Type.Object({
+  reassessmentId: Type.String({ minLength: 1 }),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
 });
 

@@ -8,12 +8,19 @@ import type {
   CampaignProgressSnapshot,
   CampaignStatusSnapshot,
   ProjectRecord,
+  ReassessmentRecord,
   RunRecord,
   WorkerRecord
 } from "./types.js";
 import { ensureDir } from "../shared/utils.js";
 
-type JsonValue = ProjectRecord | WorkerRecord | CampaignSpecRecord | RunRecord | ArtifactRecord;
+type JsonValue =
+  | ProjectRecord
+  | WorkerRecord
+  | CampaignSpecRecord
+  | RunRecord
+  | ArtifactRecord
+  | ReassessmentRecord;
 const NODE_SQLITE_SPECIFIER = `node${":sqlite"}`;
 
 function parseJson<T extends JsonValue>(value: unknown): T {
@@ -64,6 +71,11 @@ export class OrchestratorStore {
         project_id TEXT NOT NULL,
         campaign_id TEXT,
         run_id TEXT,
+        payload TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS reassessments (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
         payload TEXT NOT NULL
       );
     `);
@@ -166,6 +178,13 @@ export class OrchestratorStore {
       );
   }
 
+  getArtifact(artifactId: string): ArtifactRecord | null {
+    const row = this.db.prepare("SELECT payload FROM artifacts WHERE id = ?").get(artifactId) as
+      | { payload: string }
+      | undefined;
+    return row != null ? parseJson<ArtifactRecord>(row.payload) : null;
+  }
+
   listArtifacts(params: { projectId?: string | undefined; campaignId?: string | undefined } = {}): ArtifactRecord[] {
     let query = "SELECT payload FROM artifacts";
     const values: string[] = [];
@@ -185,6 +204,26 @@ export class OrchestratorStore {
 
   deleteArtifact(artifactId: string): void {
     this.db.prepare("DELETE FROM artifacts WHERE id = ?").run(artifactId);
+  }
+
+  upsertReassessment(reassessment: ReassessmentRecord): void {
+    this.db
+      .prepare("INSERT INTO reassessments (id, project_id, payload) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, project_id = excluded.project_id")
+      .run(reassessment.id, reassessment.projectId, JSON.stringify(reassessment));
+  }
+
+  getReassessment(reassessmentId: string): ReassessmentRecord | null {
+    const row = this.db.prepare("SELECT payload FROM reassessments WHERE id = ?").get(reassessmentId) as
+      | { payload: string }
+      | undefined;
+    return row != null ? parseJson<ReassessmentRecord>(row.payload) : null;
+  }
+
+  listReassessments(projectId?: string): ReassessmentRecord[] {
+    const rows = projectId == null
+      ? this.db.prepare("SELECT payload FROM reassessments ORDER BY id").all()
+      : this.db.prepare("SELECT payload FROM reassessments WHERE project_id = ? ORDER BY id").all(projectId);
+    return rows.map((row) => parseJson<ReassessmentRecord>((row as { payload: string }).payload));
   }
 
   getCampaignSnapshot(campaignId: string): CampaignStatusSnapshot | null {

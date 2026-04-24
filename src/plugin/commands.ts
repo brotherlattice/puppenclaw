@@ -17,6 +17,9 @@ import {
   forkParamsZod,
   logsParamsZod,
   projectCreateParamsZod,
+  reassessmentReportParamsZod,
+  reassessmentStartParamsZod,
+  reassessmentStatusParamsZod,
   resumeParamsZod,
   siteStatusParamsZod,
   sendParamsZod,
@@ -84,6 +87,8 @@ function flattenResultText(result: { content: Array<{ text: string }> }): string
 const READ_ONLY_VERBS = new Set<RemoteVerb>([
   "campaign-status",
   "artifacts",
+  "reassess-status",
+  "reassess-report",
   "site-status",
   "logs",
   "status",
@@ -136,6 +141,9 @@ function renderHelp(): string {
     "artifacts {\"campaignId\":\"camp-...\"}",
     "approve {\"campaignId\":\"camp-...\"}",
     "cancel {\"campaignId\":\"camp-...\"}",
+    "reassess {\"projectId\":\"ml-research\",\"workerId\":\"local\",\"targetModel\":\"gpt-new\",\"validationCommand\":\"npm test\"}",
+    "reassess-status {\"projectId\":\"ml-research\"}",
+    "reassess-report {\"reassessmentId\":\"reassess-...\"}",
     "site-status {\"verbose\":true}",
     "logs {\"campaignId\":\"camp-...\",\"limitChars\":12000}",
     "bind",
@@ -314,6 +322,15 @@ async function resolveRunProjectRoot(runId: string): Promise<string> {
     throw new Error(`Unknown run ${runId}.`);
   }
   return resolveProjectRoot(run.projectId);
+}
+
+async function resolveReassessmentProjectRoot(reassessmentId: string): Promise<string> {
+  const store = await getPuppenclawOrchestratorStore();
+  const reassessment = store.getReassessment(reassessmentId);
+  if (reassessment == null) {
+    throw new Error(`Unknown reassessment ${reassessmentId}.`);
+  }
+  return resolveProjectRoot(reassessment.projectId);
 }
 
 async function handleBindingCommand(ctx: PluginCommandContext): Promise<{ text: string }> {
@@ -539,6 +556,55 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
               });
             }
             const result = await orchestrator.cancel(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "reassess": {
+            const params = reassessmentStartParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              await requirePurePipeExposure(ctx, {
+                verb: "reassess",
+                projectRoot: await resolveProjectRoot(params.projectId),
+                ...(params.targetAgent != null ? { agent: params.targetAgent } : {})
+              });
+            }
+            const result = await orchestrator.startReassessment(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "reassess-status": {
+            const params = reassessmentStatusParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              const auth = await requirePurePipeExposure(ctx, {
+                verb: "reassess-status",
+                projectRoot:
+                  params.reassessmentId != null
+                    ? await resolveReassessmentProjectRoot(params.reassessmentId)
+                    : params.projectId != null
+                      ? await resolveProjectRoot(params.projectId)
+                      : null
+              });
+              if (
+                params.reassessmentId == null &&
+                params.projectId == null &&
+                auth.exposure.allowedProjectRoots.length > 0
+              ) {
+                throw new Error("reassess-status requires reassessmentId or projectId when project-root restrictions are active.");
+              }
+            }
+            const result = await orchestrator.reassessmentStatus(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "reassess-report": {
+            const params = reassessmentReportParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              await requirePurePipeExposure(ctx, {
+                verb: "reassess-report",
+                projectRoot: await resolveReassessmentProjectRoot(params.reassessmentId)
+              });
+            }
+            const result = await orchestrator.reassessmentReport(params);
             return { text: renderCommandResult(result, requestedFormat) };
           }
           case "site-status": {

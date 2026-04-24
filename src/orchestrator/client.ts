@@ -10,6 +10,9 @@ import type {
   LogsParams,
   ParsedPluginConfig,
   ProjectCreateParams,
+  ReassessmentReportParams,
+  ReassessmentStartParams,
+  ReassessmentStatusParams,
   SiteStatusParams,
   ToolResult,
   WorkerManifestInput
@@ -61,6 +64,9 @@ export class DaemonOrchestratorClient implements IOrchestrator {
     if (params.projectId != null) {
       url.searchParams.set("projectId", params.projectId);
     }
+    if (params.format != null) {
+      url.searchParams.set("format", params.format);
+    }
     return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
   }
 
@@ -84,6 +90,33 @@ export class DaemonOrchestratorClient implements IOrchestrator {
   async cancel(params: CampaignActionParams): Promise<ToolResult> {
     await this.ensureHealthy();
     return this.request({ method: "POST", path: "/orchestrator/cancel", body: params });
+  }
+
+  async startReassessment(params: ReassessmentStartParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    return this.request({ method: "POST", path: "/orchestrator/reassessment", body: params });
+  }
+
+  async reassessmentStatus(params: ReassessmentStatusParams = {}): Promise<ToolResult> {
+    await this.ensureHealthy();
+    const url = new URL("/orchestrator/reassessment/status", this.deps.config.daemonUrl);
+    if (params.reassessmentId != null) {
+      url.searchParams.set("reassessmentId", params.reassessmentId);
+    }
+    if (params.projectId != null) {
+      url.searchParams.set("projectId", params.projectId);
+    }
+    return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
+  }
+
+  async reassessmentReport(params: ReassessmentReportParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    const url = new URL("/orchestrator/reassessment/report", this.deps.config.daemonUrl);
+    url.searchParams.set("reassessmentId", params.reassessmentId);
+    if (params.format != null) {
+      url.searchParams.set("format", params.format);
+    }
+    return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
   }
 
   async siteStatus(params?: SiteStatusParams): Promise<ToolResult> {

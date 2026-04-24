@@ -365,6 +365,9 @@ Puppenclaw exposes three main surfaces:
 - `puppenclaw_artifacts`
 - `puppenclaw_campaign_approve`
 - `puppenclaw_campaign_cancel`
+- `puppenclaw_reassessment_start`
+- `puppenclaw_reassessment_status`
+- `puppenclaw_reassessment_report`
 
 2. Raw ACP session tools
 - `puppenclaw_start`
@@ -387,6 +390,9 @@ Gateway methods:
 - `puppenclaw.artifacts`
 - `puppenclaw.campaignApprove`
 - `puppenclaw.campaignCancel`
+- `puppenclaw.reassessmentStart`
+- `puppenclaw.reassessmentStatus`
+- `puppenclaw.reassessmentReport`
 
 ## Quick Start: Local Orchestration
 
@@ -439,6 +445,12 @@ Or run a fusion campaign that gives Codex and Claude the same sealed input bundl
 
 ```text
 /puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"fusion-pass","template":"puppenfusion","task":"Implement the feature end to end.","evaluationCommand":"npm test","fusionPreferredAgent":"codex"}
+```
+
+Or reassess older Puppenclaw, Codex, and Claude Code sessions with a newer model. Puppenclaw imports matching project history, creates a new branch/worktree, asks the target model to patch only concrete old-model mistakes, runs validation, and stores a report. The base branch is never merged automatically.
+
+```text
+/puppenclaw reassess {"projectId":"demo-project","workerId":"local","targetModel":"gpt-new","providers":["puppenclaw","codex","claude"],"validationCommand":"npm test"}
 ```
 
 8. Inspect status
