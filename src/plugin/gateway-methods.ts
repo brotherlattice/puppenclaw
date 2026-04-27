@@ -2,7 +2,9 @@ import type { GatewayRequestHandlerOptions, OpenClawPluginApi } from "openclaw/p
 
 import {
   artifactListParamsZod,
+  artifactReadParamsZod,
   campaignActionParamsZod,
+  campaignEventsParamsZod,
   campaignRunParamsZod,
   campaignStatusParamsZod,
   contextSyncParamsZod,
@@ -22,6 +24,8 @@ export const PUPPENCLAW_GATEWAY_METHODS = {
   runCampaign: "puppenclaw.campaignRun",
   status: "puppenclaw.campaignStatus",
   artifacts: "puppenclaw.artifacts",
+  artifactRead: "puppenclaw.artifactRead",
+  campaignEvents: "puppenclaw.campaignEvents",
   approve: "puppenclaw.campaignApprove",
   cancel: "puppenclaw.campaignCancel",
   startReassessment: "puppenclaw.reassessmentStart",
@@ -61,6 +65,16 @@ export function registerPuppenclawGatewayMethods(api: OpenClawPluginApi): void {
   api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.artifacts, handle(async ({ params }) => {
     return getPuppenclawOrchestrator().then((runtime) =>
       runtime.listArtifacts(artifactListParamsZod.parse(params ?? {}))
+    );
+  }));
+  api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.artifactRead, handle(async ({ params }) => {
+    return getPuppenclawOrchestrator().then((runtime) =>
+      runtime.readArtifact(artifactReadParamsZod.parse(params))
+    );
+  }));
+  api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.campaignEvents, handle(async ({ params }) => {
+    return getPuppenclawOrchestrator().then((runtime) =>
+      runtime.campaignEvents(campaignEventsParamsZod.parse(params))
     );
   }));
   api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.approve, handle(async ({ params }) => {

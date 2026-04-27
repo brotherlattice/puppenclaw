@@ -9,6 +9,8 @@ import { OrchestratorStore } from "../orchestrator/store.js";
 import { SessionStore } from "../shared/store.js";
 import {
   artifactListParamsZod,
+  artifactReadParamsZod,
+  campaignEventsParamsZod,
   campaignActionParamsZod,
   campaignRunParamsZod,
   campaignStatusParamsZod,
@@ -183,6 +185,37 @@ export async function createDaemonServer(params: {
         artifactListParamsZod.parse({
           campaignId: (request.query as { campaignId?: string }).campaignId,
           projectId: (request.query as { projectId?: string }).projectId
+        })
+      )
+    )
+  );
+
+  app.get("/orchestrator/artifacts/:artifactId/content", async (request) =>
+    ok(
+      await orchestrator.readArtifact(
+        artifactReadParamsZod.parse({
+          artifactId: (request.params as { artifactId: string }).artifactId,
+          limitChars:
+            (request.query as { limitChars?: string }).limitChars != null
+              ? Number((request.query as { limitChars?: string }).limitChars)
+              : undefined,
+          format: (request.query as { format?: "text" | "json" }).format
+        })
+      )
+    )
+  );
+
+  app.get("/orchestrator/events", async (request) =>
+    ok(
+      await orchestrator.campaignEvents(
+        campaignEventsParamsZod.parse({
+          campaignId: (request.query as { campaignId?: string }).campaignId,
+          after: (request.query as { after?: string }).after,
+          limit:
+            (request.query as { limit?: string }).limit != null
+              ? Number((request.query as { limit?: string }).limit)
+              : undefined,
+          format: (request.query as { format?: "text" | "json" }).format
         })
       )
     )

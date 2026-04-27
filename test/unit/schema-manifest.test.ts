@@ -37,5 +37,7 @@ describe("plugin manifest and config schema", () => {
     expect(REMOTE_CONTROL_VERBS).toContain("reassess");
     expect(REMOTE_CONTROL_VERBS).toContain("reassess-status");
     expect(REMOTE_CONTROL_VERBS).toContain("reassess-report");
+    expect(REMOTE_CONTROL_VERBS).toContain("artifact-read");
+    expect(REMOTE_CONTROL_VERBS).toContain("campaign-events");
   });
 });

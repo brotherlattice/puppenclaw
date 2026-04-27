@@ -261,6 +261,19 @@ export type ArtifactRecord = {
   files?: ArtifactFileRecord[];
 };
 
+export type ArtifactReadResult = {
+  artifact: ArtifactRecord;
+  text: string;
+  truncated: boolean;
+  limitChars: number;
+};
+
+export type CampaignEventsResult = {
+  campaignId: string;
+  events: FusionEventRecord[];
+  cursor?: string;
+};
+
 export type ImportedReassessmentSession = {
   id: string;
   provider: ReassessmentProvider;
@@ -335,6 +348,8 @@ export interface IOrchestrator {
   runCampaign(params: import("../shared/types.js").CampaignRunParams): Promise<import("../shared/types.js").ToolResult>;
   status(params: import("../shared/types.js").CampaignStatusParams): Promise<import("../shared/types.js").ToolResult>;
   listArtifacts(params: import("../shared/types.js").ArtifactListParams): Promise<import("../shared/types.js").ToolResult>;
+  readArtifact(params: import("../shared/types.js").ArtifactReadParams): Promise<import("../shared/types.js").ToolResult>;
+  campaignEvents(params: import("../shared/types.js").CampaignEventsParams): Promise<import("../shared/types.js").ToolResult>;
   approve(params: import("../shared/types.js").CampaignActionParams): Promise<import("../shared/types.js").ToolResult>;
   cancel(params: import("../shared/types.js").CampaignActionParams): Promise<import("../shared/types.js").ToolResult>;
   startReassessment(params: import("../shared/types.js").ReassessmentStartParams): Promise<import("../shared/types.js").ToolResult>;

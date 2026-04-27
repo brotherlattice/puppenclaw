@@ -25,6 +25,8 @@ export const REMOTE_CONTROL_VERBS = [
   "campaign",
   "campaign-status",
   "artifacts",
+  "artifact-read",
+  "campaign-events",
   "approve",
   "cancel",
   "reassess",
@@ -331,6 +333,23 @@ export const artifactListParamsZod = z
   })
   .strict()
   .default({});
+
+export const artifactReadParamsZod = z
+  .object({
+    artifactId: idString,
+    limitChars: z.number().int().min(128).max(500_000).default(120_000),
+    format: responseFormatZod.optional()
+  })
+  .strict();
+
+export const campaignEventsParamsZod = z
+  .object({
+    campaignId: idString,
+    after: nonEmptyString.optional(),
+    limit: z.number().int().min(1).max(500).default(100),
+    format: responseFormatZod.optional()
+  })
+  .strict();
 
 export const campaignActionParamsZod = z
   .object({
@@ -863,6 +882,19 @@ export const toolCampaignStatusSchema = Type.Object({
 export const toolArtifactsSchema = Type.Object({
   campaignId: Type.Optional(Type.String({ minLength: 1 })),
   projectId: Type.Optional(Type.String({ minLength: 1 })),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolArtifactReadSchema = Type.Object({
+  artifactId: Type.String({ minLength: 1 }),
+  limitChars: Type.Optional(Type.Integer({ minimum: 128, maximum: 500000 })),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolCampaignEventsSchema = Type.Object({
+  campaignId: Type.String({ minLength: 1 }),
+  after: Type.Optional(Type.String({ minLength: 1 })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
 });
 

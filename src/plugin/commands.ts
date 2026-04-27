@@ -8,7 +8,9 @@ import type {
 
 import {
   artifactListParamsZod,
+  artifactReadParamsZod,
   campaignActionParamsZod,
+  campaignEventsParamsZod,
   campaignRunParamsZod,
   campaignStatusParamsZod,
   contextSyncParamsZod,
@@ -87,6 +89,8 @@ function flattenResultText(result: { content: Array<{ text: string }> }): string
 const READ_ONLY_VERBS = new Set<RemoteVerb>([
   "campaign-status",
   "artifacts",
+  "artifact-read",
+  "campaign-events",
   "reassess-status",
   "reassess-report",
   "site-status",
@@ -139,6 +143,8 @@ function renderHelp(): string {
     "campaign {\"projectId\":\"ml-research\",\"workerId\":\"local\",\"name\":\"fusion\",\"template\":\"puppenfusion\",\"task\":\"Implement the feature.\",\"fusionPreferredAgent\":\"codex\",\"evaluationCommand\":\"npm test\"}",
     "campaign-status {\"campaignId\":\"camp-...\"}",
     "artifacts {\"campaignId\":\"camp-...\"}",
+    "artifact-read {\"artifactId\":\"artifact-...\",\"limitChars\":120000}",
+    "campaign-events {\"campaignId\":\"camp-...\",\"limit\":100}",
     "approve {\"campaignId\":\"camp-...\"}",
     "cancel {\"campaignId\":\"camp-...\"}",
     "reassess {\"projectId\":\"ml-research\",\"workerId\":\"local\",\"targetModel\":\"gpt-new\",\"validationCommand\":\"npm test\"}",
@@ -322,6 +328,15 @@ async function resolveRunProjectRoot(runId: string): Promise<string> {
     throw new Error(`Unknown run ${runId}.`);
   }
   return resolveProjectRoot(run.projectId);
+}
+
+async function resolveArtifactProjectRoot(artifactId: string): Promise<string> {
+  const store = await getPuppenclawOrchestratorStore();
+  const artifact = store.getArtifact(artifactId);
+  if (artifact == null) {
+    throw new Error(`Unknown artifact ${artifactId}.`);
+  }
+  return resolveProjectRoot(artifact.projectId);
 }
 
 async function resolveReassessmentProjectRoot(reassessmentId: string): Promise<string> {
@@ -532,6 +547,30 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
               }
             }
             const result = await orchestrator.listArtifacts(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "artifact-read": {
+            const params = artifactReadParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              await requirePurePipeExposure(ctx, {
+                verb: "artifact-read",
+                projectRoot: await resolveArtifactProjectRoot(params.artifactId)
+              });
+            }
+            const result = await orchestrator.readArtifact(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "campaign-events": {
+            const params = campaignEventsParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              await requirePurePipeExposure(ctx, {
+                verb: "campaign-events",
+                projectRoot: await resolveCampaignProjectRoot(params.campaignId)
+              });
+            }
+            const result = await orchestrator.campaignEvents(params);
             return { text: renderCommandResult(result, requestedFormat) };
           }
           case "approve": {

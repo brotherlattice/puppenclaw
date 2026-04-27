@@ -6,6 +6,8 @@ import type {
 
 import {
   artifactListParamsZod,
+  artifactReadParamsZod,
+  campaignEventsParamsZod,
   campaignActionParamsZod,
   campaignRunParamsZod,
   campaignStatusParamsZod,
@@ -24,6 +26,8 @@ import {
   statusParamsZod,
   stopParamsZod,
   toolArtifactsSchema,
+  toolArtifactReadSchema,
+  toolCampaignEventsSchema,
   toolCampaignActionSchema,
   toolCampaignRunSchema,
   toolCampaignStatusSchema,
@@ -128,6 +132,26 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const orchestrator = await getPuppenclawOrchestrator();
         return orchestrator.listArtifacts(artifactListParamsZod.parse(rawParams ?? {}));
+      }
+    },
+    {
+      name: "puppenclaw_artifact_read",
+      label: "Read Puppenclaw artifact",
+      description: "Read bounded text content for a generated Puppenclaw artifact.",
+      parameters: toolArtifactReadSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const orchestrator = await getPuppenclawOrchestrator();
+        return orchestrator.readArtifact(artifactReadParamsZod.parse(rawParams));
+      }
+    },
+    {
+      name: "puppenclaw_campaign_events",
+      label: "Puppenclaw campaign events",
+      description: "List structured campaign and puppenfusion events for orchestration inspection.",
+      parameters: toolCampaignEventsSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const orchestrator = await getPuppenclawOrchestrator();
+        return orchestrator.campaignEvents(campaignEventsParamsZod.parse(rawParams));
       }
     },
     {

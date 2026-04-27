@@ -13,6 +13,8 @@ import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import type {
   AgentKind,
   ArtifactListParams,
+  ArtifactReadParams,
+  CampaignEventsParams,
   CampaignActionParams,
   CampaignRunParams,
   CampaignStatusParams,
@@ -38,6 +40,8 @@ import { importReassessmentSessions } from "./reassessment.js";
 import { OrchestratorStore } from "./store.js";
 import type {
   ArtifactRecord,
+  ArtifactReadResult,
+  CampaignEventsResult,
   FusionCandidate,
   FusionCampaignRecord,
   FusionCandidateRecord,
@@ -452,6 +456,41 @@ export class OrchestratorRuntime implements IOrchestrator {
       ...(params.campaignId != null ? { campaignId: params.campaignId } : {})
     });
     return jsonToolResult({ artifacts }, "Puppenclaw artifacts");
+  }
+
+  async readArtifact(params: ArtifactReadParams): Promise<ToolResult> {
+    await this.prepareRuntime();
+    const artifact = this.deps.store.getArtifact(params.artifactId);
+    if (artifact == null) {
+      throw new PuppenclawError("UNKNOWN_ARTIFACT", `Unknown artifact ${params.artifactId}.`);
+    }
+    const raw = await readFile(join(this.deps.store.resolveArtifactsDir(), artifact.relativePath), "utf8");
+    const truncated = raw.length > params.limitChars;
+    const result: ArtifactReadResult = {
+      artifact,
+      text: truncated ? raw.slice(0, params.limitChars) : raw,
+      truncated,
+      limitChars: params.limitChars
+    };
+    return textToolResult(result.text, result);
+  }
+
+  async campaignEvents(params: CampaignEventsParams): Promise<ToolResult> {
+    await this.prepareRuntime();
+    const campaign = this.requireCampaign(params.campaignId);
+    const events = (campaign.fusion?.events ?? [])
+      .filter((event) => params.after == null || event.createdAt > params.after)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .slice(0, params.limit);
+    const result: CampaignEventsResult = {
+      campaignId: campaign.id,
+      events
+    };
+    const lastEvent = events.at(-1);
+    if (lastEvent != null) {
+      result.cursor = lastEvent.createdAt;
+    }
+    return jsonToolResult(result, "Puppenclaw campaign events");
   }
 
   async approve(params: CampaignActionParams): Promise<ToolResult> {

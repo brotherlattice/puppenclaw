@@ -31,6 +31,8 @@ import type {
   resumeParamsZod,
   runStateZod,
   artifactListParamsZod,
+  artifactReadParamsZod,
+  campaignEventsParamsZod,
   exposureModeZod,
   logsParamsZod,
   remoteVerbZod,
@@ -71,6 +73,8 @@ export type OrchestrationStepParams = z.infer<typeof campaignStepParamsZod>;
 export type CampaignRunParams = z.infer<typeof campaignRunParamsZod>;
 export type CampaignStatusParams = z.infer<typeof campaignStatusParamsZod>;
 export type ArtifactListParams = z.infer<typeof artifactListParamsZod>;
+export type ArtifactReadParams = z.infer<typeof artifactReadParamsZod>;
+export type CampaignEventsParams = z.infer<typeof campaignEventsParamsZod>;
 export type CampaignActionParams = z.infer<typeof campaignActionParamsZod>;
 export type SiteStatusParams = z.infer<typeof siteStatusParamsZod>;
 export type LogsParams = z.infer<typeof logsParamsZod>;

@@ -3,7 +3,9 @@ import type { PluginLogger } from "openclaw/plugin-sdk/core";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type {
   ArtifactListParams,
+  ArtifactReadParams,
   CampaignActionParams,
+  CampaignEventsParams,
   CampaignRunParams,
   CampaignStatusParams,
   ContextSyncParams,
@@ -78,6 +80,36 @@ export class DaemonOrchestratorClient implements IOrchestrator {
     }
     if (params.projectId != null) {
       url.searchParams.set("projectId", params.projectId);
+    }
+    if (params.format != null) {
+      url.searchParams.set("format", params.format);
+    }
+    return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
+  }
+
+  async readArtifact(params: ArtifactReadParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    const url = new URL(
+      `/orchestrator/artifacts/${encodeURIComponent(params.artifactId)}/content`,
+      this.deps.config.daemonUrl
+    );
+    url.searchParams.set("limitChars", String(params.limitChars));
+    if (params.format != null) {
+      url.searchParams.set("format", params.format);
+    }
+    return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
+  }
+
+  async campaignEvents(params: CampaignEventsParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    const url = new URL("/orchestrator/events", this.deps.config.daemonUrl);
+    url.searchParams.set("campaignId", params.campaignId);
+    if (params.after != null) {
+      url.searchParams.set("after", params.after);
+    }
+    url.searchParams.set("limit", String(params.limit));
+    if (params.format != null) {
+      url.searchParams.set("format", params.format);
     }
     return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
   }

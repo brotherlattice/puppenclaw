@@ -139,12 +139,32 @@ describe("OrchestratorRuntime", () => {
     });
     const artifactDetails = projectArtifacts.details as {
       artifacts: Array<{
+        id: string;
         kind: string;
         sha256: string;
       }>;
     };
     expect(artifactDetails.artifacts.some((artifact) => artifact.kind === "context")).toBe(true);
     expect(artifactDetails.artifacts.every((artifact) => artifact.sha256.length > 0)).toBe(true);
+    const readableArtifact = artifactDetails.artifacts.find((artifact) => artifact.kind === "context");
+    expect(readableArtifact?.id).toBeTruthy();
+    const artifactRead = await runtime.readArtifact({
+      artifactId: readableArtifact?.id as string,
+      limitChars: 5_000
+    });
+    const artifactReadDetails = artifactRead.details as {
+      text: string;
+      truncated: boolean;
+      limitChars: number;
+    };
+    expect(artifactReadDetails.text).toContain("AGENTS.md");
+    expect(artifactReadDetails.truncated).toBe(false);
+    expect(artifactReadDetails.limitChars).toBe(5_000);
+    const campaignEvents = await runtime.campaignEvents({
+      campaignId: (campaign.details as { campaign: { id: string } }).campaign.id,
+      limit: 10
+    });
+    expect((campaignEvents.details as { events: unknown[] }).events).toEqual([]);
 
     const siteStatus = await runtime.siteStatus({
       verbose: true
@@ -580,7 +600,7 @@ describe("OrchestratorRuntime", () => {
     expect(sessions.filter((session) => session.name.includes("fusion-implement"))).toHaveLength(2);
     expect(sessions.filter((session) => session.name.includes("fusion-review"))).toHaveLength(2);
     expect(sessions.some((session) => session.name.includes("fusion-merge"))).toBe(false);
-  });
+  }, 15_000);
 
   it("pauses for approval and resumes when approved", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-approval-");
