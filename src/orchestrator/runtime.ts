@@ -3,10 +3,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
-import type { PluginLogger } from "openclaw/plugin-sdk/core";
-
 import type { ISessionManager } from "../manager/interface.js";
 import { PuppenclawError } from "../shared/errors.js";
+import type { PluginLogger } from "../shared/logger.js";
 import { DEFAULT_ACPX_AGENT_COMMANDS } from "../shared/schema.js";
 import type { SessionStore } from "../shared/store.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
@@ -3181,11 +3180,24 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   private async ensureCommandAvailable(commandText: string): Promise<void> {
     const executable = this.extractExecutable(commandText);
-    const result = await this.runShellCommand({
-      campaignId: "validation",
-      command: `command -v ${this.shellQuote(executable)}`,
-      cwd: process.cwd()
-    });
+    if (executable.includes("/") || executable.includes("\\")) {
+      if (await pathExists(executable)) {
+        return;
+      }
+    }
+    const result = process.platform === "win32"
+      ? await this.runProcess({
+          campaignId: "validation",
+          command: "where.exe",
+          args: [executable],
+          cwd: process.cwd()
+        })
+      : await this.runProcess({
+          campaignId: "validation",
+          command: "sh",
+          args: ["-c", `command -v ${this.shellQuote(executable)}`],
+          cwd: process.cwd()
+        });
     if (result.exitCode !== 0) {
       throw new PuppenclawError(
         "COMMAND_NOT_AVAILABLE",
@@ -3195,7 +3207,7 @@ export class OrchestratorRuntime implements IOrchestrator {
   }
 
   private extractExecutable(commandText: string): string {
-    const parts = commandText.trim().split(/\s+/u).filter(Boolean);
+    const parts = this.splitCommandLine(commandText.trim());
     for (const part of parts) {
       if (part === "env" || part.includes("=")) {
         continue;
@@ -3203,6 +3215,34 @@ export class OrchestratorRuntime implements IOrchestrator {
       return part;
     }
     return commandText.trim();
+  }
+
+  private splitCommandLine(commandText: string): string[] {
+    const parts: string[] = [];
+    let current = "";
+    let quote: "'" | "\"" | null = null;
+    for (const character of commandText) {
+      if (quote != null) {
+        if (character === quote) {
+          quote = null;
+        } else {
+          current += character;
+        }
+      } else if (character === "'" || character === "\"") {
+        quote = character;
+      } else if (/\s/u.test(character)) {
+        if (current.length > 0) {
+          parts.push(current);
+          current = "";
+        }
+      } else {
+        current += character;
+      }
+    }
+    if (current.length > 0) {
+      parts.push(current);
+    }
+    return parts;
   }
 
   private shellQuote(value: string): string {
@@ -3324,6 +3364,17 @@ export class OrchestratorRuntime implements IOrchestrator {
     stdinText?: string;
     timeoutMs?: number;
   }): Promise<ShellCommandResult> {
+    if (process.platform === "win32") {
+      return this.runProcess({
+        campaignId: params.campaignId,
+        command: "cmd.exe",
+        args: ["/d", "/s", "/c", params.command],
+        cwd: params.cwd,
+        ...(params.env != null ? { env: params.env } : {}),
+        ...(params.stdinText != null ? { stdinText: params.stdinText } : {}),
+        ...(params.timeoutMs != null ? { timeoutMs: params.timeoutMs } : {})
+      });
+    }
     return this.runProcess({
       campaignId: params.campaignId,
       command: "bash",
@@ -3346,6 +3397,7 @@ export class OrchestratorRuntime implements IOrchestrator {
   }): Promise<ShellCommandResult> {
     const child = spawn(params.command, params.args, {
       cwd: params.cwd,
+      windowsHide: true,
       env: {
         ...process.env,
         ...params.env

@@ -7,6 +7,7 @@ export const PLUGIN_ID = "puppenclaw";
 export const PLUGIN_NAME = "Puppenclaw";
 export const PLUGIN_DESCRIPTION =
   "Project-aware orchestration runtime for OpenClaw, with ACP coding agents, scientific campaign workflows, and oc2oc-aware remote control.";
+export const DEFAULT_ACCOUNT_ID = "default";
 export const DAEMON_PORT = 18_795;
 export const DEFAULT_DAEMON_URL = `http://127.0.0.1:${DAEMON_PORT}`;
 export const DEFAULT_MAX_SESSIONS = 5;

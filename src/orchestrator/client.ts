@@ -1,6 +1,5 @@
-import type { PluginLogger } from "openclaw/plugin-sdk/core";
-
 import { ensureError, PuppenclawError } from "../shared/errors.js";
+import type { PluginLogger } from "../shared/logger.js";
 import type {
   ArtifactListParams,
   ArtifactReadParams,

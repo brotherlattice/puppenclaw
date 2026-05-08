@@ -1,8 +1,7 @@
-import type { PluginLogger } from "openclaw/plugin-sdk/core";
-
 import type { ParsedPluginConfig } from "../shared/types.js";
 import type { SessionStore } from "../shared/store.js";
-import type { OutputRouter } from "../plugin/output-router.js";
+import type { PluginLogger } from "../shared/logger.js";
+import type { OutputRouter } from "../shared/output-router.js";
 import { AcpxSessionManager } from "./acpx.js";
 import { DaemonSessionManager } from "./daemon.js";
 import type { ISessionManager } from "./interface.js";

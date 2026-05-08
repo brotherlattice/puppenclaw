@@ -1,11 +1,12 @@
 import { join } from "node:path";
 
 import Fastify, { type FastifyInstance } from "fastify";
-import type { PluginLogger } from "openclaw/plugin-sdk/core";
 
 import { AcpxSessionManager } from "../manager/acpx.js";
 import { OrchestratorRuntime } from "../orchestrator/runtime.js";
 import { OrchestratorStore } from "../orchestrator/store.js";
+import type { PluginLogger } from "../shared/logger.js";
+import { OutputRouter } from "../shared/output-router.js";
 import { SessionStore } from "../shared/store.js";
 import {
   artifactListParamsZod,
@@ -32,7 +33,6 @@ import {
 } from "../shared/schema.js";
 import type { ParsedPluginConfig, ToolResult } from "../shared/types.js";
 import { ensureDir } from "../shared/utils.js";
-import { OutputRouter } from "../plugin/output-router.js";
 
 export async function createDaemonServer(params: {
   config: ParsedPluginConfig;

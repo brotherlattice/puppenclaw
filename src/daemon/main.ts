@@ -2,7 +2,7 @@ import { join } from "node:path";
 
 import { PLUGIN_ID } from "../shared/schema.js";
 import { ensureDir } from "../shared/utils.js";
-import { readPluginConfig } from "../plugin/config.js";
+import { readPluginConfig } from "../shared/config.js";
 import { createDaemonServer } from "./server.js";
 
 export async function startDaemonServer(params: {

@@ -81,7 +81,7 @@ async function importClaudeSessions(project: ProjectRecord): Promise<{
   sessions: SessionCandidate[];
   warnings: string[];
 }> {
-  const root = join(homedir(), ".claude", "projects");
+  const root = join(resolveHomeDir(), ".claude", "projects");
   if (!(await pathExists(root))) {
     return { sessions: [], warnings: [`Claude Code history root not found: ${root}`] };
   }
@@ -124,7 +124,7 @@ async function importCodexSessions(project: ProjectRecord): Promise<{
   sessions: SessionCandidate[];
   warnings: string[];
 }> {
-  const codexRoot = join(homedir(), ".codex");
+  const codexRoot = join(resolveHomeDir(), ".codex");
   const historyPath = join(codexRoot, "history.jsonl");
   const indexPath = join(codexRoot, "session_index.jsonl");
   if (!(await pathExists(historyPath))) {
@@ -303,6 +303,10 @@ function latestTimestamp(entries: Record<string, unknown>[]): string | undefined
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function resolveHomeDir(): string {
+  return process.env.HOME ?? homedir();
 }
 
 function pathWithinProject(path: string | null | undefined, projectRoot: string): boolean {

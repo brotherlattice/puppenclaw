@@ -1,14 +1,11 @@
 import { spawn } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
 
-import type { PluginLogger } from "openclaw/plugin-sdk/core";
-
 import { SessionStore } from "../shared/store.js";
-import {
-  DEFAULT_ACPX_AGENT_COMMANDS,
-  DEFAULT_MAX_SESSIONS
-} from "../shared/schema.js";
+import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
+import type { PluginLogger } from "../shared/logger.js";
+import type { OutputRouter } from "../shared/output-router.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import type {
   AgentKind,
@@ -30,7 +27,6 @@ import type {
   TokenUsage
 } from "../shared/types.js";
 import { loadContextFiles, nowIso, summarizePromptEvents } from "../shared/utils.js";
-import type { OutputRouter } from "../plugin/output-router.js";
 import type { ISessionManager } from "./interface.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -108,6 +104,33 @@ function isNoSessionStatus(event: JsonRecord | null): boolean {
   );
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function describeRuntimeStatus(status: RuntimeStatus): string {
+  if (!status.exists) {
+    return "no active session";
+  }
+  const raw = status.raw ?? {};
+  const summary = asOptionalString(raw.summary);
+  return [status.status, summary].filter(Boolean).join(": ") || "unknown";
+}
+
+function isRuntimeStatusReady(status: RuntimeStatus): boolean {
+  if (!status.exists || status.status === "dead") {
+    return false;
+  }
+  const raw = status.raw ?? {};
+  const summary = asOptionalString(raw.summary);
+  const combined = `${status.status ?? ""} ${summary ?? ""}`;
+  return !/(no active session|needs reconnect|reconnect|starting|initializing|pending|dead)/iu.test(
+    combined
+  );
+}
+
 function buildPermissionArgs(mode: PermissionMode): string[] {
   if (mode === "approve-all") {
     return ["--approve-all"];
@@ -171,6 +194,12 @@ function resolveStructuredPayload(parsed: JsonRecord): {
   payload: JsonRecord;
   tag?: string;
 } {
+  if (isRecord(parsed.error)) {
+    return {
+      type: "error",
+      payload: parsed.error
+    };
+  }
   if (asTrimmedString(parsed.method) === "session/update" && isRecord(parsed.params)) {
     const update = parsed.params.update;
     if (isRecord(update)) {
@@ -348,6 +377,12 @@ function splitCommandLine(input: string): string[] {
 }
 
 function shellQuote(value: string): string {
+  if (process.platform === "win32") {
+    if (/^[A-Za-z0-9_./:@%+=,\\-]+$/u.test(value)) {
+      return value;
+    }
+    return `"${value.replaceAll('"', '\\"')}"`;
+  }
   if (value.length === 0) {
     return "''";
   }
@@ -750,14 +785,10 @@ export class AcpxSessionManager implements ISessionManager {
         "Configured MCP servers are recorded by Puppenclaw, but ACP adapter-side MCP injection must be handled by the target agent command."
       );
     }
-    if (this.resolveRawAgentCommand(params.agent) !== params.agent) {
+    if (this.deps.config.agentCommands[params.agent]?.trim()) {
       warnings.push(`Using configured raw ACP agent command for ${params.agent}.`);
     }
     return warnings;
-  }
-
-  private resolveRawAgentCommand(agent: AgentKind): string {
-    return this.deps.config.agentCommands[agent] ?? DEFAULT_ACPX_AGENT_COMMANDS[agent];
   }
 
   private buildPlanningPromptPrefix(params: {
@@ -795,7 +826,11 @@ export class AcpxSessionManager implements ISessionManager {
     prompt = false,
     permissionMode?: PermissionMode
   ): string[] {
-    const args = ["--format", "json", "--json-strict", "--cwd", cwd];
+    const args = ["--format", "json"];
+    if (!prompt) {
+      args.push("--json-strict");
+    }
+    args.push("--cwd", cwd);
     if (prompt) {
       args.push(...buildPermissionArgs(permissionMode ?? this.deps.config.permissionMode));
       args.push("--non-interactive-permissions", "deny");
@@ -816,19 +851,43 @@ export class AcpxSessionManager implements ISessionManager {
     directory: string;
   }): Promise<void> {
     const status = await this.getRuntimeStatus(params);
-    if (status.exists && status.status !== "dead") {
-      return;
+    if (!status.exists || status.status === "dead") {
+      const args = this.buildVerbArgs(params.agent, params.directory, [
+        "sessions",
+        "new",
+        "--name",
+        params.name
+      ]);
+      await this.runControlCommand({
+        args,
+        cwd: params.directory
+      });
     }
-    const args = this.buildVerbArgs(params.agent, params.directory, [
-      "sessions",
-      "new",
-      "--name",
-      params.name
-    ]);
-    await this.runControlCommand({
-      args,
-      cwd: params.directory
-    });
+    await this.waitForRuntimeSessionReady(params);
+  }
+
+  private async waitForRuntimeSessionReady(params: {
+    name: string;
+    agent: AgentKind;
+    directory: string;
+  }): Promise<void> {
+    const deadline = Date.now() + 20_000;
+    let lastStatus = "unknown";
+    while (Date.now() < deadline) {
+      try {
+        const status = await this.getRuntimeStatus(params);
+        lastStatus = describeRuntimeStatus(status);
+        if (isRuntimeStatusReady(status)) {
+          return;
+        }
+      } catch (error) {
+        lastStatus = ensureError(error).message;
+      }
+      await sleep(500);
+    }
+    this.deps.logger.warn(
+      `Timed out waiting for ACPX session ${params.name} to become ready: ${lastStatus}`
+    );
   }
 
   private async getRuntimeStatus(params: {
@@ -864,6 +923,7 @@ export class AcpxSessionManager implements ISessionManager {
     session: SessionInfo;
     promptText: string;
     permissionMode: PermissionMode;
+    retryAfterReconnect?: boolean;
   }): Promise<TurnResult> {
     const args = this.buildVerbArgs(
       params.session.agent,
@@ -983,6 +1043,39 @@ export class AcpxSessionManager implements ISessionManager {
           {
             role: "status",
             text: errorEvent.message,
+            createdAt: nowIso()
+          }
+        ],
+        state: "failed"
+      };
+    }
+    const reconnectEvent = events.find(
+      (event): event is Extract<PromptEvent, { type: "status" }> =>
+        event.type === "status" && /needs reconnect/iu.test(event.text)
+    );
+    if (reconnectEvent != null && outputChunks.length === 0) {
+      if (params.retryAfterReconnect !== true) {
+        await this.waitForRuntimeSessionReady({
+          name: params.session.name,
+          agent: params.session.agent,
+          directory: params.session.directory
+        });
+        return await this.runTurn({
+          ...params,
+          retryAfterReconnect: true
+        });
+      }
+      await this.deps.outputRouter.onError(
+        params.session.name,
+        new Error(reconnectEvent.text)
+      );
+      return {
+        output: reconnectEvent.text,
+        warnings: [],
+        transcript: [
+          {
+            role: "status",
+            text: reconnectEvent.text,
             createdAt: nowIso()
           }
         ],

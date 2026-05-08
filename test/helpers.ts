@@ -12,12 +12,21 @@ export async function createTempDir(prefix: string): Promise<string> {
 }
 
 export async function resolveFakeAcpxCommand(): Promise<string> {
-  const filePath = resolve(
-    dirname(fileURLToPath(import.meta.url)),
-    "./fixtures/fake-acpx.sh"
-  );
+  const fixtureDir = dirname(fileURLToPath(import.meta.url));
+  if (process.platform === "win32") {
+    const filePath = resolve(fixtureDir, "./fixtures/fake-acpx.mjs");
+    return `node ${quoteCommandPart(filePath)}`;
+  }
+  const filePath = resolve(fixtureDir, "./fixtures/fake-acpx.sh");
   await chmod(filePath, 0o755);
   return filePath;
+}
+
+function quoteCommandPart(value: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,\\-]+$/u.test(value)) {
+    return value;
+  }
+  return `"${value.replaceAll('"', '\\"')}"`;
 }
 
 export async function createStoreAndRouter(rootDir: string): Promise<{
@@ -60,4 +69,24 @@ export function makeConfig(overrides: Record<string, unknown> = {}) {
     },
     ...overrides
   });
+}
+
+export function nodePrintCommand(text: string): string {
+  return `node -e "process.stdout.write(Buffer.from('${base64(text)}','base64').toString('utf8'))"`;
+}
+
+export function nodeFileExistsCommand(path: string): string {
+  return `node -e "if(!require('node:fs').existsSync(Buffer.from('${base64(
+    path
+  )}','base64').toString('utf8')))process.exit(1)"`;
+}
+
+export function nodeStdinToNullAndPrintCommand(text: string): string {
+  return `node -e "process.stdin.resume();process.stdin.on('end',function(){process.stdout.write(Buffer.from('${base64(
+    text
+  )}','base64').toString('utf8'))})"`;
+}
+
+function base64(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64");
 }

@@ -1,6 +1,6 @@
-import type { PluginLogger } from "openclaw/plugin-sdk/core";
-
 import { ensureError, PuppenclawError } from "../shared/errors.js";
+import type { PluginLogger } from "../shared/logger.js";
+import type { OutputRouter } from "../shared/output-router.js";
 import type {
   CostParams,
   ForkParams,
@@ -12,7 +12,6 @@ import type {
   StopParams,
   ToolResult
 } from "../shared/types.js";
-import type { OutputRouter } from "../plugin/output-router.js";
 import type { ISessionManager } from "./interface.js";
 
 type JsonRequestInit = {

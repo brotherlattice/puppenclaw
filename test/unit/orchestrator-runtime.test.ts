@@ -8,7 +8,14 @@ import { AcpxSessionManager } from "../../src/manager/acpx.js";
 import { OrchestratorRuntime } from "../../src/orchestrator/runtime.js";
 import { OrchestratorStore } from "../../src/orchestrator/store.js";
 import { OutputRouter } from "../../src/plugin/output-router.js";
-import { createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
+import {
+  createTempDir,
+  makeConfig,
+  nodeFileExistsCommand,
+  nodePrintCommand,
+  nodeStdinToNullAndPrintCommand,
+  resolveFakeAcpxCommand
+} from "../helpers.js";
 import { SessionStore } from "../../src/shared/store.js";
 
 function runGit(cwd: string, args: string[]): string {
@@ -95,7 +102,7 @@ describe("OrchestratorRuntime", () => {
       name: "baseline",
       template: "baseline_from_scratch",
       task: "Implement the first baseline for this project.",
-      evaluationCommand: "printf 'tests-ok\\n'",
+      evaluationCommand: nodePrintCommand("tests-ok\n"),
       experimentCommands: [],
       experimentParallelism: 1,
       iterations: 1,
@@ -313,7 +320,7 @@ describe("OrchestratorRuntime", () => {
       workerId: "local",
       targetModel: "new-model",
       providers: ["puppenclaw"],
-      validationCommand: "test -f reassessment-fix.txt",
+      validationCommand: nodeFileExistsCommand("reassessment-fix.txt"),
       limit: 10
     });
     const details = result.details as {
@@ -355,7 +362,7 @@ describe("OrchestratorRuntime", () => {
       workerId: "local",
       targetModel: "new-model",
       providers: ["puppenclaw"],
-      validationCommand: "true",
+      validationCommand: nodePrintCommand("ok\n"),
       limit: 10
     });
     const repeatDetails = repeat.details as {
@@ -437,7 +444,7 @@ describe("OrchestratorRuntime", () => {
       template: "puppenfusion",
       task: "Implement the feature cleanly from the sealed bundle.",
       fusionPreferredAgent: "codex",
-      evaluationCommand: "printf 'tests-ok\\n'",
+      evaluationCommand: nodePrintCommand("tests-ok\n"),
       experimentCommands: [],
       experimentParallelism: 1,
       iterations: 1,
@@ -707,7 +714,7 @@ describe("OrchestratorRuntime", () => {
     const manager = new AcpxSessionManager({
       config: makeConfig({
         orchestration: {
-          gptResearcherCommand: "cat >/dev/null; printf 'research dossier ready\\n'"
+          gptResearcherCommand: nodeStdinToNullAndPrintCommand("research dossier ready\n")
         }
       }),
       logger: {
@@ -722,7 +729,7 @@ describe("OrchestratorRuntime", () => {
     const runtime = new OrchestratorRuntime({
       config: makeConfig({
         orchestration: {
-          gptResearcherCommand: "cat >/dev/null; printf 'research dossier ready\\n'"
+          gptResearcherCommand: nodeStdinToNullAndPrintCommand("research dossier ready\n")
         }
       }),
       logger: {
