@@ -29,6 +29,8 @@ import type {
   reassessmentStatusParamsZod,
   remoteControlConfigZod,
   resumeParamsZod,
+  focusParamsZod,
+  suspendParamsZod,
   runStateZod,
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -42,6 +44,7 @@ import type {
   startParamsZod,
   statusParamsZod,
   stopParamsZod,
+  unfocusParamsZod,
   workerManifestZod
 } from "./schema.js";
 
@@ -58,10 +61,15 @@ export type ParsedPluginConfig = z.output<typeof pluginConfigZod>;
 export type McpServerConfig = z.infer<typeof mcpServerConfigZod>;
 export type RemoteControlConfig = z.infer<typeof remoteControlConfigZod>;
 export type OrchestrationConfig = z.infer<typeof orchestrationConfigZod>;
-export type StartParams = z.infer<typeof startParamsZod>;
+export type StartParams = Omit<z.infer<typeof startParamsZod>, "skills"> & {
+  skills?: z.infer<typeof startParamsZod>["skills"];
+};
 export type SendParams = z.infer<typeof sendParamsZod>;
 export type StopParams = z.infer<typeof stopParamsZod>;
 export type ResumeParams = z.infer<typeof resumeParamsZod>;
+export type SuspendParams = z.infer<typeof suspendParamsZod>;
+export type FocusParams = z.infer<typeof focusParamsZod>;
+export type UnfocusParams = z.infer<typeof unfocusParamsZod>;
 export type ForkParams = z.infer<typeof forkParamsZod>;
 export type StatusParams = z.infer<typeof statusParamsZod>;
 export type CostParams = z.infer<typeof costParamsZod>;
@@ -103,6 +111,7 @@ export type SessionState =
   | "idle"
   | "running"
   | "waiting_input"
+  | "suspended"
   | "completed"
   | "failed"
   | "stopped";
@@ -142,10 +151,12 @@ export type SessionInfo = {
   state: SessionState;
   createdAt: string;
   lastActivity: string;
+  focusedUntil?: string;
   permissionMode: PermissionMode;
   effort?: EffortLevel;
   planningProfile?: PlanningProfile;
   model?: string;
+  skills?: string[];
   tokenUsage?: TokenUsage;
   pendingQuestion?: string;
   lastError?: string;

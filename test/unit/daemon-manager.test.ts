@@ -7,6 +7,46 @@ import type { SessionInfo } from "../../src/shared/types.js";
 import { createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
 
 describe("DaemonSessionManager", () => {
+  it("reports the daemon HTTP capabilities", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-capabilities-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const config = makeConfig({
+      backend: "daemon",
+      acpxCommand,
+      maxSessions: 7
+    });
+
+    const { app } = await createDaemonServer({
+      config,
+      dataDir: workspaceDir
+    });
+
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/capabilities"
+      });
+      const payload = JSON.parse(response.body) as {
+        sessionStartStream?: boolean;
+        sessionSendStream?: boolean;
+        sessionSkills?: boolean;
+        maxSessions?: { min?: number; max?: number; current?: number };
+      };
+
+      expect(response.statusCode).toBe(200);
+      expect(payload.sessionStartStream).toBe(true);
+      expect(payload.sessionSendStream).toBe(true);
+      expect(payload.sessionSkills).toBe(true);
+      expect(payload.maxSessions).toEqual({
+        min: 1,
+        max: 100,
+        current: 7
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("talks to the daemon HTTP surface", async () => {
     const workspaceDir = await createTempDir("puppenclaw-daemon-");
     const acpxCommand = await resolveFakeAcpxCommand();

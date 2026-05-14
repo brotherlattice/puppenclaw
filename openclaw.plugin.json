@@ -58,6 +58,13 @@
         "type": "string",
         "description": "Optional acpx binary override."
       },
+      "skillRoots": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Additional directories containing Claude Code skills as <skill>/SKILL.md."
+      },
       "agentCommands": {
         "type": "object",
         "additionalProperties": false,

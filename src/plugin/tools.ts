@@ -13,6 +13,7 @@ import {
   campaignStatusParamsZod,
   contextSyncParamsZod,
   costParamsZod,
+  focusParamsZod,
   forkParamsZod,
   logsParamsZod,
   projectCreateParamsZod,
@@ -25,6 +26,8 @@ import {
   startParamsZod,
   statusParamsZod,
   stopParamsZod,
+  suspendParamsZod,
+  unfocusParamsZod,
   toolArtifactsSchema,
   toolArtifactReadSchema,
   toolCampaignEventsSchema,
@@ -33,6 +36,7 @@ import {
   toolCampaignStatusSchema,
   toolContextSyncSchema,
   toolCostSchema,
+  toolFocusSchema,
   toolForkSchema,
   toolLogsSchema,
   toolProjectCreateSchema,
@@ -45,6 +49,8 @@ import {
   toolStartSchema,
   toolStatusSchema,
   toolStopSchema,
+  toolSuspendSchema,
+  toolUnfocusSchema,
   toolWorkerRegisterSchema,
   workerManifestZod
 } from "../shared/schema.js";
@@ -286,11 +292,53 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
     {
       name: "puppenclaw_resume",
       label: "Resume Puppenclaw session",
-      description: "Mark a stopped session as resumable again.",
+      description: "Reconnect a suspended or stopped Puppenclaw-managed session.",
       parameters: toolResumeSchema,
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const manager = await getPuppenclawManager();
         const result = await manager.resume(resumeParamsZod.parse(rawParams));
+        return {
+          content: result.content,
+          details: result.details
+        };
+      }
+    },
+    {
+      name: "puppenclaw_suspend",
+      label: "Suspend Puppenclaw session",
+      description: "Disconnect an idle Puppenclaw-managed session while keeping its stored transcript.",
+      parameters: toolSuspendSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const manager = await getPuppenclawManager();
+        const result = await manager.suspend(suspendParamsZod.parse(rawParams));
+        return {
+          content: result.content,
+          details: result.details
+        };
+      }
+    },
+    {
+      name: "puppenclaw_focus",
+      label: "Focus Puppenclaw session",
+      description: "Protect an opened Puppenclaw-managed session from idle eviction for a short lease.",
+      parameters: toolFocusSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const manager = await getPuppenclawManager();
+        const result = await manager.focus(focusParamsZod.parse(rawParams));
+        return {
+          content: result.content,
+          details: result.details
+        };
+      }
+    },
+    {
+      name: "puppenclaw_unfocus",
+      label: "Unfocus Puppenclaw session",
+      description: "Release the focus lease for a Puppenclaw-managed session.",
+      parameters: toolUnfocusSchema,
+      execute: async (_toolCallId: string, rawParams: unknown) => {
+        const manager = await getPuppenclawManager();
+        const result = await manager.unfocus(unfocusParamsZod.parse(rawParams));
         return {
           content: result.content,
           details: result.details

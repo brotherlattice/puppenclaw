@@ -40,6 +40,9 @@ export const REMOTE_CONTROL_VERBS = [
   "status",
   "stop",
   "resume",
+  "suspend",
+  "focus",
+  "unfocus",
   "fork",
   "cost"
 ] as const;
@@ -50,6 +53,7 @@ export const DEFAULT_ACPX_AGENT_COMMANDS = {
 
 const nonEmptyString = z.string().trim().min(1);
 const idString = nonEmptyString.regex(/^[a-zA-Z0-9._:-]+$/u);
+const skillNameString = nonEmptyString.regex(/^[a-zA-Z0-9._-]+$/u);
 
 export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
@@ -197,6 +201,7 @@ export const pluginConfigZod = z
     sessionTtlMinutes: z.number().int().min(1).max(24 * 60).default(DEFAULT_SESSION_TTL_MINUTES),
     streamOutput: z.boolean().default(DEFAULT_STREAM_OUTPUT),
     acpxCommand: nonEmptyString.optional(),
+    skillRoots: z.array(nonEmptyString).default([]),
     agentCommands: z
       .object({
         claude: nonEmptyString.optional(),
@@ -429,7 +434,8 @@ export const startParamsZod = z
     effort: effortLevelZod.optional(),
     planningProfile: planningProfileZod.optional(),
     model: nonEmptyString.optional(),
-    contextFiles: z.array(nonEmptyString).default([])
+    contextFiles: z.array(nonEmptyString).default([]),
+    skills: z.array(skillNameString).default([])
   })
   .strict();
 
@@ -452,6 +458,28 @@ export const stopParamsZod = z
   .strict();
 
 export const resumeParamsZod = z
+  .object({
+    name: nonEmptyString,
+    format: responseFormatZod.optional()
+  })
+  .strict();
+
+export const suspendParamsZod = z
+  .object({
+    name: nonEmptyString,
+    format: responseFormatZod.optional()
+  })
+  .strict();
+
+export const focusParamsZod = z
+  .object({
+    name: nonEmptyString,
+    ttlMs: z.number().int().min(5_000).max(5 * 60_000).optional(),
+    format: responseFormatZod.optional()
+  })
+  .strict();
+
+export const unfocusParamsZod = z
   .object({
     name: nonEmptyString,
     format: responseFormatZod.optional()
@@ -542,6 +570,13 @@ export const pluginManifestConfigSchema = {
     acpxCommand: {
       type: "string",
       description: "Optional acpx binary override."
+    },
+    skillRoots: {
+      type: "array",
+      items: {
+        type: "string"
+      },
+      description: "Additional directories containing Claude Code skills as <skill>/SKILL.md."
     },
     agentCommands: {
       type: "object",
@@ -711,7 +746,8 @@ export const toolStartSchema = Type.Object({
     Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])
   ),
   model: Type.Optional(Type.String({ minLength: 1 })),
-  contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 })))
+  contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  skills: Type.Optional(Type.Array(Type.String({ minLength: 1 })))
 });
 
 export const toolSendSchema = Type.Object({
@@ -734,6 +770,22 @@ export const toolStopSchema = Type.Object({
 });
 
 export const toolResumeSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolSuspendSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolFocusSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  ttlMs: Type.Optional(Type.Integer({ minimum: 5000, maximum: 300000 })),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolUnfocusSchema = Type.Object({
   name: Type.String({ minLength: 1 }),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
 });

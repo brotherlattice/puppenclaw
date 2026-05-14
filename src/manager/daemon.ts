@@ -3,6 +3,7 @@ import type { PluginLogger } from "../shared/logger.js";
 import type { OutputRouter } from "../shared/output-router.js";
 import type {
   CostParams,
+  FocusParams,
   ForkParams,
   ParsedPluginConfig,
   ResumeParams,
@@ -10,7 +11,9 @@ import type {
   StartParams,
   StatusParams,
   StopParams,
-  ToolResult
+  SuspendParams,
+  ToolResult,
+  UnfocusParams
 } from "../shared/types.js";
 import type { ISessionManager } from "./interface.js";
 
@@ -62,6 +65,33 @@ export class DaemonSessionManager implements ISessionManager {
     return this.request({
       method: "POST",
       path: `/session/${encodeURIComponent(params.name)}/resume`,
+      body: params
+    });
+  }
+
+  async suspend(params: SuspendParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    return this.request({
+      method: "POST",
+      path: `/session/${encodeURIComponent(params.name)}/suspend`,
+      body: params
+    });
+  }
+
+  async focus(params: FocusParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    return this.request({
+      method: "POST",
+      path: `/session/${encodeURIComponent(params.name)}/focus`,
+      body: params
+    });
+  }
+
+  async unfocus(params: UnfocusParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    return this.request({
+      method: "POST",
+      path: `/session/${encodeURIComponent(params.name)}/unfocus`,
       body: params
     });
   }

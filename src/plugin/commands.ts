@@ -16,6 +16,7 @@ import {
   contextSyncParamsZod,
   costParamsZod,
   exposeParamsZod,
+  focusParamsZod,
   forkParamsZod,
   logsParamsZod,
   projectCreateParamsZod,
@@ -28,6 +29,8 @@ import {
   startParamsZod,
   statusParamsZod,
   stopParamsZod,
+  suspendParamsZod,
+  unfocusParamsZod,
   workerManifestZod
 } from "../shared/schema.js";
 import type {
@@ -135,6 +138,9 @@ function renderHelp(): string {
     "status {}",
     "stop {\"name\":\"api-refactor\"}",
     "resume {\"name\":\"api-refactor\"}",
+    "suspend {\"name\":\"api-refactor\"}",
+    "focus {\"name\":\"api-refactor\"}",
+    "unfocus {\"name\":\"api-refactor\"}",
     "fork {\"source\":\"api-refactor\",\"target\":\"api-refactor-alt\"}",
     "cost {\"name\":\"api-refactor\"}",
     "project {\"name\":\"ml-research\",\"rootDir\":\".\",\"description\":\"Main project root.\",\"defaultAgent\":\"codex\",\"fusionPreferredAgent\":\"codex\",\"planningProfile\":\"deep\"}",
@@ -768,6 +774,48 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
               });
             }
             const result = await manager.resume(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "suspend": {
+            const params = suspendParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              const session = await resolveSessionForRemoteVerb(params.name);
+              await requirePurePipeExposure(ctx, {
+                verb: "suspend",
+                agent: session.agent,
+                projectRoot: session.directory
+              });
+            }
+            const result = await manager.suspend(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "focus": {
+            const params = focusParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              const session = await resolveSessionForRemoteVerb(params.name);
+              await requirePurePipeExposure(ctx, {
+                verb: "focus",
+                agent: session.agent,
+                projectRoot: session.directory
+              });
+            }
+            const result = await manager.focus(params);
+            return { text: renderCommandResult(result, requestedFormat) };
+          }
+          case "unfocus": {
+            const params = unfocusParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            requestedFormat = params.format;
+            if (remote) {
+              const session = await resolveSessionForRemoteVerb(params.name);
+              await requirePurePipeExposure(ctx, {
+                verb: "unfocus",
+                agent: session.agent,
+                projectRoot: session.directory
+              });
+            }
+            const result = await manager.unfocus(params);
             return { text: renderCommandResult(result, requestedFormat) };
           }
           case "fork": {

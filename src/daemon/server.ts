@@ -1,12 +1,12 @@
 import { join } from "node:path";
 
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 
 import { AcpxSessionManager } from "../manager/acpx.js";
 import { OrchestratorRuntime } from "../orchestrator/runtime.js";
 import { OrchestratorStore } from "../orchestrator/store.js";
 import type { PluginLogger } from "../shared/logger.js";
-import { OutputRouter } from "../shared/output-router.js";
+import { OutputRouter, type OutputRouteEvent } from "../shared/output-router.js";
 import { SessionStore } from "../shared/store.js";
 import {
   artifactListParamsZod,
@@ -17,6 +17,7 @@ import {
   campaignStatusParamsZod,
   contextSyncParamsZod,
   costParamsZod,
+  focusParamsZod,
   forkParamsZod,
   logsParamsZod,
   projectCreateParamsZod,
@@ -29,6 +30,8 @@ import {
   startParamsZod,
   statusParamsZod,
   stopParamsZod,
+  suspendParamsZod,
+  unfocusParamsZod,
   workerManifestZod
 } from "../shared/schema.js";
 import type { ParsedPluginConfig, ToolResult } from "../shared/types.js";
@@ -81,7 +84,29 @@ export async function createDaemonServer(params: {
     sessions: store.listSessions().length
   }));
 
+  app.get("/capabilities", async () => ({
+    ok: true,
+    version: 1,
+    sessionStart: true,
+    sessionStartStream: true,
+    sessionSend: true,
+    sessionSendStream: true,
+    sessionSuspend: true,
+    sessionFocus: true,
+    sessionFork: true,
+    sessionSkills: true,
+    maxSessions: {
+      min: 1,
+      max: 100,
+      current: params.config.maxSessions
+    },
+    streamOutput: params.config.streamOutput,
+    defaultAgent: params.config.defaultAgent
+  }));
+
   app.get("/sessions", async () => ok(await manager.status(statusParamsZod.parse({}))));
+
+  app.get("/skills", async () => ok(await manager.listSkills()));
 
   app.get("/session/:name", async (request) =>
     ok(
@@ -105,6 +130,16 @@ export async function createDaemonServer(params: {
 
   app.post("/session/start", async (request) => ok(await manager.start(startParamsZod.parse(request.body))));
 
+  app.post("/session/start/stream", async (request, reply) => {
+    const parsed = startParamsZod.parse(request.body);
+    return streamToolResult({
+      reply,
+      sessionName: parsed.name,
+      outputRouter,
+      run: async () => ok(await manager.start(parsed))
+    });
+  });
+
   app.post("/session/:name/send", async (request) =>
     ok(
       await manager.send(
@@ -116,10 +151,54 @@ export async function createDaemonServer(params: {
     )
   );
 
+  app.post("/session/:name/send/stream", async (request, reply) => {
+    const parsed = sendParamsZod.parse({
+      ...(request.body as Record<string, unknown>),
+      name: (request.params as { name: string }).name
+    });
+    return streamToolResult({
+      reply,
+      sessionName: parsed.name,
+      outputRouter,
+      run: async () => ok(await manager.send(parsed))
+    });
+  });
+
   app.post("/session/:name/resume", async (request) =>
     ok(
       await manager.resume(
         resumeParamsZod.parse({
+          name: (request.params as { name: string }).name
+        })
+      )
+    )
+  );
+
+  app.post("/session/:name/suspend", async (request) =>
+    ok(
+      await manager.suspend(
+        suspendParamsZod.parse({
+          name: (request.params as { name: string }).name
+        })
+      )
+    )
+  );
+
+  app.post("/session/:name/focus", async (request) =>
+    ok(
+      await manager.focus(
+        focusParamsZod.parse({
+          ...(request.body as Record<string, unknown>),
+          name: (request.params as { name: string }).name
+        })
+      )
+    )
+  );
+
+  app.post("/session/:name/unfocus", async (request) =>
+    ok(
+      await manager.unfocus(
+        unfocusParamsZod.parse({
           name: (request.params as { name: string }).name
         })
       )
@@ -293,4 +372,60 @@ export async function createDaemonServer(params: {
   });
 
   return { app };
+}
+
+async function streamToolResult(params: {
+  reply: FastifyReply;
+  sessionName: string;
+  outputRouter: OutputRouter;
+  run: () => Promise<ToolResult>;
+}): Promise<FastifyReply> {
+  let closed = false;
+  params.reply.raw.on("close", () => {
+    closed = true;
+  });
+  params.reply.raw.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no"
+  });
+
+  const write = (event: OutputRouteEvent | { kind: "result"; result: ToolResult } | { kind: "done" }): void => {
+    if (closed || params.reply.raw.writableEnded) {
+      return;
+    }
+    params.reply.raw.write(`event: ${event.kind}\n`);
+    params.reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+
+  params.outputRouter.attach(params.sessionName, (event) => {
+    write(event);
+  });
+
+  try {
+    write({
+      kind: "chunk",
+      sessionName: params.sessionName,
+      text: ""
+    });
+    const result = await params.run();
+    write({ kind: "result", result });
+    write({ kind: "done" });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    write({
+      kind: "error",
+      sessionName: params.sessionName,
+      text: message
+    });
+    write({ kind: "done" });
+  } finally {
+    params.outputRouter.detach(params.sessionName);
+    if (!params.reply.raw.writableEnded) {
+      params.reply.raw.end();
+    }
+  }
+
+  return params.reply;
 }

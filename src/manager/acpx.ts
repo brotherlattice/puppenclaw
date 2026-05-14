@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { resolve as resolvePath } from "node:path";
+import { copyFile, mkdir, readdir, stat } from "node:fs/promises";
+import { dirname, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { SessionStore } from "../shared/store.js";
 import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
@@ -11,6 +13,7 @@ import type {
   AgentKind,
   CostParams,
   EffortLevel,
+  FocusParams,
   ForkParams,
   ParsedPluginConfig,
   PermissionMode,
@@ -23,8 +26,10 @@ import type {
   StartParams,
   StatusParams,
   StopParams,
+  SuspendParams,
   ToolResult,
-  TokenUsage
+  TokenUsage,
+  UnfocusParams
 } from "../shared/types.js";
 import { loadContextFiles, nowIso, summarizePromptEvents } from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
@@ -58,6 +63,37 @@ type SpawnCommand = {
   shell: boolean;
 };
 
+type InstalledSkill = {
+  name: string;
+  sourcePath: string;
+  targetPath: string;
+};
+
+type AvailableSkill = {
+  name: string;
+  sourcePath: string;
+};
+
+const CONNECTED_SESSION_STATES: ReadonlySet<SessionInfo["state"]> = new Set([
+  "idle",
+  "running",
+  "waiting_input"
+]);
+const TERMINAL_SESSION_STATES: ReadonlySet<SessionInfo["state"]> = new Set([
+  "completed",
+  "failed",
+  "stopped"
+]);
+const DEFAULT_FOCUS_LEASE_MS = 45_000;
+const MAX_REHYDRATION_CHARS = 800_000;
+const SKILL_NAME_PATTERN = /^[a-zA-Z0-9._-]+$/u;
+const PACKAGE_SKILLS_ROOT = resolvePath(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "skills"
+);
+
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -69,6 +105,10 @@ function asTrimmedString(value: unknown): string {
 function asOptionalString(value: unknown): string | undefined {
   const trimmed = asTrimmedString(value);
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function asOptionalTextDelta(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function asOptionalFiniteNumber(value: unknown): number | undefined {
@@ -167,7 +207,7 @@ function createTextDeltaEvent(input: {
 }): PromptEvent | null {
   const content = input.payload.content;
   if (isRecord(content)) {
-    const text = asOptionalString(content.text);
+    const text = asOptionalTextDelta(content.text);
     if (text != null) {
       return {
         type: "text_delta",
@@ -177,7 +217,8 @@ function createTextDeltaEvent(input: {
       };
     }
   }
-  const text = asOptionalString(input.payload.text) ?? asOptionalString(input.payload.content);
+  const text =
+    asOptionalTextDelta(input.payload.text) ?? asOptionalTextDelta(input.payload.content);
   if (text == null) {
     return null;
   }
@@ -323,11 +364,58 @@ function dedupeWarnings(values: readonly string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
 
+function dedupeSkillNames(values: readonly string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+}
+
+function dedupeStrings(values: readonly string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function validateSkillNames(values: readonly string[]): string[] {
+  const names = dedupeSkillNames(values);
+  for (const name of names) {
+    if (!SKILL_NAME_PATTERN.test(name)) {
+      throw new PuppenclawError(
+        "INVALID_SKILL_NAME",
+        `Invalid skill name "${name}". Skill names may only contain letters, numbers, dot, underscore, and dash.`
+      );
+    }
+  }
+  return names;
+}
+
+async function isFile(path: string): Promise<boolean> {
+  const file = await stat(path).catch(() => null);
+  return file?.isFile() ?? false;
+}
+
 function mergeTranscript(
   previous: readonly SessionTranscriptEntry[],
   additions: readonly SessionTranscriptEntry[]
 ): SessionTranscriptEntry[] {
   return [...previous, ...additions].slice(-200);
+}
+
+function isConnectedSession(session: SessionInfo): boolean {
+  return CONNECTED_SESSION_STATES.has(session.state);
+}
+
+function isTerminalSession(session: SessionInfo): boolean {
+  return TERMINAL_SESSION_STATES.has(session.state);
+}
+
+function isFocusLeaseActive(session: SessionInfo, nowMs = Date.now()): boolean {
+  if (session.focusedUntil == null) {
+    return false;
+  }
+  const leaseUntil = Date.parse(session.focusedUntil);
+  return Number.isFinite(leaseUntil) && leaseUntil > nowMs;
+}
+
+function withoutFocusLease(session: SessionInfo): SessionInfo {
+  const { focusedUntil: _focusedUntil, ...rest } = session;
+  return rest;
 }
 
 function resolveQuestionFromOutput(output: string): string | undefined {
@@ -429,6 +517,9 @@ function makeUserTranscript(text: string): SessionTranscriptEntry[] {
 }
 
 export class AcpxSessionManager implements ISessionManager {
+  private readonly activeTurns = new Set<string>();
+  private readonly stopRequests = new Set<string>();
+
   constructor(
     private readonly deps: {
       config: ParsedPluginConfig;
@@ -439,8 +530,10 @@ export class AcpxSessionManager implements ISessionManager {
   ) {}
 
   async start(params: StartParams): Promise<ToolResult> {
+    return await this.withSessionTurnLock(params.name, async () => {
     const directory = resolvePath(params.directory);
     const now = nowIso();
+    const requestedSkills = validateSkillNames(params.skills ?? []);
     const existing = this.deps.store.getSession(params.name);
     if (existing != null) {
       if (existing.agent !== params.agent) {
@@ -455,18 +548,13 @@ export class AcpxSessionManager implements ISessionManager {
           `Session ${params.name} already points at ${existing.directory}.`
         );
       }
-    } else {
-      const activeCount = this.deps.store
-        .listSessions()
-        .filter((session) => !["failed", "stopped", "completed"].includes(session.state)).length;
-      if (activeCount >= (this.deps.config.maxSessions || DEFAULT_MAX_SESSIONS)) {
-        throw new PuppenclawError(
-          "MAX_SESSIONS_REACHED",
-          `Puppenclaw is already tracking ${activeCount} sessions.`
-        );
-      }
+    }
+    if (existing == null || !isConnectedSession(existing)) {
+      await this.ensureConnectedCapacity(params.name);
     }
 
+    const installedSkills = await this.installSessionSkills(directory, requestedSkills);
+    const installedSkillNames = installedSkills.map((skill) => skill.name);
     const session = existing ?? this.createSession({
       name: params.name,
       agent: params.agent,
@@ -475,8 +563,13 @@ export class AcpxSessionManager implements ISessionManager {
       ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {}),
       ...(params.model != null ? { model: params.model } : {}),
+      ...(installedSkillNames.length > 0 ? { skills: installedSkillNames } : {}),
       createdAt: now
     });
+    const sessionSkills = dedupeSkillNames([
+      ...(session.skills ?? []),
+      ...installedSkillNames
+    ]);
 
     const warnings = dedupeWarnings([
       ...session.warnings,
@@ -491,7 +584,8 @@ export class AcpxSessionManager implements ISessionManager {
     await this.ensureRuntimeSession({
       name: params.name,
       agent: params.agent,
-      directory
+      directory,
+      ...(params.model ?? session.model ? { model: params.model ?? session.model } : {})
     });
 
     const context = await loadContextFiles(directory, params.contextFiles);
@@ -507,17 +601,23 @@ export class AcpxSessionManager implements ISessionManager {
     ]
       .filter(Boolean)
       .join("\n\n");
+    const runtimePromptText =
+      session.state === "suspended"
+        ? this.buildRehydrationPrompt(session, promptText)
+        : promptText;
     const turn = await this.runTurn({
       session,
-      promptText,
+      promptText: runtimePromptText,
       permissionMode: session.permissionMode
     });
+    const stoppedDuringTurn = this.stopRequests.delete(params.name);
 
     const nextSession: SessionInfo = {
       ...session,
-      state: turn.state,
+      state: stoppedDuringTurn ? "stopped" : turn.state,
       lastActivity: nowIso(),
       warnings: dedupeWarnings([...warnings, ...turn.warnings]),
+      ...(sessionSkills.length > 0 ? { skills: sessionSkills } : {}),
       transcript: mergeTranscript(
         session.transcript,
         [...makeUserTranscript(promptText), ...turn.transcript]
@@ -536,31 +636,49 @@ export class AcpxSessionManager implements ISessionManager {
         cwd: directory,
         agent: params.agent,
         mode: "persistent"
-      }
+      },
+      ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {})
     };
 
     await this.deps.store.upsertSession(nextSession);
     return textToolResult(`Started session ${params.name}.`, {
       session: nextSession,
       output: turn.output,
-      contextFiles: context.files
+      contextFiles: context.files,
+      skills: installedSkills
+    });
     });
   }
 
   async send(params: SendParams): Promise<ToolResult> {
+    return await this.withSessionTurnLock(params.name, async () => {
     const session = this.requireSession(params.name);
+    if (!isConnectedSession(session)) {
+      await this.ensureConnectedCapacity(params.name);
+    }
+    await this.ensureRuntimeSession({
+      name: session.name,
+      agent: session.agent,
+      directory: session.directory,
+      ...(session.model != null ? { model: session.model } : {})
+    });
     const context = await loadContextFiles(session.directory, params.contextFiles);
     const prefix = params.ultrathink ? "Use a high-effort reasoning pass for this reply.\n\n" : "";
     const promptText = [prefix + params.message.trim(), context.promptText].filter(Boolean).join("\n\n");
+    const runtimePromptText =
+      session.state === "suspended"
+        ? this.buildRehydrationPrompt(session, promptText)
+        : promptText;
     const turn = await this.runTurn({
       session,
-      promptText,
+      promptText: runtimePromptText,
       permissionMode: session.permissionMode
     });
+    const stoppedDuringTurn = this.stopRequests.delete(params.name);
 
     const nextSession: SessionInfo = {
       ...session,
-      state: turn.state,
+      state: stoppedDuringTurn ? "stopped" : turn.state,
       lastActivity: nowIso(),
       warnings: dedupeWarnings([...session.warnings, ...turn.warnings]),
       transcript: mergeTranscript(session.transcript, [
@@ -575,7 +693,8 @@ export class AcpxSessionManager implements ISessionManager {
         ? { tokenUsage: turn.tokenUsage }
         : session.tokenUsage != null
           ? { tokenUsage: session.tokenUsage }
-          : {})
+          : {}),
+      ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {})
     };
 
     await this.deps.store.upsertSession(nextSession);
@@ -584,10 +703,12 @@ export class AcpxSessionManager implements ISessionManager {
       output: turn.output,
       contextFiles: context.files
     });
+    });
   }
 
   async stop(params: StopParams): Promise<ToolResult> {
     const session = this.requireSession(params.name);
+    this.stopRequests.add(params.name);
     await this.runControlCommand({
       args: this.buildVerbArgs(session.agent, session.directory, [
         "cancel",
@@ -600,12 +721,15 @@ export class AcpxSessionManager implements ISessionManager {
     });
 
     const nextSession: SessionInfo = {
-      ...session,
+      ...withoutFocusLease(session),
       state: "stopped",
       lastActivity: nowIso(),
       lastStopReason: "stopped by user"
     };
     await this.deps.store.upsertSession(nextSession);
+    if (!this.activeTurns.has(params.name)) {
+      this.stopRequests.delete(params.name);
+    }
     return textToolResult(`Stopped session ${params.name}.`, {
       session: nextSession
     });
@@ -613,18 +737,62 @@ export class AcpxSessionManager implements ISessionManager {
 
   async resume(params: ResumeParams): Promise<ToolResult> {
     const session = this.requireSession(params.name);
+    if (!isConnectedSession(session)) {
+      await this.ensureConnectedCapacity(session.name);
+    }
     await this.ensureRuntimeSession({
       name: session.name,
       agent: session.agent,
-      directory: session.directory
+      directory: session.directory,
+      ...(session.model != null ? { model: session.model } : {})
     });
     const nextSession: SessionInfo = {
       ...session,
-      state: "idle",
-      lastActivity: nowIso()
+      state: "idle"
     };
     await this.deps.store.upsertSession(nextSession);
     return textToolResult(`Resumed session ${params.name}.`, {
+      session: nextSession
+    });
+  }
+
+  async suspend(params: SuspendParams): Promise<ToolResult> {
+    const session = this.requireSession(params.name);
+    if (this.isTurnActive(session)) {
+      throw new PuppenclawError(
+        "TURN_ALREADY_RUNNING",
+        `Session ${params.name} is currently running a turn and cannot be suspended.`
+      );
+    }
+    if (session.state === "suspended" || isTerminalSession(session)) {
+      return textToolResult(`Session ${params.name} is not connected.`, {
+        session
+      });
+    }
+    const nextSession = await this.suspendTrackedSession(session, "suspended by user");
+    return textToolResult(`Suspended session ${params.name}.`, {
+      session: nextSession
+    });
+  }
+
+  async focus(params: FocusParams): Promise<ToolResult> {
+    const session = this.requireSession(params.name);
+    const ttlMs = params.ttlMs ?? DEFAULT_FOCUS_LEASE_MS;
+    const nextSession: SessionInfo = {
+      ...session,
+      focusedUntil: new Date(Date.now() + ttlMs).toISOString()
+    };
+    await this.deps.store.upsertSession(nextSession);
+    return textToolResult(`Focused session ${params.name}.`, {
+      session: nextSession
+    });
+  }
+
+  async unfocus(params: UnfocusParams): Promise<ToolResult> {
+    const session = this.requireSession(params.name);
+    const nextSession = withoutFocusLease(session);
+    await this.deps.store.upsertSession(nextSession);
+    return textToolResult(`Unfocused session ${params.name}.`, {
       session: nextSession
     });
   }
@@ -655,21 +823,33 @@ export class AcpxSessionManager implements ISessionManager {
       effort: params.effort ?? source.effort,
       planningProfile: source.planningProfile,
       model: params.model ?? source.model,
-      contextFiles: []
+      contextFiles: [],
+      skills: source.skills ?? []
     });
     return textToolResult(`Forked ${params.source} into ${params.target}.`, result.details);
+  }
+
+  async listSkills(): Promise<ToolResult> {
+    return jsonToolResult(
+      {
+        skills: await this.listAvailableSkills()
+      },
+      "Available Puppenclaw skills"
+    );
   }
 
   async status(params: StatusParams = {}): Promise<ToolResult> {
     if (params.name == null) {
       return jsonToolResult(
         {
-          sessions: this.deps.store.listSessions()
+          sessions: this.deps.store
+            .listSessions()
+            .map((session) => this.decorateVisibleSession(session))
         },
         "Tracked Puppenclaw sessions"
       );
     }
-    const session = this.requireSession(params.name);
+    const session = this.decorateVisibleSession(this.requireSession(params.name));
     const runtimeStatus = await this.getRuntimeStatus({
       name: session.name,
       agent: session.agent,
@@ -718,6 +898,187 @@ export class AcpxSessionManager implements ISessionManager {
     }
   }
 
+  private async withSessionTurnLock<T>(name: string, run: () => Promise<T>): Promise<T> {
+    if (this.activeTurns.has(name)) {
+      throw new PuppenclawError(
+        "TURN_ALREADY_RUNNING",
+        `Session ${name} is already running a turn.`
+      );
+    }
+    this.activeTurns.add(name);
+    this.stopRequests.delete(name);
+    try {
+      return await run();
+    } finally {
+      this.activeTurns.delete(name);
+    }
+  }
+
+  private isTurnActive(session: SessionInfo): boolean {
+    return this.activeTurns.has(session.name) || session.state === "running";
+  }
+
+  private decorateVisibleSession(session: SessionInfo): SessionInfo {
+    if (!this.activeTurns.has(session.name)) {
+      return session;
+    }
+    return {
+      ...session,
+      state: "running"
+    };
+  }
+
+  private async ensureConnectedCapacity(incomingSessionName: string): Promise<void> {
+    const incoming = this.deps.store.getSession(incomingSessionName);
+    if (incoming != null && isConnectedSession(incoming)) {
+      return;
+    }
+
+    const maxSessions = this.deps.config.maxSessions || DEFAULT_MAX_SESSIONS;
+    const connectedSessions = this.deps.store.listSessions().filter(isConnectedSession);
+    if (connectedSessions.length < maxSessions) {
+      return;
+    }
+
+    const evictionCandidate = connectedSessions
+      .filter((session) => session.name !== incomingSessionName)
+      .filter((session) => !this.isTurnActive(session))
+      .filter((session) => !isFocusLeaseActive(session))
+      .sort((left, right) => Date.parse(left.lastActivity) - Date.parse(right.lastActivity))
+      .at(0);
+
+    if (evictionCandidate == null) {
+      throw new PuppenclawError(
+        "MAX_SESSIONS_REACHED",
+        `Puppenclaw is already tracking ${connectedSessions.length} connected sessions and none can be suspended.`
+      );
+    }
+
+    await this.suspendTrackedSession(
+      evictionCandidate,
+      `suspended by LRU eviction for ${incomingSessionName}`
+    );
+  }
+
+  private async suspendTrackedSession(
+    session: SessionInfo,
+    reason: string
+  ): Promise<SessionInfo> {
+    await this.runControlCommand({
+      args: this.buildVerbArgs(session.agent, session.directory, [
+        "sessions",
+        "close",
+        session.name
+      ]),
+      cwd: session.directory
+    }).catch((error) => {
+      this.deps.logger.warn(
+        `Unable to close ACPX session ${session.name}: ${ensureError(error).message}`
+      );
+    });
+
+    const nextSession: SessionInfo = {
+      ...withoutFocusLease(session),
+      state: "suspended",
+      lastStopReason: reason
+    };
+    await this.deps.store.upsertSession(nextSession);
+    this.deps.outputRouter.clear(session.name);
+    return nextSession;
+  }
+
+  private buildRehydrationPrompt(session: SessionInfo, newPrompt: string): string {
+    const transcriptText = session.transcript
+      .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
+      .join("\n\n")
+      .trim();
+    if (!transcriptText) {
+      return newPrompt;
+    }
+    if (transcriptText.length > MAX_REHYDRATION_CHARS) {
+      throw new PuppenclawError(
+        "SESSION_HISTORY_TOO_LARGE",
+        `Session ${session.name} has too much stored transcript to rehydrate safely.`
+      );
+    }
+    return [
+      `This Puppenclaw session ${session.name} was disconnected from the ACP runtime to free a worker slot.`,
+      "Rehydrate the following transcript as prior context. Do not repeat it to the user unless needed.",
+      transcriptText,
+      "Continue with this new user message:",
+      newPrompt
+    ].join("\n\n");
+  }
+
+  private skillSearchRoots(): string[] {
+    return dedupeStrings([
+      ...this.deps.config.skillRoots.map((root) => resolvePath(root)),
+      PACKAGE_SKILLS_ROOT
+    ]);
+  }
+
+  private async listAvailableSkills(): Promise<AvailableSkill[]> {
+    const byName = new Map<string, AvailableSkill>();
+    for (const root of this.skillSearchRoots()) {
+      const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !SKILL_NAME_PATTERN.test(entry.name)) {
+          continue;
+        }
+        const sourcePath = join(root, entry.name, "SKILL.md");
+        if (!byName.has(entry.name) && (await isFile(sourcePath))) {
+          byName.set(entry.name, {
+            name: entry.name,
+            sourcePath
+          });
+        }
+      }
+    }
+    return [...byName.values()].sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  private async resolveSkillPath(name: string): Promise<string | undefined> {
+    for (const root of this.skillSearchRoots()) {
+      const sourcePath = join(root, name, "SKILL.md");
+      if (await isFile(sourcePath)) {
+        return sourcePath;
+      }
+    }
+    return undefined;
+  }
+
+  private async installSessionSkills(
+    directory: string,
+    skills: readonly string[]
+  ): Promise<InstalledSkill[]> {
+    const names = validateSkillNames(skills);
+    if (names.length === 0) {
+      return [];
+    }
+
+    const installed: InstalledSkill[] = [];
+    for (const name of names) {
+      const sourcePath = await this.resolveSkillPath(name);
+      if (sourcePath == null) {
+        throw new PuppenclawError(
+          "SKILL_NOT_FOUND",
+          `Skill "${name}" was not found in configured Puppenclaw skill roots.`
+        );
+      }
+
+      const targetDir = join(directory, ".claude", "skills", name);
+      const targetPath = join(targetDir, "SKILL.md");
+      await mkdir(targetDir, { recursive: true });
+      await copyFile(sourcePath, targetPath);
+      installed.push({
+        name,
+        sourcePath,
+        targetPath
+      });
+    }
+    return installed;
+  }
+
   private createSession(params: {
     name: string;
     agent: AgentKind;
@@ -726,6 +1087,7 @@ export class AcpxSessionManager implements ISessionManager {
     effort?: EffortLevel;
     planningProfile?: PlanningProfile;
     model?: string;
+    skills?: string[];
     createdAt: string;
   }): SessionInfo {
     return {
@@ -739,6 +1101,7 @@ export class AcpxSessionManager implements ISessionManager {
       ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {}),
       ...(params.model != null ? { model: params.model } : {}),
+      ...(params.skills != null && params.skills.length > 0 ? { skills: params.skills } : {}),
       warnings: [],
       transcript: [],
       handle: {
@@ -849,6 +1212,7 @@ export class AcpxSessionManager implements ISessionManager {
     name: string;
     agent: AgentKind;
     directory: string;
+    model?: string;
   }): Promise<void> {
     const status = await this.getRuntimeStatus(params);
     if (!status.exists || status.status === "dead") {
@@ -861,6 +1225,22 @@ export class AcpxSessionManager implements ISessionManager {
       await this.runControlCommand({
         args,
         cwd: params.directory
+      });
+    }
+    if (params.model != null) {
+      await this.runControlCommand({
+        args: this.buildVerbArgs(params.agent, params.directory, [
+          "set",
+          "--session",
+          params.name,
+          "model",
+          params.model
+        ]),
+        cwd: params.directory
+      }).catch((error) => {
+        this.deps.logger.warn(
+          `Unable to set ACPX model for session ${params.name}: ${ensureError(error).message}`
+        );
       });
     }
     await this.waitForRuntimeSessionReady(params);
@@ -977,8 +1357,8 @@ export class AcpxSessionManager implements ISessionManager {
           return;
         }
         const rawText =
-          asOptionalString(parsed.text) ??
-          (isRecord(parsed.content) ? asOptionalString(parsed.content.text) : undefined);
+          asOptionalTextDelta(parsed.text) ??
+          (isRecord(parsed.content) ? asOptionalTextDelta(parsed.content.text) : undefined);
         if (rawText != null) {
           outputChunks.push(rawText);
           dispatchTasks.push(this.deps.outputRouter.onChunk(params.session.name, rawText));
