@@ -91,6 +91,8 @@ export async function createDaemonServer(params: {
     sessionStartStream: true,
     sessionSend: true,
     sessionSendStream: true,
+    sessionOutput: true,
+    sessionPurge: true,
     sessionSuspend: true,
     sessionFocus: true,
     sessionFork: true,
@@ -111,6 +113,16 @@ export async function createDaemonServer(params: {
   app.get("/session/:name", async (request) =>
     ok(
       await manager.status(
+        statusParamsZod.parse({
+          name: (request.params as { name: string }).name
+        })
+      )
+    )
+  );
+
+  app.get("/session/:name/output", async (request) =>
+    ok(
+      await manager.output(
         statusParamsZod.parse({
           name: (request.params as { name: string }).name
         })
@@ -208,6 +220,16 @@ export async function createDaemonServer(params: {
   app.delete("/session/:name", async (request) =>
     ok(
       await manager.stop(
+        stopParamsZod.parse({
+          name: (request.params as { name: string }).name
+        })
+      )
+    )
+  );
+
+  app.post("/session/:name/purge", async (request) =>
+    ok(
+      await manager.purge(
         stopParamsZod.parse({
           name: (request.params as { name: string }).name
         })
@@ -391,6 +413,14 @@ async function streamToolResult(params: {
     "x-accel-buffering": "no"
   });
 
+  const heartbeat = setInterval(() => {
+    if (closed || params.reply.raw.writableEnded) {
+      return;
+    }
+    params.reply.raw.write(`: heartbeat ${Date.now()}\n\n`);
+  }, 15_000);
+  heartbeat.unref?.();
+
   const write = (event: OutputRouteEvent | { kind: "result"; result: ToolResult } | { kind: "done" }): void => {
     if (closed || params.reply.raw.writableEnded) {
       return;
@@ -421,6 +451,7 @@ async function streamToolResult(params: {
     });
     write({ kind: "done" });
   } finally {
+    clearInterval(heartbeat);
     params.outputRouter.detach(params.sessionName);
     if (!params.reply.raw.writableEnded) {
       params.reply.raw.end();

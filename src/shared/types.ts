@@ -31,6 +31,7 @@ import type {
   resumeParamsZod,
   focusParamsZod,
   suspendParamsZod,
+  modelProviderConfigZod,
   runStateZod,
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -56,6 +57,7 @@ export type PlanningProfile = z.infer<typeof planningProfileZod>;
 export type ResponseFormat = z.infer<typeof responseFormatZod>;
 export type ExposureMode = z.infer<typeof exposureModeZod>;
 export type RemoteVerb = z.infer<typeof remoteVerbZod>;
+export type ModelProviderConfig = z.infer<typeof modelProviderConfigZod>;
 export type PluginConfig = z.input<typeof pluginConfigZod>;
 export type ParsedPluginConfig = z.output<typeof pluginConfigZod>;
 export type McpServerConfig = z.infer<typeof mcpServerConfigZod>;
@@ -156,6 +158,8 @@ export type SessionInfo = {
   effort?: EffortLevel;
   planningProfile?: PlanningProfile;
   model?: string;
+  modelProviderId?: string;
+  modelProvider?: ModelProviderConfig;
   skills?: string[];
   tokenUsage?: TokenUsage;
   pendingQuestion?: string;

@@ -119,11 +119,30 @@ export class DaemonSessionManager implements ISessionManager {
     });
   }
 
+  async output(params: StatusParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    if (params.name == null) {
+      throw new PuppenclawError("MISSING_SESSION", "Session name is required.");
+    }
+    return this.request({
+      method: "GET",
+      path: `/session/${encodeURIComponent(params.name)}/output`
+    });
+  }
+
   async cost(params: CostParams): Promise<ToolResult> {
     await this.ensureHealthy();
     return this.request({
       method: "GET",
       path: `/session/${encodeURIComponent(params.name)}/cost`
+    });
+  }
+
+  async purge(params: StopParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    return this.request({
+      method: "POST",
+      path: `/session/${encodeURIComponent(params.name)}/purge`
     });
   }
 

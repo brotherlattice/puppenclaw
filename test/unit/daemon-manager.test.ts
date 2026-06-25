@@ -29,6 +29,8 @@ describe("DaemonSessionManager", () => {
       const payload = JSON.parse(response.body) as {
         sessionStartStream?: boolean;
         sessionSendStream?: boolean;
+        sessionOutput?: boolean;
+        sessionPurge?: boolean;
         sessionSkills?: boolean;
         maxSessions?: { min?: number; max?: number; current?: number };
       };
@@ -36,6 +38,8 @@ describe("DaemonSessionManager", () => {
       expect(response.statusCode).toBe(200);
       expect(payload.sessionStartStream).toBe(true);
       expect(payload.sessionSendStream).toBe(true);
+      expect(payload.sessionOutput).toBe(true);
+      expect(payload.sessionPurge).toBe(true);
       expect(payload.sessionSkills).toBe(true);
       expect(payload.maxSessions).toEqual({
         min: 1,
@@ -120,6 +124,17 @@ describe("DaemonSessionManager", () => {
       const cost = await manager.cost({ name: "daemon-demo" });
       const costDetails = cost.details as { name: string };
       expect(costDetails.name).toBe("daemon-demo");
+
+      const output = await manager.output({ name: "daemon-demo" });
+      const outputDetails = output.details as {
+        output: { text: string; source: string; complete: boolean };
+      };
+      expect(outputDetails.output.text).toContain("Handled:");
+      expect(outputDetails.output.source).toBe("active-turn");
+      expect(outputDetails.output.complete).toBe(true);
+
+      const purge = await manager.purge({ name: "daemon-demo" });
+      expect((purge.details as { purged: boolean }).purged).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
       await app.close();

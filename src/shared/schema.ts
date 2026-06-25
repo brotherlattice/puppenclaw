@@ -63,6 +63,19 @@ export const planningProfileZod = z.enum(["off", "quick", "deep"]);
 export const responseFormatZod = z.enum(["text", "json"]);
 export const exposureModeZod = z.enum(["read-only", "execute"]);
 export const remoteVerbZod = z.enum(REMOTE_CONTROL_VERBS);
+export const modelProviderConfigZod = z
+  .object({
+    id: skillNameString,
+    label: nonEmptyString.optional(),
+    kind: z
+      .enum(["claude-code", "codex-openai", "codex-openai-compatible"])
+      .optional(),
+    model: nonEmptyString,
+    baseUrl: nonEmptyString.optional(),
+    authTokenEnv: nonEmptyString.optional(),
+    wireApi: z.enum(["responses"]).optional()
+  })
+  .strict();
 export const orchestrationStepKindZod = z.enum([
   "judge",
   "research",
@@ -201,6 +214,7 @@ export const pluginConfigZod = z
     sessionTtlMinutes: z.number().int().min(1).max(24 * 60).default(DEFAULT_SESSION_TTL_MINUTES),
     streamOutput: z.boolean().default(DEFAULT_STREAM_OUTPUT),
     acpxCommand: nonEmptyString.optional(),
+    codexCommand: nonEmptyString.optional(),
     skillRoots: z.array(nonEmptyString).default([]),
     agentCommands: z
       .object({
@@ -434,6 +448,8 @@ export const startParamsZod = z
     effort: effortLevelZod.optional(),
     planningProfile: planningProfileZod.optional(),
     model: nonEmptyString.optional(),
+    modelProviderId: skillNameString.optional(),
+    modelProvider: modelProviderConfigZod.optional(),
     contextFiles: z.array(nonEmptyString).default([]),
     skills: z.array(skillNameString).default([])
   })
@@ -746,6 +762,24 @@ export const toolStartSchema = Type.Object({
     Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])
   ),
   model: Type.Optional(Type.String({ minLength: 1 })),
+  modelProviderId: Type.Optional(Type.String({ minLength: 1 })),
+  modelProvider: Type.Optional(
+    Type.Object({
+      id: Type.String({ minLength: 1 }),
+      label: Type.Optional(Type.String({ minLength: 1 })),
+      kind: Type.Optional(
+        Type.Union([
+          Type.Literal("claude-code"),
+          Type.Literal("codex-openai"),
+          Type.Literal("codex-openai-compatible")
+        ])
+      ),
+      model: Type.String({ minLength: 1 }),
+      baseUrl: Type.Optional(Type.String({ minLength: 1 })),
+      authTokenEnv: Type.Optional(Type.String({ minLength: 1 })),
+      wireApi: Type.Optional(Type.Literal("responses"))
+    })
+  ),
   contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   skills: Type.Optional(Type.Array(Type.String({ minLength: 1 })))
 });

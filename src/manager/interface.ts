@@ -22,6 +22,8 @@ export interface ISessionManager {
   unfocus(params: UnfocusParams): Promise<ToolResult>;
   fork(params: ForkParams): Promise<ToolResult>;
   status(params?: StatusParams): Promise<ToolResult>;
+  output(params: StatusParams): Promise<ToolResult>;
   cost(params: CostParams): Promise<ToolResult>;
+  purge(params: StopParams): Promise<ToolResult>;
   gc(): Promise<void>;
 }

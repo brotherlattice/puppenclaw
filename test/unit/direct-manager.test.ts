@@ -11,7 +11,7 @@ async function resolveWhitespaceFakeAcpxCommand(workspaceDir: string): Promise<s
   await writeFile(
     fakeAcpxPath,
     `#!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const args = process.argv.slice(2);
@@ -22,16 +22,20 @@ const command = commandIndex >= 0 ? args.slice(commandIndex) : [];
 const stateDir = join(cwd, ".fake-acpx-state");
 mkdirSync(stateDir, { recursive: true });
 
+function emit(value) {
+  writeSync(1, JSON.stringify(value) + "\\n");
+}
+
 function sessionFile(name) {
   return join(stateDir, \`\${basename(name)}.session\`);
 }
 
 if (command[0] === "status" && command[1] === "--session" && command[2]) {
   if (!existsSync(sessionFile(command[2]))) {
-    console.log(JSON.stringify({ action: "status_snapshot", status: "no-session", summary: "no active session" }));
+    emit({ action: "status_snapshot", status: "no-session", summary: "no active session" });
     process.exit(0);
   }
-  console.log(JSON.stringify({ status: "alive", summary: "ready" }));
+  emit({ status: "alive", summary: "ready" });
   process.exit(0);
 }
 
@@ -39,16 +43,26 @@ if (command[0] === "sessions" && command[1] === "new") {
   const nameIndex = command.indexOf("--name");
   const name = nameIndex >= 0 ? command[nameIndex + 1] : "demo";
   writeFileSync(sessionFile(name), "alive\\n", "utf8");
-  console.log(JSON.stringify({ status: "alive" }));
+  emit({ status: "alive" });
+  process.exit(0);
+}
+
+if (command[0] === "sessions" && command[1] === "show" && command[2]) {
+  emit({ messages: [] });
+  process.exit(0);
+}
+
+if (command[0] === "sessions" && command[1] === "history") {
+  emit({ entries: [] });
   process.exit(0);
 }
 
 if (command[0] === "prompt" && command[1] === "--session" && command[2]) {
   readFileSync(0, "utf8");
   for (const text of ["Alpha", " beta", " ", "gamma", "\\nNext", " line"]) {
-    console.log(JSON.stringify({ type: "agent_message_chunk", content: { type: "text", text } }));
+    emit({ type: "agent_message_chunk", content: { type: "text", text } });
   }
-  console.log(JSON.stringify({ type: "done" }));
+  emit({ type: "done" });
   process.exit(0);
 }
 
@@ -58,6 +72,150 @@ process.exit(1);
     "utf8"
   );
   return `node "${fakeAcpxPath.replaceAll('"', '\\"')}"`;
+}
+
+async function resolveFakeCodexJsonCommand(workspaceDir: string): Promise<string> {
+  const fakeCodexPath = join(workspaceDir, "fake-codex-json.mjs");
+  await writeFile(
+    fakeCodexPath,
+    `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { join } from "node:path";
+
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+const outputPath = outputIndex >= 0 ? args[outputIndex + 1] : null;
+const cwdIndex = args.indexOf("--cd");
+const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : process.cwd();
+const counterPath = join(cwd, ".fake-codex-json-count");
+const invocation = existsSync(counterPath)
+  ? Number.parseInt(readFileSync(counterPath, "utf8"), 10) || 0
+  : 0;
+writeFileSync(counterPath, String(invocation + 1), "utf8");
+
+let promptText = "";
+for await (const chunk of process.stdin) {
+  promptText += chunk;
+}
+const longRunningTurn = invocation > 0;
+
+function emit(value) {
+  writeSync(1, JSON.stringify(value) + "\\n");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+emit({ type: "turn_started" });
+writeSync(1, "LIVE RAW PROGRESS\\n");
+emit({
+  type: "response_item",
+  item: {
+    type: "function_call",
+    name: "exec_command",
+    arguments: "{\\"cmd\\":\\"date\\"}"
+  }
+});
+emit({
+  type: "response_item",
+  item: {
+    type: "message",
+    tool_calls: [
+      {
+        type: "function",
+        function: {
+          name: "mcp__paper_search_mcp__search_pubmed",
+          arguments: "{\\"query\\":\\"RSV\\"}"
+        }
+      }
+    ]
+  }
+});
+await sleep(longRunningTurn ? 1500 : 20);
+emit({
+  type: "response_item",
+  item: {
+    type: "function_call_output",
+    output: "command output line\\nsecond line"
+  }
+});
+await sleep(80);
+emit({
+  type: "response_item",
+  item: {
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text: "Final streamed answer." }]
+  }
+});
+if (outputPath != null) {
+  writeFileSync(outputPath, "Final file answer.", "utf8");
+}
+`,
+    "utf8"
+  );
+  return `node "${fakeCodexPath.replaceAll('"', '\\"')}"`;
+}
+
+async function resolveFakeCodexFailureCommand(workspaceDir: string): Promise<string> {
+  const fakeCodexPath = join(workspaceDir, "fake-codex-failure.mjs");
+  await writeFile(
+    fakeCodexPath,
+    `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { join } from "node:path";
+
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+const outputPath = outputIndex >= 0 ? args[outputIndex + 1] : null;
+const cwdIndex = args.indexOf("--cd");
+const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : process.cwd();
+const counterPath = join(cwd, ".fake-codex-failure-count");
+const invocation = existsSync(counterPath)
+  ? Number.parseInt(readFileSync(counterPath, "utf8"), 10) || 0
+  : 0;
+writeFileSync(counterPath, String(invocation + 1), "utf8");
+
+for await (const _chunk of process.stdin) {}
+
+function emit(value) {
+  writeSync(1, JSON.stringify(value) + "\\n");
+}
+
+if (invocation === 0) {
+  emit({
+    type: "response_item",
+    item: {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "Initial successful report." }]
+    }
+  });
+  if (outputPath != null) {
+    writeFileSync(outputPath, "Initial successful report.", "utf8");
+  }
+  process.exit(0);
+}
+
+emit({
+  type: "response_item",
+  item: {
+    type: "function_call",
+    name: "exec_command",
+    arguments: "{\\"cmd\\":\\"build report\\"}"
+  }
+});
+writeSync(2, "stream disconnected before completion: {\\"error\\":\\"The operation was aborted due to timeout\\"}\\n");
+process.exit(1);
+`,
+    "utf8"
+  );
+  return `node "${fakeCodexPath.replaceAll('"', '\\"')}"`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 describe("AcpxSessionManager", () => {
@@ -149,6 +307,162 @@ describe("AcpxSessionManager", () => {
 
     expect(chunks.join("")).toBe("Alpha beta gamma\nNext line");
     expect(details.output).toBe("Alpha beta gamma\nNext line");
+  });
+
+  it("exposes live Codex one-shot JSON output while the turn is running", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-codex-json-");
+    const codexCommand = await resolveFakeCodexJsonCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const chunks: string[] = [];
+    outputRouter.attach("codex-json-demo", async (event) => {
+      if (event.kind === "chunk") {
+        chunks.push(event.text);
+      }
+    });
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        agentCommands: {
+          codex: codexCommand
+        }
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const modelProvider = {
+      id: "fake-openai-compatible",
+      kind: "codex-openai-compatible" as const,
+      model: "fake-model",
+      baseUrl: "http://example.invalid/v1",
+      authTokenEnv: "FAKE_CODEX_TOKEN",
+      wireApi: "responses" as const
+    };
+
+    await manager.start({
+      agent: "codex",
+      name: "codex-json-demo",
+      directory: workspaceDir,
+      task: "Prime the one-shot session.",
+      contextFiles: [],
+      modelProvider
+    });
+    chunks.length = 0;
+
+    const sendPromise = manager.send({
+      name: "codex-json-demo",
+      message: "Run a visible tool turn.",
+      contextFiles: []
+    });
+
+    let liveOutput = "";
+    const observedOutputs: Array<{
+      attempt: number;
+      source: string | undefined;
+      complete: boolean | undefined;
+      text: string;
+    }> = [];
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      await sleep(20);
+      const output = await manager.output({ name: "codex-json-demo" }).catch(() => null);
+      const outputDetails = (output?.details as
+        | { output?: { text?: string; source?: string; complete?: boolean } }
+        | undefined)?.output;
+      liveOutput = outputDetails?.text ?? "";
+      if (
+        observedOutputs.length === 0 ||
+        observedOutputs.at(-1)?.text !== liveOutput ||
+        observedOutputs.at(-1)?.source !== outputDetails?.source ||
+        observedOutputs.at(-1)?.complete !== outputDetails?.complete
+      ) {
+        observedOutputs.push({
+          attempt,
+          source: outputDetails?.source,
+          complete: outputDetails?.complete,
+          text: liveOutput
+        });
+      }
+      if (liveOutput.includes("[tool] exec_command")) {
+        break;
+      }
+    }
+
+    const result = await sendPromise;
+    const details = result.details as {
+      output: string;
+    };
+
+    expect(
+      liveOutput,
+      JSON.stringify({ observedOutputs, chunks }, null, 2)
+    ).toContain("[tool] exec_command");
+
+    expect(chunks.join("")).toContain("command output line");
+    expect(chunks.join("")).toContain("[tool] mcp__paper_search_mcp__search_pubmed");
+    expect(details.output).toBe("Final file answer.");
+  });
+
+  it("reports a failed Codex follow-up turn instead of stale prior assistant output", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-codex-failure-");
+    const codexCommand = await resolveFakeCodexFailureCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        agentCommands: {
+          codex: codexCommand
+        }
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const modelProvider = {
+      id: "fake-openai-compatible",
+      kind: "codex-openai-compatible" as const,
+      model: "fake-model",
+      baseUrl: "http://example.invalid/v1",
+      authTokenEnv: "FAKE_CODEX_TOKEN",
+      wireApi: "responses" as const
+    };
+
+    await manager.start({
+      agent: "codex",
+      name: "codex-failure-demo",
+      directory: workspaceDir,
+      task: "Create the first report.",
+      contextFiles: [],
+      modelProvider
+    });
+
+    const result = await manager.send({
+      name: "codex-failure-demo",
+      message: "Revise the report.",
+      contextFiles: []
+    });
+    const sendDetails = result.details as {
+      session: SessionInfo;
+    };
+    expect(sendDetails.session.state).toBe("failed");
+
+    const output = await manager.output({ name: "codex-failure-demo" });
+    const outputDetails = output.details as {
+      output: { text: string; source: string; complete: boolean };
+    };
+    expect(outputDetails.output.source).toBe("active-turn");
+    expect(outputDetails.output.complete).toBe(true);
+    expect(outputDetails.output.text).toContain("stream disconnected before completion");
+    expect(outputDetails.output.text).toContain("[tool] exec_command");
+    expect(outputDetails.output.text).not.toContain("Initial successful report");
   });
 
   it("marks a session as waiting_input when the reply is a question", async () => {
