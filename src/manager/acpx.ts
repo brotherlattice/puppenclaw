@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -64,6 +64,10 @@ type ActiveTurnOutput = {
   startedAt: string;
   updatedAt: string;
   complete: boolean;
+};
+
+type ActiveTurnProcess = {
+  child: ChildProcess;
 };
 
 type SpawnCommand = {
@@ -850,6 +854,7 @@ export class AcpxSessionManager implements ISessionManager {
   private readonly activeTurns = new Set<string>();
   private readonly stopRequests = new Set<string>();
   private readonly activeTurnOutputs = new Map<string, ActiveTurnOutput>();
+  private readonly activeTurnProcesses = new Map<string, ActiveTurnProcess>();
 
   constructor(
     private readonly deps: {
@@ -1061,6 +1066,7 @@ export class AcpxSessionManager implements ISessionManager {
     const session = this.requireSession(params.name);
     const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
     this.stopRequests.add(params.name);
+    const hadActiveTurn = this.activeTurns.has(params.name);
     await this.runControlCommand({
       args: this.buildVerbArgs(session.agent, session.directory, [
         "cancel",
@@ -1072,6 +1078,13 @@ export class AcpxSessionManager implements ISessionManager {
     }).catch(() => {
       // best-effort cancel
     });
+    const signalledTurn = this.terminateActiveTurnProcess(params.name, "SIGTERM");
+    if (signalledTurn) {
+      const forceKillTimer = setTimeout(() => {
+        this.terminateActiveTurnProcess(params.name, "SIGKILL");
+      }, 2_000);
+      forceKillTimer.unref();
+    }
 
     const nextSession: SessionInfo = {
       ...withoutFocusLease(session),
@@ -1080,7 +1093,7 @@ export class AcpxSessionManager implements ISessionManager {
       lastStopReason: "stopped by user"
     };
     await this.deps.store.upsertSession(nextSession);
-    if (!this.activeTurns.has(params.name)) {
+    if (!hadActiveTurn) {
       this.stopRequests.delete(params.name);
     }
     return textToolResult(`Stopped session ${params.name}.`, {
@@ -1287,6 +1300,7 @@ export class AcpxSessionManager implements ISessionManager {
     const session = this.requireSession(params.name);
     const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
     this.stopRequests.add(params.name);
+    this.terminateActiveTurnProcess(params.name, "SIGTERM");
     await this.runControlCommand({
       args: this.buildVerbArgs(session.agent, session.directory, [
         "cancel",
@@ -1312,6 +1326,7 @@ export class AcpxSessionManager implements ISessionManager {
     await this.deps.store.removeSession(params.name);
     this.deps.outputRouter.clear(params.name);
     this.activeTurnOutputs.delete(params.name);
+    this.activeTurnProcesses.delete(params.name);
     this.stopRequests.delete(params.name);
     return textToolResult(`Purged session ${params.name}.`, {
       sessionName: params.name,
@@ -1368,6 +1383,9 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private decorateVisibleSession(session: SessionInfo): SessionInfo {
+    if (this.stopRequests.has(session.name)) {
+      return session;
+    }
     if (!this.activeTurns.has(session.name)) {
       return session;
     }
@@ -1919,13 +1937,16 @@ export class AcpxSessionManager implements ISessionManager {
           cwd: params.session.directory,
           stdio: ["pipe", "pipe", "pipe"],
           shell: true,
+          detached: process.platform !== "win32",
           env
         })
       : spawn(spawnCommand.command, spawnCommand.args, {
           cwd: params.session.directory,
           stdio: ["pipe", "pipe", "pipe"],
+          detached: process.platform !== "win32",
           env
         });
+    this.registerActiveTurnProcess(params.session.name, child);
 
     child.stdin.setDefaultEncoding("utf8");
     child.stdin.write(params.promptText);
@@ -2193,13 +2214,16 @@ export class AcpxSessionManager implements ISessionManager {
           cwd: params.session.directory,
           stdio: ["pipe", "pipe", "pipe"],
           shell: true,
+          detached: process.platform !== "win32",
           env
         })
       : spawn(spawnCommand.command, spawnCommand.args, {
           cwd: params.session.directory,
           stdio: ["pipe", "pipe", "pipe"],
+          detached: process.platform !== "win32",
           env
         });
+    this.registerActiveTurnProcess(params.session.name, child);
 
     let stderr = "";
     let pendingStdout = "";
@@ -2382,6 +2406,46 @@ export class AcpxSessionManager implements ISessionManager {
       updatedAt: nowIso(),
       complete: true
     });
+  }
+
+  private registerActiveTurnProcess(sessionName: string, child: ChildProcess): void {
+    this.activeTurnProcesses.set(sessionName, {
+      child
+    });
+    const clear = (): void => {
+      if (this.activeTurnProcesses.get(sessionName)?.child === child) {
+        this.activeTurnProcesses.delete(sessionName);
+      }
+    };
+    child.once("close", clear);
+    child.once("error", clear);
+  }
+
+  private terminateActiveTurnProcess(
+    sessionName: string,
+    signal: NodeJS.Signals
+  ): boolean {
+    const active = this.activeTurnProcesses.get(sessionName);
+    if (active == null) {
+      return false;
+    }
+    const pid = active.child.pid;
+    try {
+      if (pid != null && process.platform !== "win32") {
+        process.kill(-pid, signal);
+      } else {
+        active.child.kill(signal);
+      }
+    } catch (error) {
+      try {
+        active.child.kill(signal);
+      } catch {
+        this.deps.logger.warn(
+          `Failed to signal active turn for ${sessionName}: ${ensureError(error).message}`
+        );
+      }
+    }
+    return true;
   }
 
   private async finishSuccessfulTurn(params: {
