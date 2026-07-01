@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { dirname, extname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SessionStore } from "../shared/store.js";
@@ -821,19 +821,45 @@ function resolveSpawnCommand(commandText: string, args: string[]): SpawnCommand 
       shell: false
     };
   }
-  if (parts.length !== 1 || parts[0] !== trimmed) {
-    const suffix = args.map((value) => shellQuote(value)).join(" ");
+  const command = parts[0];
+  if (command == null) {
     return {
-      command: suffix.length > 0 ? `${trimmed} ${suffix}` : trimmed,
+      command: "acpx",
+      args,
+      shell: false
+    };
+  }
+  const commandArgs = [...parts.slice(1), ...args];
+  if (shouldUseShellForSpawnCommand(command)) {
+    const suffix = commandArgs.map((value) => shellQuote(value)).join(" ");
+    return {
+      command: suffix.length > 0 ? `${shellQuote(command)} ${suffix}` : shellQuote(command),
       args: [],
       shell: true
     };
   }
   return {
-    command: parts[0],
-    args: [...parts.slice(1), ...args],
+    command,
+    args: commandArgs,
     shell: false
   };
+}
+
+function shouldUseShellForSpawnCommand(command: string): boolean {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  const extension = extname(command).toLowerCase();
+  if (extension === ".exe" || extension === ".com") {
+    return false;
+  }
+  if (extension === ".cmd" || extension === ".bat" || extension === ".ps1") {
+    return true;
+  }
+  if (command.includes("\\") || command.includes("/")) {
+    return false;
+  }
+  return true;
 }
 
 function makeUserTranscript(text: string): SessionTranscriptEntry[] {
