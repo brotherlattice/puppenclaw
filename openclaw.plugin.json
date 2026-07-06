@@ -21,6 +21,10 @@
         "type": "string",
         "description": "Only used when backend=daemon."
       },
+      "daemonAuthToken": {
+        "type": "string",
+        "description": "Optional bearer token required for daemon HTTP requests; empty = no auth."
+      },
       "defaultAgent": {
         "type": "string",
         "enum": [
@@ -57,6 +61,10 @@
       "acpxCommand": {
         "type": "string",
         "description": "Optional acpx binary override."
+      },
+      "codexCommand": {
+        "type": "string",
+        "description": "Optional codex binary override."
       },
       "skillRoots": {
         "type": "array",

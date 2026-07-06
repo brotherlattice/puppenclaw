@@ -38,4 +38,48 @@ describe("OutputRouter", () => {
       }
     ]);
   });
+
+  it("fans out to concurrent dispatchers and detaches only by subscription identity", async () => {
+    const router = new OutputRouter({
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    });
+    const first: string[] = [];
+    const second: string[] = [];
+    const firstSubscription = router.attach("demo", (event) => {
+      if (event.kind === "chunk") {
+        first.push(event.text);
+      }
+    });
+    const secondSubscription = router.attach("demo", (event) => {
+      if (event.kind === "chunk") {
+        second.push(event.text);
+      }
+    });
+
+    await router.onChunk("demo", "one\n");
+    expect(first).toEqual(["one\n"]);
+    expect(second).toEqual(["one\n"]);
+
+    // A stale/foreign token must not remove either active subscription.
+    router.detach({ sessionName: "demo", dispatcher: () => undefined });
+    await router.onChunk("demo", "two\n");
+    expect(first).toEqual(["one\n", "two\n"]);
+    expect(second).toEqual(["one\n", "two\n"]);
+
+    // Detaching one subscription leaves the other receiving events.
+    router.detach(secondSubscription);
+    await router.onChunk("demo", "three\n");
+    expect(first).toEqual(["one\n", "two\n", "three\n"]);
+    expect(second).toEqual(["one\n", "two\n"]);
+
+    // Double-detach is a no-op; removing the last subscription stops dispatch.
+    router.detach(secondSubscription);
+    router.detach(firstSubscription);
+    await router.onChunk("demo", "four\n");
+    expect(first).toEqual(["one\n", "two\n", "three\n"]);
+    expect(second).toEqual(["one\n", "two\n"]);
+  });
 });

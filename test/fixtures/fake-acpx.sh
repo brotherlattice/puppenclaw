@@ -155,7 +155,11 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
     emit_json "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32002,\"message\":\"No acpx session found\",\"data\":{\"acpxCode\":\"NO_SESSION\",\"origin\":\"cli\",\"sessionId\":\"unknown\"}}}"
     exit 4
   fi
-  emit_json "{\"type\":\"usage_update\",\"used\":${#normalized_input},\"size\":4096}"
+  if [[ "$normalized_input" == *"USAGE_CODEX_VARIANT"* ]]; then
+    emit_json "{\"type\":\"usage_update\",\"used\":${#normalized_input},\"size\":4096,\"usage\":{\"prompt_tokens\":${#normalized_input},\"completion_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":5}}}"
+  else
+    emit_json "{\"type\":\"usage_update\",\"used\":${#normalized_input},\"size\":4096,\"input_tokens\":${#normalized_input},\"output_tokens\":12,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3}"
+  fi
   if [[ "$normalized_input" == *"FAIL_TURN"* ]]; then
     emit_error "SIM_FAIL" "Simulated turn failure"
     exit 0

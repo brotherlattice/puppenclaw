@@ -202,16 +202,15 @@ export class DaemonOrchestratorClient implements IOrchestrator {
 
   private async request(init: JsonRequestInit): Promise<ToolResult> {
     try {
+      const authToken = this.deps.config.daemonAuthToken?.trim() ?? "";
+      const headers: Record<string, string> = {
+        ...(init.body != null ? { "content-type": "application/json" } : {}),
+        ...(authToken.length > 0 ? { authorization: `Bearer ${authToken}` } : {})
+      };
       const response = await fetch(new URL(init.path, this.deps.config.daemonUrl), {
         method: init.method ?? (init.body == null ? "GET" : "POST"),
-        ...(init.body == null
-          ? {}
-          : {
-              headers: {
-                "content-type": "application/json"
-              },
-              body: JSON.stringify(init.body)
-            })
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+        ...(init.body != null ? { body: JSON.stringify(init.body) } : {})
       });
       const payload = (await response.json()) as ToolResult | { error: string };
       if (!response.ok) {

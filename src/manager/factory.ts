@@ -1,5 +1,6 @@
 import type { ParsedPluginConfig } from "../shared/types.js";
 import type { SessionStore } from "../shared/store.js";
+import type { UsageLedgerStore } from "../shared/usage-ledger.js";
 import type { PluginLogger } from "../shared/logger.js";
 import type { OutputRouter } from "../shared/output-router.js";
 import { AcpxSessionManager } from "./acpx.js";
@@ -11,6 +12,7 @@ export function createSessionManager(params: {
   logger: PluginLogger;
   store: SessionStore;
   outputRouter: OutputRouter;
+  ledger?: UsageLedgerStore;
 }): ISessionManager {
   if (params.config.backend === "daemon") {
     return new DaemonSessionManager({
@@ -23,6 +25,7 @@ export function createSessionManager(params: {
     config: params.config,
     logger: params.logger,
     store: params.store,
-    outputRouter: params.outputRouter
+    outputRouter: params.outputRouter,
+    ...(params.ledger != null ? { ledger: params.ledger } : {})
   });
 }

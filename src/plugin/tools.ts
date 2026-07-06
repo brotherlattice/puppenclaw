@@ -54,6 +54,7 @@ import {
   toolWorkerRegisterSchema,
   workerManifestZod
 } from "../shared/schema.js";
+import { jsonToolResult } from "../shared/tool-results.js";
 import { patchStoredSession, getPuppenclawManager, getPuppenclawOrchestrator } from "./service.js";
 
 function flattenToolText(result: { content: Array<{ text: string }> }): string {
@@ -362,11 +363,15 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
     {
       name: "puppenclaw_cost",
       label: "Puppenclaw usage",
-      description: "Return recorded usage counters for a managed session.",
+      description: "Return recorded token usage counters for a managed session, or a provider/model rollup when no session name is given.",
       parameters: toolCostSchema,
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const manager = await getPuppenclawManager();
-        const result = await manager.cost(costParamsZod.parse(rawParams));
+        const params = costParamsZod.parse(rawParams ?? {});
+        const result = await manager.cost(params);
+        if (params.format === "json") {
+          return jsonToolResult(result.details);
+        }
         return {
           content: result.content,
           details: result.details

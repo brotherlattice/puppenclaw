@@ -318,9 +318,17 @@ function pathWithinProject(path: string | null | undefined, projectRoot: string)
   return normalizedPath === normalizedProject || normalizedPath.startsWith(`${normalizedProject}/`);
 }
 
-function encodedPathMatches(path: string, projectRoot: string): boolean {
+/**
+ * Matches a Claude Code history file path against the encoded project
+ * directory name under `~/.claude/projects`. Claude Code encodes a project
+ * root by replacing every non-alphanumeric character (path separators, drive
+ * colons, dots, ...) with "-"; keeping the drive colon here would make
+ * Windows roots ("c:-users-...") unmatchable since ":" is illegal in
+ * directory names. Exported for tests.
+ */
+export function encodedPathMatches(path: string, projectRoot: string): boolean {
   const normalizedPath = path.toLowerCase();
-  const encodedProject = normalizePath(projectRoot).replace(/\//gu, "-");
+  const encodedProject = normalizePath(projectRoot).replace(/[^a-z0-9]/gu, "-");
   return normalizedPath.includes(encodedProject);
 }
 

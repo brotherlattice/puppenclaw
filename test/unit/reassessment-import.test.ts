@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { importReassessmentSessions } from "../../src/orchestrator/reassessment.js";
+import { encodedPathMatches, importReassessmentSessions } from "../../src/orchestrator/reassessment.js";
 import type { ProjectRecord } from "../../src/orchestrator/types.js";
 import { SessionStore } from "../../src/shared/store.js";
 import { createTempDir } from "../helpers.js";
@@ -81,6 +81,44 @@ describe("reassessment session import", () => {
       } else {
         process.env.HOME = oldHome;
       }
+    }
+  });
+});
+
+describe("encodedPathMatches", () => {
+  it("matches Claude Code encoded project directory names (no filename-illegal chars)", () => {
+    if (process.platform === "win32") {
+      // Claude Code encodes "C:\Users\dev\demo.proj" as "C--Users-dev-demo-proj":
+      // the drive colon and the dot are replaced with "-" because they are
+      // illegal / non-alphanumeric in encoded directory names.
+      const root = "C:\\Users\\dev\\demo.proj";
+      expect(
+        encodedPathMatches(
+          "C:\\Users\\dev\\.claude\\projects\\C--Users-dev-demo-proj\\session.jsonl",
+          root
+        )
+      ).toBe(true);
+      expect(
+        encodedPathMatches(
+          "C:\\Users\\dev\\.claude\\projects\\C--Users-dev-other-proj\\session.jsonl",
+          root
+        )
+      ).toBe(false);
+    } else {
+      // Same encoding rule on POSIX: "/home/dev/demo.proj" -> "-home-dev-demo-proj".
+      const root = "/home/dev/demo.proj";
+      expect(
+        encodedPathMatches(
+          "/home/dev/.claude/projects/-home-dev-demo-proj/session.jsonl",
+          root
+        )
+      ).toBe(true);
+      expect(
+        encodedPathMatches(
+          "/home/dev/.claude/projects/-home-dev-other-proj/session.jsonl",
+          root
+        )
+      ).toBe(false);
     }
   });
 });

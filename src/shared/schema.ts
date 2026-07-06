@@ -208,6 +208,7 @@ export const pluginConfigZod = z
   .object({
     backend: backendZod.default("local"),
     daemonUrl: nonEmptyString.default(DEFAULT_DAEMON_URL),
+    daemonAuthToken: z.string().optional(),
     defaultAgent: agentKindZod.default(DEFAULT_AGENT),
     maxSessions: z.number().int().min(1).max(100).default(DEFAULT_MAX_SESSIONS),
     permissionMode: permissionModeZod.default(DEFAULT_PERMISSION_MODE),
@@ -522,10 +523,13 @@ export const statusParamsZod = z
 
 export const costParamsZod = z
   .object({
-    name: nonEmptyString,
+    name: nonEmptyString.optional(),
+    since: nonEmptyString.optional(),
+    limit: z.number().int().min(1).max(1000).optional(),
     format: responseFormatZod.optional()
   })
-  .strict();
+  .strict()
+  .default({});
 
 export const exposeParamsZod = z
   .object({
@@ -557,6 +561,10 @@ export const pluginManifestConfigSchema = {
       type: "string",
       description: "Only used when backend=daemon."
     },
+    daemonAuthToken: {
+      type: "string",
+      description: "Optional bearer token required for daemon HTTP requests; empty = no auth."
+    },
     defaultAgent: {
       type: "string",
       enum: ["claude", "codex"],
@@ -586,6 +594,10 @@ export const pluginManifestConfigSchema = {
     acpxCommand: {
       type: "string",
       description: "Optional acpx binary override."
+    },
+    codexCommand: {
+      type: "string",
+      description: "Optional codex binary override."
     },
     skillRoots: {
       type: "array",
@@ -835,7 +847,9 @@ export const toolForkSchema = Type.Object({
 });
 
 export const toolCostSchema = Type.Object({
-  name: Type.String({ minLength: 1 }),
+  name: Type.Optional(Type.String({ minLength: 1 })),
+  since: Type.Optional(Type.String({ minLength: 1 })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
 });
 

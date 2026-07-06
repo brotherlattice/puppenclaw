@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -770,5 +770,195 @@ describe("OrchestratorRuntime", () => {
     expect(details.campaign.state).toBe("completed");
     expect(details.artifacts.some((artifact) => artifact.kind === "research-dossier")).toBe(true);
     expect(sessionStore.listSessions()).toHaveLength(0);
+  });
+
+  it("confines context files and step working directories to the project root", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-confine-");
+    await writeFile(join(workspaceDir, "AGENTS.md"), "In-root context file.\n", "utf8");
+    const outsideDir = await createTempDir("puppenclaw-orch-outside-");
+    await writeFile(join(outsideDir, "secret.txt"), "outside the root\n", "utf8");
+
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store: sessionStore,
+      outputRouter: new OutputRouter({
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      })
+    });
+    const runtime = new OrchestratorRuntime({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      sessionStore,
+      store: await OrchestratorStore.open(join(workspaceDir, ".orchestrator")),
+      sessionManager: manager
+    });
+
+    await runtime.createProject({
+      name: "confined-project",
+      rootDir: workspaceDir
+    });
+
+    await expect(
+      runtime.syncContext({
+        projectId: "confined-project",
+        includeFiles: ["../escape.md"]
+      })
+    ).rejects.toMatchObject({ code: "CONTEXT_FILE_OUTSIDE_ROOT" });
+
+    await expect(
+      runtime.syncContext({
+        projectId: "confined-project",
+        includeFiles: [join(outsideDir, "secret.txt")]
+      })
+    ).rejects.toMatchObject({ code: "CONTEXT_FILE_OUTSIDE_ROOT" });
+
+    const sync = await runtime.syncContext({
+      projectId: "confined-project",
+      includeFiles: ["AGENTS.md"]
+    });
+    expect(sync.content[0]?.text).toContain("Synchronized context");
+
+    const escaped = await runtime.runCampaign({
+      projectId: "confined-project",
+      workerId: "local",
+      name: "escape-cwd",
+      template: "custom",
+      experimentCommands: [],
+      experimentParallelism: 1,
+      iterations: 1,
+      steps: [
+        {
+          title: "Escape working directory",
+          kind: "experiment",
+          executor: "command",
+          command: nodePrintCommand("should-not-run\n"),
+          contextFiles: [],
+          approvalRequired: false,
+          env: {},
+          retryLimit: 0,
+          workingDirectory: "../"
+        }
+      ]
+    });
+    const escapedDetails = escaped.details as {
+      campaign: { state: string; lastError?: string };
+      runs: Array<{ state: string; failureCode?: string }>;
+    };
+    expect(escapedDetails.campaign.state).toBe("failed");
+    expect(escapedDetails.runs.some((run) => run.failureCode === "STEP_CWD_OUTSIDE_ROOT")).toBe(true);
+
+    const escapedAbsolute = await runtime.runCampaign({
+      projectId: "confined-project",
+      workerId: "local",
+      name: "escape-cwd-absolute",
+      template: "custom",
+      experimentCommands: [],
+      experimentParallelism: 1,
+      iterations: 1,
+      steps: [
+        {
+          title: "Escape working directory with an absolute path",
+          kind: "experiment",
+          executor: "command",
+          command: nodePrintCommand("should-not-run\n"),
+          contextFiles: [],
+          approvalRequired: false,
+          env: {},
+          retryLimit: 0,
+          workingDirectory: outsideDir
+        }
+      ]
+    });
+    const escapedAbsoluteDetails = escapedAbsolute.details as {
+      campaign: { state: string };
+      runs: Array<{ failureCode?: string }>;
+    };
+    expect(escapedAbsoluteDetails.campaign.state).toBe("failed");
+    expect(
+      escapedAbsoluteDetails.runs.some((run) => run.failureCode === "STEP_CWD_OUTSIDE_ROOT")
+    ).toBe(true);
+
+    await mkdir(join(workspaceDir, "sub"), { recursive: true });
+    const inRoot = await runtime.runCampaign({
+      projectId: "confined-project",
+      workerId: "local",
+      name: "in-root-cwd",
+      template: "custom",
+      experimentCommands: [],
+      experimentParallelism: 1,
+      iterations: 1,
+      steps: [
+        {
+          title: "Run inside the project root",
+          kind: "experiment",
+          executor: "command",
+          command: nodePrintCommand("ran-in-sub\n"),
+          contextFiles: [],
+          approvalRequired: false,
+          env: {},
+          retryLimit: 0,
+          workingDirectory: "sub"
+        }
+      ]
+    });
+    const inRootDetails = inRoot.details as { campaign: { state: string } };
+    expect(inRootDetails.campaign.state).toBe("completed");
+  });
+
+  it("refuses context sync when orchestration is disabled", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-disabled-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand, orchestration: { enabled: false } }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store: sessionStore,
+      outputRouter: new OutputRouter({
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      })
+    });
+    const runtime = new OrchestratorRuntime({
+      config: makeConfig({ acpxCommand, orchestration: { enabled: false } }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      sessionStore,
+      store: await OrchestratorStore.open(join(workspaceDir, ".orchestrator")),
+      sessionManager: manager
+    });
+
+    await expect(
+      runtime.syncContext({
+        projectId: "any-project",
+        includeFiles: []
+      })
+    ).rejects.toMatchObject({ code: "ORCHESTRATION_DISABLED" });
   });
 });

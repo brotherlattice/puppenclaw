@@ -1,13 +1,17 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
 import { dirname, extname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SessionStore } from "../shared/store.js";
+import { UsageLedgerStore } from "../shared/usage-ledger.js";
+import { hasNonzeroUsage, normalizeUsage } from "../shared/usage.js";
 import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
 import type { OutputRouter } from "../shared/output-router.js";
+import { killProcessTree } from "../shared/process-tree.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import type {
   AgentKind,
@@ -16,6 +20,7 @@ import type {
   FocusParams,
   ForkParams,
   ModelProviderConfig,
+  NormalizedUsage,
   ParsedPluginConfig,
   PermissionMode,
   PlanningProfile,
@@ -53,6 +58,9 @@ type TurnResult = {
   output: string;
   question?: string;
   tokenUsage?: TokenUsage;
+  usage?: NormalizedUsage;
+  stopReason?: string;
+  durationMs?: number;
   warnings: string[];
   transcript: SessionTranscriptEntry[];
   state: SessionInfo["state"];
@@ -645,13 +653,15 @@ function parsePromptEventLine(line: string): PromptEvent | null {
       case "usage_update": {
         const used = asOptionalFiniteNumber(structured.payload.used);
         const size = asOptionalFiniteNumber(structured.payload.size);
+        const usage = normalizeUsage(structured.payload);
         return {
           type: "status",
           text:
             used != null && size != null ? `usage updated: ${used}/${size}` : "usage updated",
           ...(structured.tag != null ? { tag: structured.tag } : {}),
           ...(used != null ? { used } : {}),
-          ...(size != null ? { size } : {})
+          ...(size != null ? { size } : {}),
+          ...(hasNonzeroUsage(usage) ? { usage } : {})
         };
       }
       case "done":
@@ -876,6 +886,37 @@ function makeUserTranscript(text: string): SessionTranscriptEntry[] {
   ];
 }
 
+function formatTokenCount(value: number): string {
+  return Math.trunc(value).toLocaleString("en-US");
+}
+
+function formatUsageLine(usage: NormalizedUsage): string {
+  return `${formatTokenCount(usage.input)} in / ${formatTokenCount(usage.output)} out / ${formatTokenCount(
+    usage.cacheRead
+  )} cacheRead / ${formatTokenCount(usage.cacheWrite)} cacheWrite (${formatTokenCount(usage.total)} total)`;
+}
+
+function deriveUsageProvider(session: SessionInfo): string {
+  switch (session.modelProvider?.kind) {
+    case "claude-code":
+      return "anthropic";
+    case "codex-openai":
+      return "openai";
+    case "codex-openai-compatible":
+      return session.modelProvider.id ?? "openai-compatible";
+    default:
+      return session.agent === "codex" ? "openai" : "anthropic";
+  }
+}
+
+function deriveUsageModel(session: SessionInfo): string {
+  return (
+    session.model ??
+    session.modelProvider?.model ??
+    (session.agent === "codex" ? "codex-default" : "claude-default")
+  );
+}
+
 export class AcpxSessionManager implements ISessionManager {
   private readonly activeTurns = new Set<string>();
   private readonly stopRequests = new Set<string>();
@@ -888,8 +929,36 @@ export class AcpxSessionManager implements ISessionManager {
       logger: PluginLogger;
       store: SessionStore;
       outputRouter: OutputRouter;
+      ledger?: UsageLedgerStore;
     }
   ) {}
+
+  private recordTurnUsage(session: SessionInfo, turn: TurnResult): void {
+    if (this.deps.ledger == null || turn.state === "failed") {
+      return;
+    }
+    const usage = turn.usage;
+    if (usage == null || !hasNonzeroUsage(usage)) {
+      return;
+    }
+    try {
+      this.deps.ledger.append({
+        id: `usage-${randomUUID()}`,
+        sessionName: session.name,
+        agent: session.agent,
+        provider: deriveUsageProvider(session),
+        model: deriveUsageModel(session),
+        usage,
+        ...(turn.stopReason != null ? { stopReason: turn.stopReason } : {}),
+        durationMs: turn.durationMs ?? 0,
+        timestamp: nowIso()
+      });
+    } catch (error) {
+      this.deps.logger.warn(
+        `Puppenclaw usage ledger append failed for ${session.name}: ${ensureError(error).message}`
+      );
+    }
+  }
 
   async start(params: StartParams): Promise<ToolResult> {
     return await this.withSessionTurnLock(params.name, async () => {
@@ -1015,6 +1084,7 @@ export class AcpxSessionManager implements ISessionManager {
     };
 
     await this.deps.store.upsertSession(nextSession);
+    this.recordTurnUsage(nextSession, turn);
     return textToolResult(`Started session ${params.name}.`, {
       session: nextSession,
       output: turn.output,
@@ -1080,6 +1150,7 @@ export class AcpxSessionManager implements ISessionManager {
     };
 
     await this.deps.store.upsertSession(nextSession);
+    this.recordTurnUsage(nextSession, turn);
     return textToolResult(`Updated session ${params.name}.`, {
       session: nextSession,
       output: turn.output,
@@ -1104,10 +1175,13 @@ export class AcpxSessionManager implements ISessionManager {
     }).catch(() => {
       // best-effort cancel
     });
-    const signalledTurn = this.terminateActiveTurnProcess(params.name, "SIGTERM");
-    if (signalledTurn) {
+    const signalledChild = this.terminateActiveTurnProcess(params.name, "SIGTERM");
+    if (signalledChild != null) {
       const forceKillTimer = setTimeout(() => {
-        this.terminateActiveTurnProcess(params.name, "SIGKILL");
+        // Identity-guarded: if the SIGTERM'd child exited quickly and a new
+        // turn already registered its own process under this session name,
+        // this delayed SIGKILL must not hit the new turn's process.
+        this.terminateActiveTurnProcess(params.name, "SIGKILL", signalledChild);
       }, 2_000);
       forceKillTimer.unref();
     }
@@ -1312,13 +1386,75 @@ export class AcpxSessionManager implements ISessionManager {
     );
   }
 
-  async cost(params: CostParams): Promise<ToolResult> {
+  async cost(params: CostParams = {}): Promise<ToolResult> {
+    if (params.name == null) {
+      return this.usageRollup(params);
+    }
     const session = this.requireSession(params.name);
-    return textToolResult(`Usage for session ${params.name}.`, {
+    const totals = this.deps.ledger?.perSessionTotals(session.name) ?? null;
+    const history = this.deps.ledger?.perSessionHistory(session.name, params.limit ?? 20) ?? [];
+    const provider = deriveUsageProvider(session);
+    const model = deriveUsageModel(session);
+    const contextSnapshot =
+      session.tokenUsage?.used != null && session.tokenUsage?.size != null
+        ? ` Context: ${formatTokenCount(session.tokenUsage.used)}/${formatTokenCount(session.tokenUsage.size)}.`
+        : "";
+    const summary =
+      totals != null && totals.turns > 0
+        ? `Usage for session ${session.name} (${provider} ${model}): ${totals.turns} turn${
+            totals.turns === 1 ? "" : "s"
+          }, ${formatUsageLine(totals.usage)}.${contextSnapshot}`
+        : `Usage for session ${session.name}: no recorded token counters yet.${contextSnapshot}`;
+    return textToolResult(summary, {
       name: session.name,
-      tokenUsage: session.tokenUsage ?? null,
+      provider,
+      model,
+      lastCall: session.tokenUsage ?? null,
+      totals,
+      turns: totals?.turns ?? 0,
+      history,
       pricing: null,
       note: "Puppenclaw records token counters when the ACP runtime emits them. It does not infer currency pricing."
+    });
+  }
+
+  private usageRollup(params: CostParams): ToolResult {
+    const ledger = this.deps.ledger;
+    const scope = params.since != null ? `since ${params.since}` : "all recorded sessions";
+    const note =
+      "Puppenclaw records token counters when the ACP runtime emits them. It does not infer currency pricing.";
+    if (ledger == null) {
+      return textToolResult(
+        `Usage rollup (${scope}): no usage ledger is configured, so no token counters are recorded.`,
+        {
+          rollup: [],
+          totals: null,
+          since: params.since ?? null,
+          pricing: null,
+          note
+        }
+      );
+    }
+    const rollup = ledger.perModelRollup(params.since);
+    const totals = ledger.grandTotals(params.since);
+    const lines = rollup.map(
+      (entry) =>
+        `${entry.provider}/${entry.model}: ${entry.turns} turn${entry.turns === 1 ? "" : "s"}, ${formatUsageLine(entry.usage)}`
+    );
+    const summary =
+      totals.turns > 0
+        ? [
+            `Usage rollup (${scope}):`,
+            ...lines,
+            `TOTAL: ${totals.turns} turn${totals.turns === 1 ? "" : "s"}, ${formatUsageLine(totals.usage)}`
+          ].join("\n")
+        : `Usage rollup (${scope}): no recorded token counters yet.`;
+    return textToolResult(summary, {
+      rollup,
+      totals,
+      since: params.since ?? null,
+      pricing: null,
+      note
     });
   }
 
@@ -1367,6 +1503,13 @@ export class AcpxSessionManager implements ISessionManager {
       if (!["failed", "completed", "stopped"].includes(session.state)) {
         continue;
       }
+      // The stored state/lastActivity are only updated when a turn FINISHES,
+      // so a session with an in-flight turn can look terminal and expired
+      // here. Never close/remove a session while a turn is running: consult
+      // the in-memory turn lock and the live turn-process registry.
+      if (this.activeTurns.has(session.name) || this.activeTurnProcesses.has(session.name)) {
+        continue;
+      }
       const ageMs = now - Date.parse(session.lastActivity);
       if (!Number.isFinite(ageMs) || ageMs < ttlMs) {
         continue;
@@ -1385,6 +1528,9 @@ export class AcpxSessionManager implements ISessionManager {
       });
       await this.deps.store.removeSession(session.name);
       this.deps.outputRouter.clear(session.name);
+      this.activeTurnOutputs.delete(session.name);
+      this.activeTurnProcesses.delete(session.name);
+      this.stopRequests.delete(session.name);
     }
   }
 
@@ -1974,6 +2120,16 @@ export class AcpxSessionManager implements ISessionManager {
         });
     this.registerActiveTurnProcess(params.session.name, child);
 
+    // If the child exits or closes stdin before the prompt is fully written
+    // (bad auth, oversized prompt, immediate crash), the write surfaces an
+    // EPIPE as an 'error' event on stdin. Without a listener that is an
+    // UNCAUGHT exception that would crash the whole process, so swallow it
+    // here; the turn outcome is decided by the exit code / error events.
+    child.stdin.on("error", (error: Error) => {
+      this.deps.logger.debug(
+        `Puppenclaw prompt stdin error for ${params.session.name}: ${error.message}`
+      );
+    });
     child.stdin.setDefaultEncoding("utf8");
     child.stdin.write(params.promptText);
     child.stdin.end();
@@ -1982,8 +2138,19 @@ export class AcpxSessionManager implements ISessionManager {
     const dispatchTasks: Array<Promise<void>> = [];
     const outputChunks: string[] = [];
     let latestTokenUsage: TokenUsage | undefined;
+    let latestNormalizedUsage: NormalizedUsage | undefined;
     let pendingStdout = "";
     let stderr = "";
+    const recordNormalizedUsage = (usage: NormalizedUsage): void => {
+      latestNormalizedUsage = usage;
+      latestTokenUsage = {
+        ...latestTokenUsage,
+        input: usage.input,
+        output: usage.output,
+        cacheRead: usage.cacheRead,
+        cacheWrite: usage.cacheWrite
+      };
+    };
     const consumeLine = (line: string): void => {
       const event = parsePromptEventLine(line);
       if (event != null) {
@@ -1993,11 +2160,17 @@ export class AcpxSessionManager implements ISessionManager {
           this.appendActiveTurnOutput(params.session.name, event.text);
           dispatchTasks.push(this.deps.outputRouter.onChunk(params.session.name, event.text));
         }
-        if (event.type === "status" && (event.used != null || event.size != null)) {
-          latestTokenUsage = {
-            ...(event.used != null ? { used: event.used } : {}),
-            ...(event.size != null ? { size: event.size } : {})
-          };
+        if (event.type === "status") {
+          if (event.used != null || event.size != null) {
+            latestTokenUsage = {
+              ...latestTokenUsage,
+              ...(event.used != null ? { used: event.used } : {}),
+              ...(event.size != null ? { size: event.size } : {})
+            };
+          }
+          if (event.usage != null && hasNonzeroUsage(event.usage)) {
+            recordNormalizedUsage(event.usage);
+          }
         }
         return;
       }
@@ -2019,9 +2192,14 @@ export class AcpxSessionManager implements ISessionManager {
         const size = asOptionalFiniteNumber(parsed.size);
         if (used != null || size != null) {
           latestTokenUsage = {
+            ...latestTokenUsage,
             ...(used != null ? { used } : {}),
             ...(size != null ? { size } : {})
           };
+        }
+        const usage = normalizeUsage(parsed);
+        if (hasNonzeroUsage(usage)) {
+          recordNormalizedUsage(usage);
         }
       } catch {
         // ignore malformed fallback lines
@@ -2063,6 +2241,11 @@ export class AcpxSessionManager implements ISessionManager {
     await Promise.all(dispatchTasks);
 
     const output = outputChunks.join("").trim() || summarizePromptEvents(events).trim();
+    const doneEvent = events.find(
+      (event): event is Extract<PromptEvent, { type: "done" }> => event.type === "done"
+    );
+    const turnStopReason = doneEvent?.stopReason;
+    const turnDurationMs = Date.now() - promptStartedAtMs;
     const errorEvent = events.find((event): event is Extract<PromptEvent, { type: "error" }> => event.type === "error");
     const reconnectEvent = events.find(
       (event): event is Extract<PromptEvent, { type: "status" }> =>
@@ -2091,7 +2274,10 @@ export class AcpxSessionManager implements ISessionManager {
         const result = await this.finishSuccessfulTurn({
           sessionName: params.session.name,
           output: recoveredOutput,
-          ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {})
+          ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {}),
+          ...(latestNormalizedUsage != null ? { usage: latestNormalizedUsage } : {}),
+          ...(turnStopReason != null ? { stopReason: turnStopReason } : {}),
+          durationMs: turnDurationMs
         });
         this.completeActiveTurnOutput(params.session.name);
         return result;
@@ -2175,7 +2361,10 @@ export class AcpxSessionManager implements ISessionManager {
     const result = await this.finishSuccessfulTurn({
       sessionName: params.session.name,
       output,
-      ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {})
+      ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {}),
+      ...(latestNormalizedUsage != null ? { usage: latestNormalizedUsage } : {}),
+      ...(turnStopReason != null ? { stopReason: turnStopReason } : {}),
+      durationMs: turnDurationMs
     });
     this.completeActiveTurnOutput(params.session.name);
     return result;
@@ -2300,6 +2489,13 @@ export class AcpxSessionManager implements ISessionManager {
       stderr += chunk;
     });
 
+    // See runTurn: an early child exit must not turn the prompt write EPIPE
+    // into an uncaught exception.
+    child.stdin.on("error", (error: Error) => {
+      this.deps.logger.debug(
+        `Puppenclaw prompt stdin error for ${params.session.name}: ${error.message}`
+      );
+    });
     child.stdin.setDefaultEncoding("utf8");
     child.stdin.write(params.promptText);
     child.stdin.end();
@@ -2447,37 +2643,43 @@ export class AcpxSessionManager implements ISessionManager {
     child.once("error", clear);
   }
 
+  /**
+   * Signals the whole process TREE of the currently-registered turn process:
+   * `taskkill /pid <pid> /T /F` on win32 (a plain child.kill would only hit
+   * the cmd.exe shell wrapper and orphan the real agent process) and a
+   * process-group kill on POSIX (the spawns set `detached: true`).
+   *
+   * When `expectedChild` is provided the kill is identity-guarded: it becomes
+   * a no-op if the registered turn process is no longer that same child, so a
+   * delayed escalation can never kill a newer turn's process.
+   */
   private terminateActiveTurnProcess(
     sessionName: string,
-    signal: NodeJS.Signals
-  ): boolean {
+    signal: NodeJS.Signals,
+    expectedChild?: ChildProcess
+  ): ChildProcess | null {
     const active = this.activeTurnProcesses.get(sessionName);
     if (active == null) {
-      return false;
+      return null;
     }
-    const pid = active.child.pid;
-    try {
-      if (pid != null && process.platform !== "win32") {
-        process.kill(-pid, signal);
-      } else {
-        active.child.kill(signal);
-      }
-    } catch (error) {
-      try {
-        active.child.kill(signal);
-      } catch {
-        this.deps.logger.warn(
-          `Failed to signal active turn for ${sessionName}: ${ensureError(error).message}`
-        );
-      }
+    if (expectedChild != null && active.child !== expectedChild) {
+      return null;
     }
-    return true;
+    killProcessTree(active.child, signal, (error) => {
+      this.deps.logger.warn(
+        `Failed to signal active turn for ${sessionName}: ${error.message}`
+      );
+    });
+    return active.child;
   }
 
   private async finishSuccessfulTurn(params: {
     sessionName: string;
     output: string;
     tokenUsage?: TokenUsage;
+    usage?: NormalizedUsage;
+    stopReason?: string;
+    durationMs?: number;
   }): Promise<TurnResult> {
     const question = resolveQuestionFromOutput(params.output);
     if (question != null) {
@@ -2492,6 +2694,9 @@ export class AcpxSessionManager implements ISessionManager {
       output: params.output,
       ...(question != null ? { question } : {}),
       ...(params.tokenUsage != null ? { tokenUsage: params.tokenUsage } : {}),
+      ...(params.usage != null ? { usage: params.usage } : {}),
+      ...(params.stopReason != null ? { stopReason: params.stopReason } : {}),
+      ...(params.durationMs != null ? { durationMs: params.durationMs } : {}),
       warnings: [],
       transcript: makeAssistantTranscript(params.output),
       state: question != null ? "waiting_input" : "idle"

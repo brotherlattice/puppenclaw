@@ -153,7 +153,15 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
     );
     process.exit(4);
   }
-  emitJson(`{"type":"usage_update","used":${normalizedInput.length},"size":4096}`);
+  if (normalizedInput.includes("USAGE_CODEX_VARIANT")) {
+    emitJson(
+      `{"type":"usage_update","used":${normalizedInput.length},"size":4096,"usage":{"prompt_tokens":${normalizedInput.length},"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":5}}}`
+    );
+  } else {
+    emitJson(
+      `{"type":"usage_update","used":${normalizedInput.length},"size":4096,"input_tokens":${normalizedInput.length},"output_tokens":12,"cache_read_input_tokens":5,"cache_creation_input_tokens":3}`
+    );
+  }
   let reply;
   if (normalizedInput.includes("FAIL_TURN")) {
     emitError("SIM_FAIL", "Simulated turn failure");

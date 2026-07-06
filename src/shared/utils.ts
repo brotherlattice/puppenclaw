@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 import { ensureError } from "./errors.js";
@@ -47,6 +47,34 @@ export async function pathExists(path: string): Promise<boolean> {
 
 export function resolvePathMaybe(basePath: string, input: string): string {
   return isAbsolute(input) ? input : resolve(basePath, input);
+}
+
+/**
+ * Resolves `candidate` against `root` and returns the absolute path only if it
+ * stays inside `root`. Returns null when the candidate escapes the root:
+ * - any `..` path segment (either separator style) is rejected outright,
+ * - absolute candidates outside the root are rejected,
+ * - the containment check is boundary-aware ("/a/proj" does NOT contain
+ *   "/a/proj-evil") and case-insensitive on win32.
+ */
+export function confineToRoot(root: string, candidate: string): string | null {
+  const hasParentTraversal = candidate
+    .split(/[\\/]+/u)
+    .some((segment) => segment === "..");
+  if (hasParentTraversal) {
+    return null;
+  }
+  const resolvedRoot = resolve(root);
+  const resolvedCandidate = resolve(resolvedRoot, candidate);
+  const caseFold = (value: string): string =>
+    process.platform === "win32" ? value.toLowerCase() : value;
+  const rootCompare = caseFold(resolvedRoot);
+  const candidateCompare = caseFold(resolvedCandidate);
+  if (candidateCompare === rootCompare) {
+    return resolvedCandidate;
+  }
+  const rootWithSep = rootCompare.endsWith(sep) ? rootCompare : `${rootCompare}${sep}`;
+  return candidateCompare.startsWith(rootWithSep) ? resolvedCandidate : null;
 }
 
 export function truncateText(input: string, maxChars: number): { text: string; truncated: boolean } {

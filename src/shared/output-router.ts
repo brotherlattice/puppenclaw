@@ -25,6 +25,16 @@ export type OutputRouteEvent =
 
 export type OutputDispatcher = (event: OutputRouteEvent) => Promise<void> | void;
 
+/**
+ * Identity token returned by {@link OutputRouter.attach}. Detaching requires
+ * the exact token, so a concurrent second subscriber can never clobber or
+ * remove another subscriber's dispatcher.
+ */
+export type OutputSubscription = {
+  readonly sessionName: string;
+  readonly dispatcher: OutputDispatcher;
+};
+
 type SessionBuffer = {
   pending: string;
 };
@@ -32,7 +42,7 @@ type SessionBuffer = {
 export class OutputRouter {
   private readonly buffers = new Map<string, SessionBuffer>();
 
-  private readonly dispatchers = new Map<string, OutputDispatcher>();
+  private readonly subscriptions = new Map<string, Set<OutputSubscription>>();
 
   constructor(
     private readonly logger: PluginLogger,
@@ -41,12 +51,26 @@ export class OutputRouter {
     } = {}
   ) {}
 
-  attach(sessionName: string, dispatcher: OutputDispatcher): void {
-    this.dispatchers.set(sessionName, dispatcher);
+  attach(sessionName: string, dispatcher: OutputDispatcher): OutputSubscription {
+    const subscription: OutputSubscription = { sessionName, dispatcher };
+    const existing = this.subscriptions.get(sessionName);
+    if (existing != null) {
+      existing.add(subscription);
+    } else {
+      this.subscriptions.set(sessionName, new Set([subscription]));
+    }
+    return subscription;
   }
 
-  detach(sessionName: string): void {
-    this.dispatchers.delete(sessionName);
+  detach(subscription: OutputSubscription): void {
+    const existing = this.subscriptions.get(subscription.sessionName);
+    if (existing == null) {
+      return;
+    }
+    existing.delete(subscription);
+    if (existing.size === 0) {
+      this.subscriptions.delete(subscription.sessionName);
+    }
   }
 
   async onChunk(sessionName: string, chunk: string): Promise<void> {
@@ -97,7 +121,7 @@ export class OutputRouter {
 
   clear(sessionName: string): void {
     this.buffers.delete(sessionName);
-    this.dispatchers.delete(sessionName);
+    this.subscriptions.delete(sessionName);
   }
 
   private ensureBuffer(sessionName: string): SessionBuffer {
@@ -135,15 +159,17 @@ export class OutputRouter {
   }
 
   private async dispatch(sessionName: string, event: OutputRouteEvent): Promise<void> {
-    const dispatcher = this.dispatchers.get(sessionName);
-    if (dispatcher == null) {
+    const subscriptions = this.subscriptions.get(sessionName);
+    if (subscriptions == null || subscriptions.size === 0) {
       return;
     }
-    try {
-      await dispatcher(event);
-    } catch (error) {
-      const err = ensureError(error);
-      this.logger.warn(`Puppenclaw output dispatch failed for ${sessionName}: ${err.message}`);
+    for (const subscription of [...subscriptions]) {
+      try {
+        await subscription.dispatcher(event);
+      } catch (error) {
+        const err = ensureError(error);
+        this.logger.warn(`Puppenclaw output dispatch failed for ${sessionName}: ${err.message}`);
+      }
     }
   }
 }

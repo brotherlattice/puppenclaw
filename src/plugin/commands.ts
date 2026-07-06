@@ -142,7 +142,7 @@ function renderHelp(): string {
     "focus {\"name\":\"api-refactor\"}",
     "unfocus {\"name\":\"api-refactor\"}",
     "fork {\"source\":\"api-refactor\",\"target\":\"api-refactor-alt\"}",
-    "cost {\"name\":\"api-refactor\"}",
+    "cost {\"name\":\"api-refactor\"} (omit name for a provider/model token rollup; optional \"since\" ISO timestamp and \"limit\")",
     "project {\"name\":\"ml-research\",\"rootDir\":\".\",\"description\":\"Main project root.\",\"defaultAgent\":\"codex\",\"fusionPreferredAgent\":\"codex\",\"planningProfile\":\"deep\"}",
     "worker {\"id\":\"local\",\"label\":\"Local Worker\",\"labels\":[\"gpu\"],\"projectRoots\":[\".\"]}",
     "sync {\"projectId\":\"ml-research\",\"includeFiles\":[\"AGENTS.md\",\"README.md\"]}",
@@ -198,7 +198,7 @@ async function withCommandOutputRoute<T extends { content: Array<{ text: string 
   streamedText: string;
 }> {
   const collector = new CommandStreamCollector();
-  router.attach(sessionName, (event) => collector.onEvent(event));
+  const subscription = router.attach(sessionName, (event) => collector.onEvent(event));
   try {
     const result = await run();
     return {
@@ -206,7 +206,7 @@ async function withCommandOutputRoute<T extends { content: Array<{ text: string 
       streamedText: collector.render()
     };
   } finally {
-    router.detach(sessionName);
+    router.detach(subscription);
   }
 }
 
@@ -839,13 +839,18 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
           case "cost": {
             const params = costParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
             requestedFormat = params.format;
-            if (remote) {
+            if (remote && params.name != null) {
               const session = await resolveSessionForRemoteVerb(params.name);
               await requirePurePipeExposure(ctx, {
                 verb: "cost",
                 agent: session.agent,
                 projectRoot: session.directory
               });
+            } else if (remote) {
+              const auth = await requirePurePipeExposure(ctx, { verb: "cost" });
+              if (auth.exposure.allowedProjectRoots.length > 0) {
+                throw new Error("cost requires a specific session name when project-root restrictions are active.");
+              }
             }
             const result = await manager.cost(params);
             return { text: renderCommandResult(result, requestedFormat) };

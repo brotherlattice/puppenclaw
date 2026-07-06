@@ -723,4 +723,132 @@ describe("AcpxSessionManager", () => {
       })
     ).rejects.toThrow(/none can be suspended/u);
   });
+
+  it("survives a prompt child that exits before reading stdin (EPIPE)", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-epipe-");
+    const fakeAcpxPath = join(workspaceDir, "fake-epipe-acpx.mjs");
+    await writeFile(
+      fakeAcpxPath,
+      `#!/usr/bin/env node
+import { writeSync } from "node:fs";
+
+const args = process.argv.slice(2);
+const commandIndex = args.findIndex((arg) => ["status", "sessions", "prompt"].includes(arg));
+const command = commandIndex >= 0 ? args.slice(commandIndex) : [];
+
+function emit(value) {
+  writeSync(1, JSON.stringify(value) + "\\n");
+}
+
+if (command[0] === "status") {
+  emit({ status: "alive", summary: "ready" });
+  process.exit(0);
+}
+if (command[0] === "sessions" && command[1] === "new") {
+  emit({ status: "alive" });
+  process.exit(0);
+}
+if (command[0] === "sessions" && command[1] === "show") {
+  emit({ messages: [] });
+  process.exit(0);
+}
+if (command[0] === "sessions" && command[1] === "history") {
+  emit({ entries: [] });
+  process.exit(0);
+}
+if (command[0] === "prompt") {
+  // Exit immediately WITHOUT reading stdin: the manager's prompt write
+  // then fails with EPIPE, which must not crash the process.
+  process.exit(1);
+}
+process.exit(1);
+`,
+      "utf8"
+    );
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand: `node "${fakeAcpxPath.replaceAll('"', '\\"')}"`
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    // A prompt far larger than the OS pipe buffer guarantees the child exits
+    // while the write is still in flight.
+    const result = await manager.start({
+      agent: "claude",
+      name: "epipe-demo",
+      directory: workspaceDir,
+      task: `Summarize: ${"x".repeat(1_500_000)}`,
+      contextFiles: []
+    });
+    const details = result.details as {
+      session: SessionInfo;
+    };
+    expect(details.session.state).toBe("failed");
+  });
+
+  it("gc skips sessions with in-flight turns and clears tracking maps for reaped sessions", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-gc-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand,
+        sessionTtlMinutes: 1
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const staleActivity = new Date(Date.now() - 10 * 60_000).toISOString();
+    const baseSession = {
+      agent: "claude" as const,
+      directory: workspaceDir,
+      state: "completed" as const,
+      createdAt: staleActivity,
+      lastActivity: staleActivity,
+      permissionMode: "approve-reads" as const,
+      warnings: [],
+      transcript: []
+    };
+    await store.upsertSession({ ...baseSession, name: "busy" });
+    await store.upsertSession({ ...baseSession, name: "stale" });
+
+    // Simulate an in-flight turn for "busy": send()/start() hold the turn
+    // lock for the whole turn without touching the stored state.
+    manager["activeTurns"].add("busy");
+    manager["activeTurnOutputs"].set("stale", {
+      sessionName: "stale",
+      text: "leftover output",
+      startedAt: staleActivity,
+      updatedAt: staleActivity,
+      complete: true
+    });
+
+    await manager.gc();
+
+    expect(store.getSession("busy")).not.toBeNull();
+    expect(store.getSession("stale")).toBeNull();
+    expect(manager["activeTurnOutputs"].has("stale")).toBe(false);
+    expect(manager["activeTurnProcesses"].has("stale")).toBe(false);
+
+    // Once the turn is no longer in flight, the session becomes reapable.
+    manager["activeTurns"].delete("busy");
+    await manager.gc();
+    expect(store.getSession("busy")).toBeNull();
+  });
 });

@@ -6,6 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { ISessionManager } from "../manager/interface.js";
 import { PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
+import { killProcessTreeWithEscalation } from "../shared/process-tree.js";
 import { DEFAULT_ACPX_AGENT_COMMANDS } from "../shared/schema.js";
 import type { SessionStore } from "../shared/store.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
@@ -34,7 +35,7 @@ import type {
   ToolResult,
   WorkerManifestInput
 } from "../shared/types.js";
-import { ensureDir, loadContextFiles, nowIso, pathExists } from "../shared/utils.js";
+import { confineToRoot, ensureDir, loadContextFiles, nowIso, pathExists } from "../shared/utils.js";
 import { importReassessmentSessions } from "./reassessment.js";
 import { OrchestratorStore } from "./store.js";
 import type {
@@ -204,6 +205,75 @@ function transcriptToLogText(
 
 const FUSION_CANDIDATES: FusionCandidate[] = ["codex", "claude"];
 
+/** Per-stream cap on retained command output; the tail is kept. */
+const MAX_PROCESS_OUTPUT_BYTES = 4 * 1024 * 1024;
+/** SIGTERM -> SIGKILL escalation delay for command-step process trees. */
+const PROCESS_KILL_ESCALATION_MS = 2_000;
+/**
+ * After the child process exits, wait this long for its stdio streams to
+ * close before force-destroying them. A grandchild that inherited the pipes
+ * would otherwise keep "close" from ever firing and hang the step forever.
+ */
+const PROCESS_STREAM_CLOSE_GRACE_MS = 1_500;
+
+type CappedOutputCollector = {
+  push: (chunk: Buffer) => void;
+  toText: () => string;
+};
+
+function createCappedOutputCollector(maxBytes: number): CappedOutputCollector {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  let truncatedBytes = 0;
+  return {
+    push(chunk: Buffer): void {
+      chunks.push(chunk);
+      totalBytes += chunk.length;
+      while (totalBytes > maxBytes) {
+        const first = chunks[0];
+        if (first == null) {
+          break;
+        }
+        const excess = totalBytes - maxBytes;
+        if (first.length <= excess) {
+          chunks.shift();
+          totalBytes -= first.length;
+          truncatedBytes += first.length;
+        } else {
+          chunks[0] = first.subarray(excess);
+          totalBytes -= excess;
+          truncatedBytes += excess;
+        }
+      }
+    },
+    toText(): string {
+      const text = Buffer.concat(chunks).toString("utf8").trim();
+      if (truncatedBytes === 0) {
+        return text;
+      }
+      return `[output truncated: dropped earliest ${truncatedBytes} bytes]\n${text}`.trim();
+    }
+  };
+}
+
+function parseCampaignEventsCursor(after: string | undefined): {
+  createdAt: string;
+  sequence: number;
+} | null {
+  if (after == null) {
+    return null;
+  }
+  const separatorIndex = after.lastIndexOf("#");
+  if (separatorIndex > 0) {
+    const sequence = Number(after.slice(separatorIndex + 1));
+    if (Number.isInteger(sequence) && sequence >= 0) {
+      return { createdAt: after.slice(0, separatorIndex), sequence };
+    }
+  }
+  // Legacy cursors are a bare timestamp with strictly-greater semantics.
+  return { createdAt: after, sequence: Number.POSITIVE_INFINITY };
+}
+
 function relativeArtifactPath(params: {
   projectId: string;
   campaignId?: string;
@@ -345,7 +415,18 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   async syncContext(params: ContextSyncParams): Promise<ToolResult> {
     await this.prepareRuntime();
+    if (!this.deps.config.orchestration.enabled) {
+      throw new PuppenclawError("ORCHESTRATION_DISABLED", "Orchestration is disabled in plugin config.");
+    }
     const project = this.requireProject(params.projectId);
+    for (const includeFile of params.includeFiles) {
+      if (confineToRoot(project.rootDir, includeFile) == null) {
+        throw new PuppenclawError(
+          "CONTEXT_FILE_OUTSIDE_ROOT",
+          `Context file path escapes the project root (${project.rootDir}): ${includeFile}`
+        );
+      }
+    }
     const loaded = await loadContextFiles(project.rootDir, params.includeFiles, {
       maxFiles: 16,
       maxBytesPerFile: 48 * 1024
@@ -477,17 +558,33 @@ export class OrchestratorRuntime implements IOrchestrator {
   async campaignEvents(params: CampaignEventsParams): Promise<ToolResult> {
     await this.prepareRuntime();
     const campaign = this.requireCampaign(params.campaignId);
-    const events = (campaign.fusion?.events ?? [])
-      .filter((event) => params.after == null || event.createdAt > params.after)
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    // Back-to-back fusion events can share a millisecond timestamp, so a
+    // timestamp-only cursor could permanently drop events at a page boundary.
+    // Use a composite (createdAt, append-sequence) cursor instead: the
+    // append-only events array gives every event a stable sequence number.
+    const ordered = (campaign.fusion?.events ?? [])
+      .map((event, sequence) => ({ event, sequence }))
+      .sort(
+        (left, right) =>
+          left.event.createdAt.localeCompare(right.event.createdAt) ||
+          left.sequence - right.sequence
+      );
+    const after = parseCampaignEventsCursor(params.after);
+    const page = ordered
+      .filter(
+        ({ event, sequence }) =>
+          after == null ||
+          event.createdAt.localeCompare(after.createdAt) > 0 ||
+          (event.createdAt === after.createdAt && sequence > after.sequence)
+      )
       .slice(0, params.limit);
     const result: CampaignEventsResult = {
       campaignId: campaign.id,
-      events
+      events: page.map((entry) => entry.event)
     };
-    const lastEvent = events.at(-1);
-    if (lastEvent != null) {
-      result.cursor = lastEvent.createdAt;
+    const last = page.at(-1);
+    if (last != null) {
+      result.cursor = `${last.event.createdAt}#${last.sequence}`;
     }
     return jsonToolResult(result, "Puppenclaw campaign events");
   }
@@ -521,7 +618,14 @@ export class OrchestratorRuntime implements IOrchestrator {
     const active = this.activeCommands.get(campaign.id);
     if (active != null) {
       for (const child of active) {
-        child.kill("SIGTERM");
+        // Kill the whole tree (grandchildren included) and escalate to
+        // SIGKILL if the process ignores SIGTERM; a direct child.kill would
+        // orphan grandchildren and could leave the step running forever.
+        killProcessTreeWithEscalation(child, PROCESS_KILL_ESCALATION_MS, (error) => {
+          this.deps.logger.warn(
+            `Failed to terminate campaign ${campaign.id} command process: ${error.message}`
+          );
+        });
       }
       this.activeCommands.delete(campaign.id);
     }
@@ -792,8 +896,23 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async pruneArtifacts(): Promise<void> {
     const retentionHours = this.deps.config.orchestration.artifactRetentionHours;
     const cutoff = Date.now() - retentionHours * 60 * 60 * 1000;
+    // Never prune artifacts belonging to a campaign that is still running or
+    // waiting for approval: e.g. a puppenfusion campaign in waiting_approval
+    // still references its bundle/plan artifacts, and approve() would fail
+    // with ARTIFACT_MISSING if retention deleted them first.
+    const protectedCampaignIds = new Set(
+      this.deps.store
+        .listCampaigns()
+        .filter(
+          (campaign) => campaign.state === "running" || campaign.state === "waiting_approval"
+        )
+        .map((campaign) => campaign.id)
+    );
     let removed = 0;
     for (const artifact of this.deps.store.listArtifacts()) {
+      if (artifact.campaignId != null && protectedCampaignIds.has(artifact.campaignId)) {
+        continue;
+      }
       const createdAt = Date.parse(artifact.createdAt);
       if (!Number.isFinite(createdAt) || createdAt >= cutoff) {
         continue;
@@ -1046,7 +1165,10 @@ export class OrchestratorRuntime implements IOrchestrator {
     steps: CampaignStepRecord[]
   ): void {
     if (worker.projectRoots.length > 0) {
-      const allowed = worker.projectRoots.some((root) => project.rootDir.startsWith(root));
+      // Boundary-aware containment: "/a/proj-evil" must not match root "/a/proj".
+      const allowed = worker.projectRoots.some(
+        (root) => confineToRoot(root, project.rootDir) != null
+      );
       if (!allowed) {
         throw new PuppenclawError(
           "WORKER_PROJECT_NOT_ALLOWED",
@@ -2308,11 +2430,38 @@ export class OrchestratorRuntime implements IOrchestrator {
     return next;
   }
 
+  /**
+   * Confines a step's workingDirectory to the project root (or, for
+   * internally generated fusion steps, to the orchestrator state dir where
+   * fusion worktrees live). Throws when a user-supplied working directory
+   * escapes the sandbox via absolute paths or ".." traversal.
+   */
+  private resolveStepWorkingDirectory(project: ProjectRecord, step: CampaignStepRecord): string {
+    if (step.workingDirectory == null) {
+      return project.rootDir;
+    }
+    const allowedRoots =
+      step.fusion != null
+        ? [project.rootDir, this.deps.store.rootDir]
+        : [project.rootDir];
+    for (const root of allowedRoots) {
+      const confined = confineToRoot(root, step.workingDirectory);
+      if (confined != null) {
+        return confined;
+      }
+    }
+    throw new PuppenclawError(
+      "STEP_CWD_OUTSIDE_ROOT",
+      `Step working directory escapes the project root (${project.rootDir}): ${step.workingDirectory}`
+    );
+  }
+
   private async executeAcpStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
     step: CampaignStepRecord
   ): Promise<StepExecutionResult> {
+    const stepDirectory = this.resolveStepWorkingDirectory(project, step);
     const sessionScope = step.sessionScope ?? "campaign";
     const sessionName = sessionScope === "step"
       ? `${slug(campaign.name)}-${step.id}-${campaign.id.slice(-6)}`
@@ -2324,7 +2473,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       ? await this.deps.sessionManager.start({
           agent: selectedAgent,
           name: sessionName,
-          directory: step.workingDirectory ?? project.rootDir,
+          directory: stepDirectory,
           task: prompt,
           ...(project.permissionMode != null ? { permissionMode: project.permissionMode } : {}),
           ...(project.effort != null ? { effort: project.effort } : {}),
@@ -2347,7 +2496,7 @@ export class OrchestratorRuntime implements IOrchestrator {
           title: `${selectedAgent} candidate diff`
         }));
         await this.finalizeFusionWorktreeCommit(
-          step.workingDirectory ?? project.rootDir,
+          stepDirectory,
           `puppenfusion(${selectedAgent}): candidate for ${campaign.name}`
         );
       } else if (step.fusion.role === "merge") {
@@ -2356,7 +2505,7 @@ export class OrchestratorRuntime implements IOrchestrator {
           title: "Merged candidate diff"
         }));
         await this.finalizeFusionWorktreeCommit(
-          step.workingDirectory ?? project.rootDir,
+          stepDirectory,
           `puppenfusion(${selectedAgent}): resolve integration for ${campaign.name}`
         );
       }
@@ -2507,7 +2656,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         "Local command execution is disabled in orchestration config."
       );
     }
-    const cwd = step.workingDirectory != null ? resolve(project.rootDir, step.workingDirectory) : project.rootDir;
+    const cwd = this.resolveStepWorkingDirectory(project, step);
     const stdinText =
       campaign.template === "puppenfusion" && step.fusion?.role === "external_arbiter"
         ? await this.buildFusionArbiterInput(campaign)
@@ -3398,6 +3547,8 @@ export class OrchestratorRuntime implements IOrchestrator {
     const child = spawn(params.command, params.args, {
       cwd: params.cwd,
       windowsHide: true,
+      // POSIX: own process group so a group kill reaches grandchildren.
+      detached: process.platform !== "win32",
       env: {
         ...process.env,
         ...params.env
@@ -3406,10 +3557,17 @@ export class OrchestratorRuntime implements IOrchestrator {
     const children = this.activeCommands.get(params.campaignId) ?? new Set<ChildProcessWithoutNullStreams>();
     children.add(child);
     this.activeCommands.set(params.campaignId, children);
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
+    const stdout = createCappedOutputCollector(MAX_PROCESS_OUTPUT_BYTES);
+    const stderr = createCappedOutputCollector(MAX_PROCESS_OUTPUT_BYTES);
     child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
     child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+    // An early child exit must not turn the stdin write EPIPE into an
+    // uncaught exception that crashes the whole daemon.
+    child.stdin.on("error", (error: Error) => {
+      this.deps.logger.debug(
+        `Puppenclaw command stdin error for ${params.campaignId}: ${error.message}`
+      );
+    });
     if (params.stdinText != null) {
       child.stdin.write(params.stdinText);
     }
@@ -3418,12 +3576,28 @@ export class OrchestratorRuntime implements IOrchestrator {
     const timeoutHandle = params.timeoutMs != null
       ? setTimeout(() => {
           timedOut = true;
-          child.kill("SIGTERM");
+          // Kill the whole tree and escalate to SIGKILL: a SIGTERM on the
+          // direct shell alone can leave grandchildren running forever.
+          killProcessTreeWithEscalation(child, PROCESS_KILL_ESCALATION_MS, () => undefined);
         }, params.timeoutMs)
       : null;
     const exitCode = await new Promise<number>((resolveExit, reject) => {
+      let exitedCode: number | null = null;
       child.once("error", reject);
-      child.once("close", (code) => resolveExit(code ?? 0));
+      child.once("close", (code) => resolveExit(code ?? exitedCode ?? 0));
+      child.once("exit", (code) => {
+        exitedCode = code ?? 0;
+        // If a grandchild inherited the stdio pipes, "close" may never fire.
+        // Give the streams a short grace period, then destroy them and
+        // resolve on the exit code so the step cannot hang forever.
+        const graceTimer = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          resolveExit(exitedCode ?? 0);
+        }, PROCESS_STREAM_CLOSE_GRACE_MS);
+        graceTimer.unref();
+        child.once("close", () => clearTimeout(graceTimer));
+      });
     }).finally(() => {
       if (timeoutHandle != null) {
         clearTimeout(timeoutHandle);
@@ -3433,8 +3607,8 @@ export class OrchestratorRuntime implements IOrchestrator {
         this.activeCommands.delete(params.campaignId);
       }
     });
-    const stdoutText = Buffer.concat(stdout).toString("utf8").trim();
-    const stderrText = Buffer.concat(stderr).toString("utf8").trim();
+    const stdoutText = stdout.toText();
+    const stderrText = stderr.toText();
     const outputText = [stdoutText, stderrText].filter(Boolean).join("\n").trim();
     if (timedOut) {
       throw new PuppenclawError(

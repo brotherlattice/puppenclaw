@@ -118,12 +118,44 @@ export type SessionState =
   | "failed"
   | "stopped";
 
+/**
+ * Canonical four-bucket per-turn token usage, mirroring OpenClaw core's
+ * NormalizedUsage. `total` is the sum of the four buckets.
+ */
+export type NormalizedUsage = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+};
+
 export type TokenUsage = {
   used?: number;
   size?: number;
   input?: number;
   output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  /** @deprecated legacy alias of cacheRead; retained only for reading old persisted state. */
   cached?: number;
+};
+
+/**
+ * One immutable per-turn usage record. Persisted in the durable usage ledger
+ * (`usage.sqlite`) which survives session `purge()`/`gc()`, so historical token
+ * counts remain queryable after a session or chat is deleted.
+ */
+export type UsageLedgerEntry = {
+  id: string;
+  sessionName: string;
+  agent: AgentKind;
+  provider: string;
+  model: string;
+  usage: NormalizedUsage;
+  stopReason?: string;
+  durationMs: number;
+  timestamp: string;
 };
 
 export type SessionTranscriptEntry = {
@@ -323,6 +355,7 @@ export type PromptEvent =
       tag?: string;
       used?: number;
       size?: number;
+      usage?: NormalizedUsage;
     }
   | {
       type: "done";

@@ -15,6 +15,7 @@ import { OrchestratorRuntime } from "../orchestrator/runtime.js";
 import { OrchestratorStore } from "../orchestrator/store.js";
 import type { IOrchestrator } from "../orchestrator/types.js";
 import { SessionStore } from "../shared/store.js";
+import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import type { ParsedPluginConfig, SessionInfo } from "../shared/types.js";
 import { ensureDir } from "../shared/utils.js";
 import { readPluginConfig, resolvePluginDataDir } from "./config.js";
@@ -28,6 +29,7 @@ type RegistrationState = {
   dataDir: string | null;
   store: SessionStore | null;
   orchestratorStore: OrchestratorStore | null;
+  usageLedger: UsageLedgerStore | null;
   manager: ISessionManager | null;
   orchestrator: IOrchestrator | null;
   outputRouter: OutputRouter | null;
@@ -43,6 +45,7 @@ const state: RegistrationState = {
   dataDir: null,
   store: null,
   orchestratorStore: null,
+  usageLedger: null,
   manager: null,
   orchestrator: null,
   outputRouter: null,
@@ -128,6 +131,14 @@ export async function getPuppenclawOrchestratorStore(): Promise<OrchestratorStor
   return state.orchestratorStore;
 }
 
+export async function getPuppenclawUsageLedger(): Promise<UsageLedgerStore> {
+  await ensureInitialized();
+  if (state.usageLedger == null) {
+    throw new Error("Puppenclaw usage ledger is unavailable");
+  }
+  return state.usageLedger;
+}
+
 export function getConfiguredPluginConfig(): ParsedPluginConfig {
   return state.pluginConfig ?? readPluginConfig({});
 }
@@ -146,6 +157,7 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
     state.store != null &&
     state.outputRouter != null &&
     state.orchestratorStore != null &&
+    state.usageLedger != null &&
     state.orchestrator != null
   ) {
     return;
@@ -170,12 +182,14 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
     await ensureDir(state.dataDir);
     state.store = await SessionStore.open(state.dataDir);
     state.orchestratorStore = await OrchestratorStore.open(join(state.dataDir, "orchestrator"));
+    state.usageLedger = await UsageLedgerStore.open(join(state.dataDir, "usage"));
     state.outputRouter = new OutputRouter(logger);
     state.manager = createSessionManager({
       config: getConfiguredPluginConfig(),
       logger,
       store: state.store,
-      outputRouter: state.outputRouter
+      outputRouter: state.outputRouter,
+      ledger: state.usageLedger
     });
     state.orchestrator =
       getConfiguredPluginConfig().backend === "daemon"

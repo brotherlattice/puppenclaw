@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
@@ -8,6 +9,7 @@ import { OrchestratorStore } from "../orchestrator/store.js";
 import type { PluginLogger } from "../shared/logger.js";
 import { OutputRouter, type OutputRouteEvent } from "../shared/output-router.js";
 import { SessionStore } from "../shared/store.js";
+import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import {
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -54,8 +56,35 @@ export async function createDaemonServer(params: {
   const app = Fastify({
     logger: false
   });
+
+  // SECURITY: When config.daemonAuthToken is a non-empty string, every route
+  // except GET /health and GET /capabilities requires
+  // `Authorization: Bearer <token>` and replies 401 otherwise. When no token
+  // is configured the daemon is fully open (unchanged legacy behavior): it is
+  // then only safe on a loopback bind. Running with `--host 0.0.0.0` (or any
+  // non-loopback bind) WITHOUT a token is unsafe — POST /orchestrator/campaign
+  // can execute arbitrary shell commands.
+  const authToken = params.config.daemonAuthToken?.trim() ?? "";
+  if (authToken.length > 0) {
+    const expectedHeader = Buffer.from(`Bearer ${authToken}`, "utf8");
+    const openRoutes = new Set(["/health", "/capabilities"]);
+    app.addHook("onRequest", async (request, reply) => {
+      const path = request.url.split("?")[0] ?? "";
+      if (request.method === "GET" && openRoutes.has(path)) {
+        return;
+      }
+      const provided = Buffer.from(request.headers.authorization ?? "", "utf8");
+      const authorized =
+        provided.length === expectedHeader.length && timingSafeEqual(provided, expectedHeader);
+      if (!authorized) {
+        await reply.code(401).send({ ok: false, error: "unauthorized" });
+      }
+    });
+  }
+
   const store = await SessionStore.open(params.dataDir);
   const orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
+  const usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
   const outputRouter = new OutputRouter(logger);
   const manager = new AcpxSessionManager({
     config: {
@@ -64,7 +93,8 @@ export async function createDaemonServer(params: {
     },
     logger,
     store,
-    outputRouter
+    outputRouter,
+    ledger: usageLedger
   });
   const orchestrator = new OrchestratorRuntime({
     config: {
@@ -135,6 +165,17 @@ export async function createDaemonServer(params: {
       await manager.cost(
         costParamsZod.parse({
           name: (request.params as { name: string }).name
+        })
+      )
+    )
+  );
+
+  app.get("/usage", async (request) =>
+    ok(
+      await manager.cost(
+        costParamsZod.parse({
+          since: (request.query as { since?: string }).since,
+          format: (request.query as { format?: "text" | "json" }).format
         })
       )
     )
@@ -429,7 +470,7 @@ async function streamToolResult(params: {
     params.reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
   };
 
-  params.outputRouter.attach(params.sessionName, (event) => {
+  const subscription = params.outputRouter.attach(params.sessionName, (event) => {
     write(event);
   });
 
@@ -452,7 +493,10 @@ async function streamToolResult(params: {
     write({ kind: "done" });
   } finally {
     clearInterval(heartbeat);
-    params.outputRouter.detach(params.sessionName);
+    // Identity-guarded: only removes this stream's own subscription, so a
+    // racing second stream (e.g. rejected with TURN_ALREADY_RUNNING) can
+    // never silence the first stream's live dispatcher.
+    params.outputRouter.detach(subscription);
     if (!params.reply.raw.writableEnded) {
       params.reply.raw.end();
     }

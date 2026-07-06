@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readPluginConfig } from "../shared/config.js";
 import { DAEMON_PORT } from "../shared/schema.js";
 import { startDaemonServer } from "./main.js";
 
@@ -68,8 +69,16 @@ async function main(): Promise<void> {
     return;
   }
   if (parsed.command === "stop") {
+    // POST /shutdown is auth-protected when the daemon runs with a
+    // daemonAuthToken, so read the configured token (same --config file the
+    // daemon was started with) and send it as a bearer header.
+    const config = readPluginConfig(await loadConfig(parsed.options.configPath));
+    const authToken = config.daemonAuthToken?.trim() ?? "";
     const response = await fetch(new URL("/shutdown", baseUrl), {
-      method: "POST"
+      method: "POST",
+      ...(authToken.length > 0
+        ? { headers: { authorization: `Bearer ${authToken}` } }
+        : {})
     });
     console.log(await response.text());
     return;

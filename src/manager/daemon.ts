@@ -130,8 +130,22 @@ export class DaemonSessionManager implements ISessionManager {
     });
   }
 
-  async cost(params: CostParams): Promise<ToolResult> {
+  async cost(params: CostParams = {}): Promise<ToolResult> {
     await this.ensureHealthy();
+    if (params.name == null) {
+      const query = new URLSearchParams();
+      if (params.since != null) {
+        query.set("since", params.since);
+      }
+      if (params.format != null) {
+        query.set("format", params.format);
+      }
+      const queryString = query.toString();
+      return this.request({
+        method: "GET",
+        path: queryString.length > 0 ? `/usage?${queryString}` : "/usage"
+      });
+    }
     return this.request({
       method: "GET",
       path: `/session/${encodeURIComponent(params.name)}/cost`
@@ -177,15 +191,14 @@ export class DaemonSessionManager implements ISessionManager {
 
   private async request(init: JsonRequestInit): Promise<ToolResult> {
     try {
+      const authToken = this.deps.config.daemonAuthToken?.trim() ?? "";
+      const headers: Record<string, string> = {
+        ...(init.body != null ? { "content-type": "application/json" } : {}),
+        ...(authToken.length > 0 ? { authorization: `Bearer ${authToken}` } : {})
+      };
       const response = await fetch(new URL(init.path, this.deps.config.daemonUrl), {
         method: init.method ?? (init.body == null ? "GET" : "POST"),
-        ...(init.body == null
-          ? {}
-          : {
-              headers: {
-                "content-type": "application/json"
-              }
-            }),
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
         ...(init.body != null ? { body: JSON.stringify(init.body) } : {})
       });
       const payload = (await response.json()) as ToolResult | { error: string };

@@ -8,6 +8,7 @@ import {
   campaignRunParamsZod,
   campaignStatusParamsZod,
   contextSyncParamsZod,
+  costParamsZod,
   projectCreateParamsZod,
   reassessmentReportParamsZod,
   reassessmentStartParamsZod,
@@ -15,7 +16,8 @@ import {
   workerManifestZod
 } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
-import { getPuppenclawOrchestrator } from "./service.js";
+import { jsonToolResult } from "../shared/tool-results.js";
+import { getPuppenclawManager, getPuppenclawOrchestrator } from "./service.js";
 
 export const PUPPENCLAW_GATEWAY_METHODS = {
   createProject: "puppenclaw.projectCreate",
@@ -30,7 +32,8 @@ export const PUPPENCLAW_GATEWAY_METHODS = {
   cancel: "puppenclaw.campaignCancel",
   startReassessment: "puppenclaw.reassessmentStart",
   reassessmentStatus: "puppenclaw.reassessmentStatus",
-  reassessmentReport: "puppenclaw.reassessmentReport"
+  reassessmentReport: "puppenclaw.reassessmentReport",
+  usageCost: "puppenclaw.usageCost"
 } as const;
 
 export function registerPuppenclawGatewayMethods(api: OpenClawPluginApi): void {
@@ -101,6 +104,15 @@ export function registerPuppenclawGatewayMethods(api: OpenClawPluginApi): void {
     return getPuppenclawOrchestrator().then((runtime) =>
       runtime.reassessmentReport(reassessmentReportParamsZod.parse(params))
     );
+  }));
+  api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.usageCost, handle(async ({ params }) => {
+    const manager = await getPuppenclawManager();
+    const parsed = costParamsZod.parse(params ?? {});
+    const result = await manager.cost(parsed);
+    if (parsed.format === "json") {
+      return jsonToolResult(result.details);
+    }
+    return result;
   }));
 }
 
