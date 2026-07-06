@@ -191,19 +191,26 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
       outputRouter: state.outputRouter,
       ledger: state.usageLedger
     });
-    state.orchestrator =
-      getConfiguredPluginConfig().backend === "daemon"
-        ? new DaemonOrchestratorClient({
-            config: getConfiguredPluginConfig(),
-            logger
-          })
-        : new OrchestratorRuntime({
-            config: getConfiguredPluginConfig(),
-            logger,
-            store: state.orchestratorStore,
-            sessionStore: state.store,
-            sessionManager: state.manager
-          });
+    if (getConfiguredPluginConfig().backend === "daemon") {
+      state.orchestrator = new DaemonOrchestratorClient({
+        config: getConfiguredPluginConfig(),
+        logger
+      });
+    } else {
+      const runtime = new OrchestratorRuntime({
+        config: getConfiguredPluginConfig(),
+        logger,
+        store: state.orchestratorStore,
+        sessionStore: state.store,
+        sessionManager: state.manager
+      });
+      // The local backend owns the orchestrator store, so reconcile campaigns
+      // interrupted by a previous process exactly once during bootstrap.
+      // Daemon-backend clients must never trigger this: the daemon reconciles
+      // its own store on startup.
+      await runtime.recoverInterruptedCampaigns();
+      state.orchestrator = runtime;
+    }
   })();
   try {
     await state.initPromise;

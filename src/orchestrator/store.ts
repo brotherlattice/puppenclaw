@@ -4,6 +4,7 @@ import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 
 import type {
   ArtifactRecord,
+  CampaignEventRecord,
   CampaignSpecRecord,
   CampaignProgressSnapshot,
   CampaignStatusSnapshot,
@@ -18,6 +19,7 @@ type JsonValue =
   | ProjectRecord
   | WorkerRecord
   | CampaignSpecRecord
+  | CampaignEventRecord
   | RunRecord
   | ArtifactRecord
   | ReassessmentRecord;
@@ -78,6 +80,15 @@ export class OrchestratorStore {
         project_id TEXT NOT NULL,
         payload TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS campaign_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        payload TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS campaign_events_campaign_id_idx ON campaign_events (campaign_id, id);
     `);
   }
 
@@ -164,6 +175,23 @@ export class OrchestratorStore {
       | { payload: string }
       | undefined;
     return row != null ? parseJson<RunRecord>(row.payload) : null;
+  }
+
+  appendCampaignEvent(event: Omit<CampaignEventRecord, "id">): CampaignEventRecord {
+    const result = this.db
+      .prepare("INSERT INTO campaign_events (campaign_id, project_id, type, created_at, payload) VALUES (?, ?, ?, ?, ?)")
+      .run(event.campaignId, event.projectId, event.type, event.createdAt, JSON.stringify(event));
+    return { ...event, id: Number(result.lastInsertRowid) };
+  }
+
+  listCampaignEvents(params: { campaignId: string; afterId?: number; limit: number }): CampaignEventRecord[] {
+    return this.db
+      .prepare("SELECT id, payload FROM campaign_events WHERE campaign_id = ? AND id > ? ORDER BY id LIMIT ?")
+      .all(params.campaignId, params.afterId ?? 0, params.limit)
+      .map((row) => {
+        const { id, payload } = row as { id: number | bigint; payload: string };
+        return { ...parseJson<CampaignEventRecord>(payload), id: Number(id) };
+      });
   }
 
   upsertArtifact(artifact: ArtifactRecord): void {

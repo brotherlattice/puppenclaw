@@ -4,6 +4,7 @@ import {
   artifactListParamsZod,
   artifactReadParamsZod,
   campaignActionParamsZod,
+  campaignApproveParamsZod,
   campaignEventsParamsZod,
   campaignRunParamsZod,
   campaignStatusParamsZod,
@@ -82,7 +83,7 @@ export function registerPuppenclawGatewayMethods(api: OpenClawPluginApi): void {
   }));
   api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.approve, handle(async ({ params }) => {
     return getPuppenclawOrchestrator().then((runtime) =>
-      runtime.approve(campaignActionParamsZod.parse(params))
+      runtime.approve(campaignApproveParamsZod.parse(params))
     );
   }));
   api.registerGatewayMethod(PUPPENCLAW_GATEWAY_METHODS.cancel, handle(async ({ params }) => {

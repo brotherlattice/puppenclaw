@@ -4,6 +4,7 @@ import type {
   ArtifactListParams,
   ArtifactReadParams,
   CampaignActionParams,
+  CampaignApproveParams,
   CampaignEventsParams,
   CampaignRunParams,
   CampaignStatusParams,
@@ -107,13 +108,16 @@ export class DaemonOrchestratorClient implements IOrchestrator {
       url.searchParams.set("after", params.after);
     }
     url.searchParams.set("limit", String(params.limit));
+    if (params.scope != null) {
+      url.searchParams.set("scope", params.scope);
+    }
     if (params.format != null) {
       url.searchParams.set("format", params.format);
     }
     return this.request({ method: "GET", path: `${url.pathname}${url.search}` });
   }
 
-  async approve(params: CampaignActionParams): Promise<ToolResult> {
+  async approve(params: CampaignApproveParams): Promise<ToolResult> {
     await this.ensureHealthy();
     return this.request({ method: "POST", path: "/orchestrator/approve", body: params });
   }
@@ -212,16 +216,20 @@ export class DaemonOrchestratorClient implements IOrchestrator {
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
         ...(init.body != null ? { body: JSON.stringify(init.body) } : {})
       });
-      const payload = (await response.json()) as ToolResult | { error: string };
+      const payload = (await response.json()) as ToolResult | { error?: unknown; code?: unknown };
       if (!response.ok) {
+        const body = payload != null && typeof payload === "object" ? (payload as { error?: unknown; code?: unknown }) : null;
         const message =
-          payload != null &&
-          typeof payload === "object" &&
-          "error" in payload &&
-          typeof payload.error === "string"
-            ? payload.error
+          body != null && typeof body.error === "string"
+            ? body.error
             : `daemon request failed with ${response.status}`;
-        throw new PuppenclawError("DAEMON_REQUEST_FAILED", message);
+        // Rehydrate the daemon's error envelope so daemon-mode callers can
+        // match the same PuppenclawError codes local-mode callers see.
+        const code =
+          body != null && typeof body.code === "string" && body.code.length > 0
+            ? body.code
+            : "DAEMON_REQUEST_FAILED";
+        throw new PuppenclawError(code, message);
       }
       return payload as ToolResult;
     } catch (error) {

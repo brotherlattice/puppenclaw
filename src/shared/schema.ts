@@ -164,7 +164,7 @@ export const remoteControlConfigZod = z
 export const orchestrationConfigZod = z
   .object({
     enabled: z.boolean().default(true),
-    maxCampaigns: z.number().int().min(1).max(500).default(DEFAULT_MAX_CAMPAIGNS),
+    maxCampaigns: z.number().int().min(1).max(10_000).default(DEFAULT_MAX_CAMPAIGNS),
     artifactRetentionHours: z
       .number()
       .int()
@@ -180,14 +180,16 @@ export const orchestrationConfigZod = z
         id: idString.default("local"),
         label: nonEmptyString.default("Local Worker"),
         labels: z.array(nonEmptyString).default(["local"]),
-        projectRoots: z.array(nonEmptyString).default([])
+        projectRoots: z.array(nonEmptyString).default([]),
+        maxConcurrentRuns: z.number().int().min(1).max(1024).default(1)
       })
       .strict()
       .default({
         id: "local",
         label: "Local Worker",
         labels: ["local"],
-        projectRoots: []
+        projectRoots: [],
+        maxConcurrentRuns: 1
       })
   })
   .strict()
@@ -200,7 +202,8 @@ export const orchestrationConfigZod = z
       id: "local",
       label: "Local Worker",
       labels: ["local"],
-      projectRoots: []
+      projectRoots: [],
+      maxConcurrentRuns: 1
     }
   });
 
@@ -210,7 +213,7 @@ export const pluginConfigZod = z
     daemonUrl: nonEmptyString.default(DEFAULT_DAEMON_URL),
     daemonAuthToken: z.string().optional(),
     defaultAgent: agentKindZod.default(DEFAULT_AGENT),
-    maxSessions: z.number().int().min(1).max(100).default(DEFAULT_MAX_SESSIONS),
+    maxSessions: z.number().int().min(1).max(10_000).default(DEFAULT_MAX_SESSIONS),
     permissionMode: permissionModeZod.default(DEFAULT_PERMISSION_MODE),
     sessionTtlMinutes: z.number().int().min(1).max(24 * 60).default(DEFAULT_SESSION_TTL_MINUTES),
     streamOutput: z.boolean().default(DEFAULT_STREAM_OUTPUT),
@@ -326,6 +329,9 @@ export const campaignRunParamsZod = z
     format: responseFormatZod.optional(),
     template: campaignTemplateZod.default("custom"),
     task: nonEmptyString.optional(),
+    detached: z.boolean().default(false),
+    modelProviderId: skillNameString.optional(),
+    modelProvider: modelProviderConfigZod.optional(),
     fusionPreferredAgent: agentKindZod.optional(),
     useExternalArbiter: z.boolean().optional(),
     fusionBaseRef: nonEmptyString.optional(),
@@ -368,6 +374,7 @@ export const campaignEventsParamsZod = z
     campaignId: idString,
     after: nonEmptyString.optional(),
     limit: z.number().int().min(1).max(500).default(100),
+    scope: z.enum(["fusion", "all"]).default("fusion"),
     format: responseFormatZod.optional()
   })
   .strict();
@@ -378,6 +385,10 @@ export const campaignActionParamsZod = z
     format: responseFormatZod.optional()
   })
   .strict();
+
+export const campaignApproveParamsZod = campaignActionParamsZod.extend({
+  detached: z.boolean().default(false)
+});
 
 export const reassessmentStartParamsZod = z
   .object({
@@ -573,7 +584,7 @@ export const pluginManifestConfigSchema = {
     maxSessions: {
       type: "integer",
       minimum: 1,
-      maximum: 100,
+      maximum: 10000,
       description: "Maximum concurrently tracked sessions."
     },
     permissionMode: {
@@ -666,7 +677,7 @@ export const pluginManifestConfigSchema = {
         maxCampaigns: {
           type: "integer",
           minimum: 1,
-          maximum: 500
+          maximum: 10000
         },
         artifactRetentionHours: {
           type: "integer",
@@ -706,6 +717,11 @@ export const pluginManifestConfigSchema = {
               items: {
                 type: "string"
               }
+            },
+            maxConcurrentRuns: {
+              type: "integer",
+              minimum: 1,
+              maximum: 1024
             }
           }
         }
@@ -962,6 +978,25 @@ export const toolCampaignRunSchema = Type.Object({
     ])
   ),
   task: Type.Optional(Type.String({ minLength: 1 })),
+  detached: Type.Optional(Type.Boolean()),
+  modelProviderId: Type.Optional(Type.String({ minLength: 1 })),
+  modelProvider: Type.Optional(
+    Type.Object({
+      id: Type.String({ minLength: 1 }),
+      label: Type.Optional(Type.String({ minLength: 1 })),
+      kind: Type.Optional(
+        Type.Union([
+          Type.Literal("claude-code"),
+          Type.Literal("codex-openai"),
+          Type.Literal("codex-openai-compatible")
+        ])
+      ),
+      model: Type.String({ minLength: 1 }),
+      baseUrl: Type.Optional(Type.String({ minLength: 1 })),
+      authTokenEnv: Type.Optional(Type.String({ minLength: 1 })),
+      wireApi: Type.Optional(Type.Literal("responses"))
+    })
+  ),
   fusionPreferredAgent: Type.Optional(
     Type.Union([Type.Literal("claude"), Type.Literal("codex")])
   ),
@@ -996,11 +1031,18 @@ export const toolCampaignEventsSchema = Type.Object({
   campaignId: Type.String({ minLength: 1 }),
   after: Type.Optional(Type.String({ minLength: 1 })),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+  scope: Type.Optional(Type.Union([Type.Literal("fusion"), Type.Literal("all")])),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
 });
 
 export const toolCampaignActionSchema = Type.Object({
   campaignId: Type.String({ minLength: 1 }),
+  format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
+});
+
+export const toolCampaignApproveSchema = Type.Object({
+  campaignId: Type.String({ minLength: 1 }),
+  detached: Type.Optional(Type.Boolean()),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
 });
 

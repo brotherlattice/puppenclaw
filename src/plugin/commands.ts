@@ -10,6 +10,7 @@ import {
   artifactListParamsZod,
   artifactReadParamsZod,
   campaignActionParamsZod,
+  campaignApproveParamsZod,
   campaignEventsParamsZod,
   campaignRunParamsZod,
   campaignStatusParamsZod,
@@ -580,7 +581,7 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
             return { text: renderCommandResult(result, requestedFormat) };
           }
           case "approve": {
-            const params = campaignActionParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            const params = campaignApproveParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
             requestedFormat = params.format;
             if (remote) {
               await requirePurePipeExposure(ctx, {

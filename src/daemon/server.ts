@@ -2,10 +2,12 @@ import { timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import { ZodError } from "zod";
 
 import { AcpxSessionManager } from "../manager/acpx.js";
 import { OrchestratorRuntime } from "../orchestrator/runtime.js";
 import { OrchestratorStore } from "../orchestrator/store.js";
+import { PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
 import { OutputRouter, type OutputRouteEvent } from "../shared/output-router.js";
 import { SessionStore } from "../shared/store.js";
@@ -13,6 +15,7 @@ import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import {
   artifactListParamsZod,
   artifactReadParamsZod,
+  campaignApproveParamsZod,
   campaignEventsParamsZod,
   campaignActionParamsZod,
   campaignRunParamsZod,
@@ -55,6 +58,29 @@ export async function createDaemonServer(params: {
   };
   const app = Fastify({
     logger: false
+  });
+
+  // Uniform error envelope for every route. The bearer-auth onRequest hook
+  // below replies 401 directly and never reaches this handler.
+  app.setErrorHandler(async (error, _request, reply) => {
+    if (error instanceof PuppenclawError) {
+      return reply.code(400).send({ ok: false, error: error.message, code: error.code });
+    }
+    if (error instanceof ZodError) {
+      const summary = error.issues
+        .map((issue) => `${issue.path.map(String).join(".") || "(params)"}: ${issue.message}`)
+        .join("; ");
+      return reply.code(400).send({
+        ok: false,
+        error: `Invalid parameters: ${summary}`,
+        code: "INVALID_PARAMS"
+      });
+    }
+    return reply.code(500).send({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      code: "INTERNAL_ERROR"
+    });
   });
 
   // SECURITY: When config.daemonAuthToken is a non-empty string, every route
@@ -106,6 +132,9 @@ export async function createDaemonServer(params: {
     sessionStore: store,
     sessionManager: manager
   });
+  // Reconcile campaigns left "running" by a previous daemon process exactly
+  // once, before the server can accept any request that could observe them.
+  await orchestrator.recoverInterruptedCampaigns();
 
   const ok = (result: ToolResult) => result;
 
@@ -357,6 +386,7 @@ export async function createDaemonServer(params: {
             (request.query as { limit?: string }).limit != null
               ? Number((request.query as { limit?: string }).limit)
               : undefined,
+          scope: (request.query as { scope?: string }).scope,
           format: (request.query as { format?: "text" | "json" }).format
         })
       )
@@ -364,7 +394,7 @@ export async function createDaemonServer(params: {
   );
 
   app.post("/orchestrator/approve", async (request) =>
-    ok(await orchestrator.approve(campaignActionParamsZod.parse(request.body)))
+    ok(await orchestrator.approve(campaignApproveParamsZod.parse(request.body)))
   );
 
   app.post("/orchestrator/cancel", async (request) =>

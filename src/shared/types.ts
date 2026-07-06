@@ -4,6 +4,7 @@ import type {
   agentKindZod,
   backendZod,
   campaignActionParamsZod,
+  campaignApproveParamsZod,
   campaignRunParamsZod,
   campaignStateZod,
   campaignStatusParamsZod,
@@ -80,12 +81,19 @@ export type WorkerManifestInput = z.infer<typeof workerManifestZod>;
 export type ProjectCreateParams = z.infer<typeof projectCreateParamsZod>;
 export type ContextSyncParams = z.infer<typeof contextSyncParamsZod>;
 export type OrchestrationStepParams = z.infer<typeof campaignStepParamsZod>;
-export type CampaignRunParams = z.infer<typeof campaignRunParamsZod>;
+export type CampaignRunParams = Omit<z.infer<typeof campaignRunParamsZod>, "detached"> & {
+  detached?: z.infer<typeof campaignRunParamsZod>["detached"];
+};
 export type CampaignStatusParams = z.infer<typeof campaignStatusParamsZod>;
 export type ArtifactListParams = z.infer<typeof artifactListParamsZod>;
 export type ArtifactReadParams = z.infer<typeof artifactReadParamsZod>;
-export type CampaignEventsParams = z.infer<typeof campaignEventsParamsZod>;
+export type CampaignEventsParams = Omit<z.infer<typeof campaignEventsParamsZod>, "scope"> & {
+  scope?: z.infer<typeof campaignEventsParamsZod>["scope"];
+};
 export type CampaignActionParams = z.infer<typeof campaignActionParamsZod>;
+export type CampaignApproveParams = Omit<z.infer<typeof campaignApproveParamsZod>, "detached"> & {
+  detached?: z.infer<typeof campaignApproveParamsZod>["detached"];
+};
 export type SiteStatusParams = z.infer<typeof siteStatusParamsZod>;
 export type LogsParams = z.infer<typeof logsParamsZod>;
 export type OrchestrationStepKind = z.infer<typeof orchestrationStepKindZod>;

@@ -3,6 +3,7 @@ import type {
   CampaignState,
   CampaignTemplate,
   EffortLevel,
+  ModelProviderConfig,
   OrchestrationExecutor,
   OrchestrationStepKind,
   PermissionMode,
@@ -184,10 +185,13 @@ export type CampaignSpecRecord = {
   iterations: number;
   steps: CampaignStepRecord[];
   acpSessionName?: string;
+  modelProviderId?: string;
+  modelProvider?: ModelProviderConfig;
   currentStepIndex: number;
   currentRunId?: string;
   waitingApprovalStepId?: string;
   lastError?: string;
+  failureCode?: string;
   lastProgressAt: string;
   createdAt: string;
   updatedAt: string;
@@ -268,10 +272,39 @@ export type ArtifactReadResult = {
   limitChars: number;
 };
 
+export type CampaignLifecycleEventType =
+  | "campaign_created"
+  | "step_started"
+  | "step_completed"
+  | "step_failed"
+  | "waiting_approval"
+  | "approved"
+  | "campaign_failed"
+  | "campaign_cancelled"
+  | "campaign_completed"
+  | "campaign_interrupted";
+
+export type CampaignEventRecord = {
+  id: number;
+  campaignId: string;
+  projectId: string;
+  type: CampaignLifecycleEventType | FusionEventRecord["type"];
+  createdAt: string;
+  message: string;
+  stepId?: string;
+  stepIndex?: number;
+  runId?: string;
+  artifactId?: string;
+  failureCode?: string;
+  phase?: FusionPhase;
+  candidate?: FusionCandidate;
+};
+
 export type CampaignEventsResult = {
   campaignId: string;
-  events: FusionEventRecord[];
+  events: Array<FusionEventRecord | CampaignEventRecord>;
   cursor?: string;
+  scope?: "fusion" | "all";
 };
 
 export type ImportedReassessmentSession = {
@@ -350,7 +383,7 @@ export interface IOrchestrator {
   listArtifacts(params: import("../shared/types.js").ArtifactListParams): Promise<import("../shared/types.js").ToolResult>;
   readArtifact(params: import("../shared/types.js").ArtifactReadParams): Promise<import("../shared/types.js").ToolResult>;
   campaignEvents(params: import("../shared/types.js").CampaignEventsParams): Promise<import("../shared/types.js").ToolResult>;
-  approve(params: import("../shared/types.js").CampaignActionParams): Promise<import("../shared/types.js").ToolResult>;
+  approve(params: import("../shared/types.js").CampaignApproveParams): Promise<import("../shared/types.js").ToolResult>;
   cancel(params: import("../shared/types.js").CampaignActionParams): Promise<import("../shared/types.js").ToolResult>;
   startReassessment(params: import("../shared/types.js").ReassessmentStartParams): Promise<import("../shared/types.js").ToolResult>;
   reassessmentStatus(params: import("../shared/types.js").ReassessmentStatusParams): Promise<import("../shared/types.js").ToolResult>;

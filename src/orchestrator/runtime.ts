@@ -14,6 +14,7 @@ import type {
   AgentKind,
   ArtifactListParams,
   ArtifactReadParams,
+  CampaignApproveParams,
   CampaignEventsParams,
   CampaignActionParams,
   CampaignRunParams,
@@ -41,6 +42,7 @@ import { OrchestratorStore } from "./store.js";
 import type {
   ArtifactRecord,
   ArtifactReadResult,
+  CampaignEventRecord,
   CampaignEventsResult,
   FusionCandidate,
   FusionCampaignRecord,
@@ -215,6 +217,11 @@ const PROCESS_KILL_ESCALATION_MS = 2_000;
  * would otherwise keep "close" from ever firing and hang the step forever.
  */
 const PROCESS_STREAM_CLOSE_GRACE_MS = 1_500;
+/**
+ * Poll endpoints hit prepareRuntime at ~1s intervals; the artifact prune is
+ * an O(all-artifacts) scan, so throttle it to at most once per interval.
+ */
+const ARTIFACT_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
 
 type CappedOutputCollector = {
   push: (chunk: Buffer) => void;
@@ -316,6 +323,9 @@ function describeReassessment(record: ReassessmentRecord): string {
 
 export class OrchestratorRuntime implements IOrchestrator {
   private readonly activeCommands = new Map<string, Set<ChildProcessWithoutNullStreams>>();
+  private readonly activeExecutions = new Map<string, Promise<CampaignStatusSnapshot>>();
+  private interruptedCampaignsRecovered = false;
+  private lastArtifactPruneAt = 0;
 
   constructor(
     private readonly deps: {
@@ -327,6 +337,145 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
   ) {}
 
+  private driveCampaign(
+    campaign: CampaignSpecRecord,
+    approvedStepId?: string
+  ): Promise<CampaignStatusSnapshot> {
+    if (this.activeExecutions.has(campaign.id)) {
+      throw new PuppenclawError(
+        "CAMPAIGN_EXECUTION_ACTIVE",
+        `Campaign ${campaign.id} already has an active execution.`
+      );
+    }
+    // Register synchronously (no await between the has-check and the set) so
+    // concurrent callers cannot start a second execution of the same campaign.
+    const execution = (async () => {
+      try {
+        return approvedStepId != null
+          ? await this.executeCampaign(campaign, approvedStepId)
+          : await this.executeCampaign(campaign);
+      } catch (error) {
+        this.markCampaignExecutionError(campaign.id, error);
+        throw error;
+      } finally {
+        this.activeExecutions.delete(campaign.id);
+      }
+    })();
+    this.activeExecutions.set(campaign.id, execution);
+    return execution;
+  }
+
+  private markCampaignExecutionError(campaignId: string, error: unknown): void {
+    const campaign = this.deps.store.getCampaign(campaignId);
+    if (
+      campaign == null ||
+      campaign.state === "completed" ||
+      campaign.state === "failed" ||
+      campaign.state === "cancelled" ||
+      campaign.state === "waiting_approval"
+    ) {
+      return;
+    }
+    const failedAt = nowIso();
+    const message = error instanceof Error ? error.message : String(error);
+    const failed: CampaignSpecRecord = {
+      ...campaign,
+      state: "failed",
+      failureCode: "CAMPAIGN_EXECUTION_ERROR",
+      lastError: message,
+      lastProgressAt: failedAt,
+      updatedAt: failedAt
+    };
+    this.deps.store.upsertCampaign(failed);
+    this.recordCampaignEvent(failed, {
+      type: "campaign_failed",
+      message: `Campaign execution failed: ${message}`,
+      failureCode: "CAMPAIGN_EXECUTION_ERROR"
+    });
+  }
+
+  async recoverInterruptedCampaigns(): Promise<void> {
+    if (this.interruptedCampaignsRecovered) {
+      return;
+    }
+    this.interruptedCampaignsRecovered = true;
+    for (const campaign of this.deps.store.listCampaigns()) {
+      if (campaign.state !== "running" || this.activeExecutions.has(campaign.id)) {
+        continue;
+      }
+      const now = nowIso();
+      for (const run of this.deps.store.listRuns(campaign.id)) {
+        if (run.state === "completed" || run.state === "failed" || run.state === "cancelled") {
+          continue;
+        }
+        this.deps.store.upsertRun({
+          ...run,
+          state: "failed",
+          failureCode: "CAMPAIGN_INTERRUPTED",
+          summary: "Interrupted by daemon restart.",
+          finishedAt: now,
+          updatedAt: now,
+          lastProgressAt: now
+        });
+      }
+      const failed: CampaignSpecRecord = {
+        ...campaign,
+        state: "failed",
+        failureCode: "CAMPAIGN_INTERRUPTED",
+        lastError: "Campaign was interrupted by a daemon restart.",
+        lastProgressAt: now,
+        updatedAt: now
+      };
+      delete failed.waitingApprovalStepId;
+      this.deps.store.upsertCampaign(failed);
+      this.recordCampaignEvent(failed, {
+        type: "campaign_interrupted",
+        message: "Campaign was interrupted by a daemon restart.",
+        failureCode: "CAMPAIGN_INTERRUPTED"
+      });
+      this.deps.logger.warn(
+        `Puppenclaw marked interrupted campaign ${campaign.id} as failed after a restart.`
+      );
+    }
+  }
+
+  private recordCampaignEvent(
+    campaign: Pick<CampaignSpecRecord, "id" | "projectId">,
+    event: {
+      type: CampaignEventRecord["type"];
+      message: string;
+      stepId?: string;
+      stepIndex?: number;
+      runId?: string;
+      artifactId?: string;
+      failureCode?: string;
+      phase?: FusionPhase;
+      candidate?: FusionCandidate;
+    }
+  ): void {
+    try {
+      this.deps.store.appendCampaignEvent({
+        campaignId: campaign.id,
+        projectId: campaign.projectId,
+        type: event.type,
+        createdAt: nowIso(),
+        message: event.message,
+        ...(event.stepId != null ? { stepId: event.stepId } : {}),
+        ...(event.stepIndex != null ? { stepIndex: event.stepIndex } : {}),
+        ...(event.runId != null ? { runId: event.runId } : {}),
+        ...(event.artifactId != null ? { artifactId: event.artifactId } : {}),
+        ...(event.failureCode != null ? { failureCode: event.failureCode } : {}),
+        ...(event.phase != null ? { phase: event.phase } : {}),
+        ...(event.candidate != null ? { candidate: event.candidate } : {})
+      });
+    } catch (error) {
+      // Events are observability only; never let them affect control flow.
+      this.deps.logger.warn(
+        `Failed to record campaign event ${event.type} for ${campaign.id}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
   async ensureDefaultWorker(): Promise<void> {
     if (!this.deps.config.orchestration.enabled) {
       return;
@@ -334,6 +483,15 @@ export class OrchestratorRuntime implements IOrchestrator {
     const configured = this.deps.config.orchestration.localWorker;
     const existing = this.deps.store.getWorker(configured.id);
     if (existing != null) {
+      // Config stays authoritative for capacity only; registerWorker remains
+      // authoritative for everything else on the stored record.
+      if (existing.maxConcurrentRuns !== configured.maxConcurrentRuns) {
+        this.deps.store.upsertWorker({
+          ...existing,
+          maxConcurrentRuns: configured.maxConcurrentRuns,
+          updatedAt: nowIso()
+        });
+      }
       return;
     }
     const now = nowIso();
@@ -351,7 +509,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         "handoff"
       ],
       executors: this.deps.config.orchestration.allowLocalCommandExecution ? ["acp", "command"] : ["acp"],
-      maxConcurrentRuns: 1,
+      maxConcurrentRuns: configured.maxConcurrentRuns,
       adminOnlyRawSessions: true,
       createdAt: now,
       updatedAt: now,
@@ -361,7 +519,11 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   private async prepareRuntime(): Promise<void> {
     await this.ensureDefaultWorker();
-    await this.pruneArtifacts();
+    const now = Date.now();
+    if (now - this.lastArtifactPruneAt >= ARTIFACT_PRUNE_INTERVAL_MS) {
+      this.lastArtifactPruneAt = now;
+      await this.pruneArtifacts();
+    }
   }
 
   async createProject(params: ProjectCreateParams): Promise<ToolResult> {
@@ -500,6 +662,8 @@ export class OrchestratorRuntime implements IOrchestrator {
       experimentParallelism,
       iterations,
       steps,
+      ...(params.modelProviderId != null ? { modelProviderId: params.modelProviderId } : {}),
+      ...(params.modelProvider != null ? { modelProvider: params.modelProvider } : {}),
       currentStepIndex: 0,
       lastProgressAt: now,
       createdAt: now,
@@ -508,7 +672,20 @@ export class OrchestratorRuntime implements IOrchestrator {
       ...(preparedFusion != null ? { fusion: preparedFusion.fusion } : {})
     };
     this.deps.store.upsertCampaign(campaign);
-    const snapshot = await this.executeCampaign(campaign);
+    this.recordCampaignEvent(campaign, {
+      type: "campaign_created",
+      message: `Campaign ${campaign.name} created with template ${campaign.template}.`
+    });
+    if (params.detached) {
+      void this.driveCampaign(campaign).catch((error) => {
+        this.deps.logger.error(
+          `Detached campaign ${campaign.id} failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+      const snapshot = this.requireSnapshot(campaign.id);
+      return textToolResult(`${describeCampaign(snapshot)}\nmode: detached`, snapshot);
+    }
+    const snapshot = await this.driveCampaign(campaign);
     return textToolResult(describeCampaign(snapshot), snapshot);
   }
 
@@ -558,6 +735,34 @@ export class OrchestratorRuntime implements IOrchestrator {
   async campaignEvents(params: CampaignEventsParams): Promise<ToolResult> {
     await this.prepareRuntime();
     const campaign = this.requireCampaign(params.campaignId);
+    if (params.scope === "all") {
+      let afterId: number | undefined;
+      if (params.after != null) {
+        const parsed = Number(params.after);
+        if (!Number.isInteger(parsed) || parsed <= 0) {
+          throw new PuppenclawError(
+            "INVALID_EVENT_CURSOR",
+            `Invalid campaign event cursor for scope "all": ${params.after}`
+          );
+        }
+        afterId = parsed;
+      }
+      const events = this.deps.store.listCampaignEvents({
+        campaignId: campaign.id,
+        ...(afterId != null ? { afterId } : {}),
+        limit: params.limit
+      });
+      const result: CampaignEventsResult = {
+        campaignId: campaign.id,
+        scope: "all",
+        events
+      };
+      const last = events.at(-1);
+      if (last != null) {
+        result.cursor = String(last.id);
+      }
+      return jsonToolResult(result, "Puppenclaw campaign events");
+    }
     // Back-to-back fusion events can share a millisecond timestamp, so a
     // timestamp-only cursor could permanently drop events at a page boundary.
     // Use a composite (createdAt, append-sequence) cursor instead: the
@@ -589,13 +794,36 @@ export class OrchestratorRuntime implements IOrchestrator {
     return jsonToolResult(result, "Puppenclaw campaign events");
   }
 
-  async approve(params: CampaignActionParams): Promise<ToolResult> {
+  async approve(params: CampaignApproveParams): Promise<ToolResult> {
     await this.prepareRuntime();
     const campaign = this.requireCampaign(params.campaignId);
     if (campaign.waitingApprovalStepId == null) {
       throw new PuppenclawError(
         "CAMPAIGN_NOT_WAITING_APPROVAL",
         `Campaign ${campaign.id} is not waiting for approval.`
+      );
+    }
+    if (this.activeExecutions.has(campaign.id)) {
+      throw new PuppenclawError(
+        "CAMPAIGN_EXECUTION_ACTIVE",
+        `Campaign ${campaign.id} already has an active execution.`
+      );
+    }
+    // Re-check worker capacity before mutating any state so an over-capacity
+    // approval leaves the campaign validly parked in waiting_approval.
+    const worker = this.requireWorker(campaign.workerId);
+    const runningCampaigns = this.deps.store
+      .listCampaigns()
+      .filter(
+        (entry) =>
+          entry.workerId === worker.id &&
+          entry.id !== campaign.id &&
+          entry.state === "running"
+      ).length;
+    if (runningCampaigns >= worker.maxConcurrentRuns) {
+      throw new PuppenclawError(
+        "WORKER_CAPACITY_REACHED",
+        `Worker ${worker.id} already has ${runningCampaigns} running campaign(s).`
       );
     }
     const approvedStepId = campaign.waitingApprovalStepId;
@@ -608,7 +836,24 @@ export class OrchestratorRuntime implements IOrchestrator {
     };
     delete resumed.waitingApprovalStepId;
     this.deps.store.upsertCampaign(resumed);
-    const snapshot = await this.executeCampaign(resumed, approvedStepId);
+    this.recordCampaignEvent(resumed, {
+      type: "approved",
+      message: `Approval granted for step ${approvedStepId}.`,
+      stepId: approvedStepId
+    });
+    if (params.detached) {
+      void this.driveCampaign(resumed, approvedStepId).catch((error) => {
+        this.deps.logger.error(
+          `Detached campaign ${resumed.id} failed after approval: ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+      const snapshot = this.requireSnapshot(resumed.id);
+      return textToolResult(
+        `Approved campaign ${snapshot.campaign.name}.\nmode: detached`,
+        snapshot
+      );
+    }
+    const snapshot = await this.driveCampaign(resumed, approvedStepId);
     return textToolResult(`Approved campaign ${snapshot.campaign.name}.`, snapshot);
   }
 
@@ -645,6 +890,10 @@ export class OrchestratorRuntime implements IOrchestrator {
     };
     delete cancelled.lastError;
     this.deps.store.upsertCampaign(cancelled);
+    this.recordCampaignEvent(cancelled, {
+      type: "campaign_cancelled",
+      message: `Campaign ${cancelled.name} cancelled.`
+    });
     return textToolResult(`Cancelled campaign ${cancelled.name}.`, {
       campaign: cancelled
     });
@@ -1176,14 +1425,12 @@ export class OrchestratorRuntime implements IOrchestrator {
         );
       }
     }
+    // Only running campaigns consume execution slots; draft and
+    // waiting_approval campaigns are parked, not executing.
     const activeRuns = this.deps.store
       .listCampaigns()
-      .filter((campaign) =>
-        campaign.workerId === worker.id &&
-        (campaign.state === "draft" ||
-          campaign.state === "running" ||
-          campaign.state === "waiting_approval")
-      ).length;
+      .filter((campaign) => campaign.workerId === worker.id && campaign.state === "running")
+      .length;
     if (activeRuns >= worker.maxConcurrentRuns) {
       throw new PuppenclawError(
         "WORKER_CAPACITY_REACHED",
@@ -1565,6 +1812,12 @@ export class OrchestratorRuntime implements IOrchestrator {
         };
         delete current.currentRunId;
         this.deps.store.upsertCampaign(current);
+        this.recordCampaignEvent(current, {
+          type: "waiting_approval",
+          message: `Campaign is waiting for approval of step ${step.title}.`,
+          stepId: step.id,
+          stepIndex: index
+        });
         return this.requireSnapshot(current.id);
       }
 
@@ -1685,6 +1938,13 @@ export class OrchestratorRuntime implements IOrchestrator {
     };
     this.deps.store.upsertRun(baseRun);
     this.markCampaignRunActive(campaign, stepIndex, baseRun.id, startedAt);
+    this.recordCampaignEvent(campaign, {
+      type: "step_started",
+      message: `Step ${step.title} started.`,
+      stepId: step.id,
+      stepIndex,
+      runId: baseRun.id
+    });
 
     const attempt = await this.executeStepWithRetries(campaign, project, step, baseRun);
     if (!attempt.ok) {
@@ -1702,6 +1962,14 @@ export class OrchestratorRuntime implements IOrchestrator {
         ...(attempt.failureCategory != null ? { failureCategory: attempt.failureCategory } : {})
       };
       this.deps.store.upsertRun(run);
+      this.recordCampaignEvent(campaign, {
+        type: "step_failed",
+        message: `Step ${step.title} failed after ${attempt.attempts} attempt(s): ${attempt.message}`,
+        stepId: step.id,
+        stepIndex,
+        runId: run.id,
+        ...(attempt.failureCode != null ? { failureCode: attempt.failureCode } : {})
+      });
       return { ok: false, run };
     }
 
@@ -1750,6 +2018,14 @@ export class OrchestratorRuntime implements IOrchestrator {
       ...(attempt.result.sessionName != null ? { sessionName: attempt.result.sessionName } : {})
     };
     this.deps.store.upsertRun(run);
+    this.recordCampaignEvent(campaign, {
+      type: "step_completed",
+      message: `Step ${step.title} completed.`,
+      stepId: step.id,
+      stepIndex,
+      runId: run.id,
+      artifactId: artifact.id
+    });
     return {
       ok: true,
       run,
@@ -1857,6 +2133,14 @@ export class OrchestratorRuntime implements IOrchestrator {
     updatedAt: string,
     sessionName?: string
   ): CampaignSpecRecord {
+    // A concurrent cancel() may have persisted the terminal state while the
+    // step was running; keep it instead of overwriting it with
+    // "running"/"completed" (a SIGTERM-killed command step can exit 0 on
+    // POSIX and land here through the success path).
+    const stored = this.deps.store.getCampaign(campaign.id);
+    if (stored?.state === "cancelled") {
+      return stored;
+    }
     const next: CampaignSpecRecord = {
       ...campaign,
       currentStepIndex: nextStepIndex,
@@ -1869,6 +2153,12 @@ export class OrchestratorRuntime implements IOrchestrator {
     delete next.lastError;
     delete next.currentRunId;
     this.deps.store.upsertCampaign(next);
+    if (next.state === "completed") {
+      this.recordCampaignEvent(next, {
+        type: "campaign_completed",
+        message: `Campaign ${next.name} completed.`
+      });
+    }
     return next;
   }
 
@@ -2257,6 +2547,15 @@ export class OrchestratorRuntime implements IOrchestrator {
           lastProgressAt: artifact.createdAt,
           updatedAt: artifact.createdAt
         };
+        if (next.state === "completed") {
+          // Skipping the resolver can end the campaign here, bypassing
+          // completeCampaignStep; record the terminal event so the
+          // scope:"all" stream always carries one.
+          this.recordCampaignEvent(next, {
+            type: "campaign_completed",
+            message: `Campaign ${next.name} completed.`
+          });
+        }
       }
     } else {
       next = {
@@ -2325,17 +2624,25 @@ export class OrchestratorRuntime implements IOrchestrator {
     if (campaign.fusion == null) {
       return campaign;
     }
+    const record: FusionEventRecord = {
+      ...event,
+      createdAt: nowIso()
+    };
+    // Mirror into the campaign_events table. The table write is immediate
+    // while the fusion array persists on the caller's later upsertCampaign;
+    // a crash between the two can leave a table-only event — harmless for an
+    // observability stream.
+    this.recordCampaignEvent(campaign, {
+      type: record.type,
+      message: record.message,
+      phase: record.phase,
+      ...(record.candidate != null ? { candidate: record.candidate } : {})
+    });
     return {
       ...campaign,
       fusion: {
         ...campaign.fusion,
-        events: [
-          ...campaign.fusion.events,
-          {
-            ...event,
-            createdAt: nowIso()
-          }
-        ]
+        events: [...campaign.fusion.events, record]
       }
     };
   }
@@ -2403,6 +2710,13 @@ export class OrchestratorRuntime implements IOrchestrator {
     stepIndex: number,
     run: RunRecord
   ): CampaignSpecRecord {
+    // A concurrent cancel() already persisted the terminal state; keep it
+    // instead of overwriting it with "failed". The killed step's run record
+    // was already persisted as failed by the caller.
+    const stored = this.deps.store.getCampaign(campaign.id);
+    if (stored?.state === "cancelled") {
+      return stored;
+    }
     const updatedAt = run.finishedAt ?? nowIso();
     let next: CampaignSpecRecord = {
       ...campaign,
@@ -2427,6 +2741,13 @@ export class OrchestratorRuntime implements IOrchestrator {
       });
     }
     this.deps.store.upsertCampaign(next);
+    this.recordCampaignEvent(next, {
+      type: "campaign_failed",
+      message: next.lastError ?? "Campaign step failed.",
+      stepIndex,
+      runId: run.id,
+      ...(run.failureCode != null ? { failureCode: run.failureCode } : {})
+    });
     return next;
   }
 
@@ -2478,6 +2799,8 @@ export class OrchestratorRuntime implements IOrchestrator {
           ...(project.permissionMode != null ? { permissionMode: project.permissionMode } : {}),
           ...(project.effort != null ? { effort: project.effort } : {}),
           ...(project.model != null ? { model: project.model } : {}),
+          ...(campaign.modelProviderId != null ? { modelProviderId: campaign.modelProviderId } : {}),
+          ...(campaign.modelProvider != null ? { modelProvider: campaign.modelProvider } : {}),
           ...(project.planningProfile != null ? { planningProfile: project.planningProfile } : {}),
           contextFiles: step.contextFiles
         })

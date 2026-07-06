@@ -9,6 +9,7 @@ import {
   artifactReadParamsZod,
   campaignEventsParamsZod,
   campaignActionParamsZod,
+  campaignApproveParamsZod,
   campaignRunParamsZod,
   campaignStatusParamsZod,
   contextSyncParamsZod,
@@ -32,6 +33,7 @@ import {
   toolArtifactReadSchema,
   toolCampaignEventsSchema,
   toolCampaignActionSchema,
+  toolCampaignApproveSchema,
   toolCampaignRunSchema,
   toolCampaignStatusSchema,
   toolContextSyncSchema,
@@ -114,7 +116,7 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
     {
       name: "puppenclaw_campaign_start",
       label: "Start Puppenclaw campaign",
-      description: "Run a high-level project campaign such as baseline, literature review, ablations, or a self-improvement loop.",
+      description: "Run a high-level project campaign such as baseline, literature review, ablations, or a self-improvement loop. detached: true returns immediately with the running snapshot; poll campaign status/events for progress (puppenfusion prepare still runs synchronously before the response).",
       parameters: toolCampaignRunSchema,
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const orchestrator = await getPuppenclawOrchestrator();
@@ -154,7 +156,7 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
     {
       name: "puppenclaw_campaign_events",
       label: "Puppenclaw campaign events",
-      description: "List structured campaign and puppenfusion events for orchestration inspection.",
+      description: "List structured campaign and puppenfusion events for orchestration inspection. scope: \"all\" streams the full lifecycle (steps, approvals, terminal states) with an integer id cursor for paging; the default scope lists only puppenfusion events.",
       parameters: toolCampaignEventsSchema,
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const orchestrator = await getPuppenclawOrchestrator();
@@ -164,11 +166,11 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
     {
       name: "puppenclaw_campaign_approve",
       label: "Approve Puppenclaw campaign step",
-      description: "Approve a paused orchestration campaign and resume execution.",
-      parameters: toolCampaignActionSchema,
+      description: "Approve a paused orchestration campaign and resume execution. detached: true returns immediately; poll campaign status/events for progress.",
+      parameters: toolCampaignApproveSchema,
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const orchestrator = await getPuppenclawOrchestrator();
-        return orchestrator.approve(campaignActionParamsZod.parse(rawParams));
+        return orchestrator.approve(campaignApproveParamsZod.parse(rawParams));
       }
     },
     {
