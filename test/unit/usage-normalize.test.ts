@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { hasNonzeroUsage, normalizeUsage } from "../../src/shared/usage.js";
+import {
+  hasNonzeroUsage,
+  normalizeCodexUsage,
+  normalizeUsage
+} from "../../src/shared/usage.js";
 
 describe("normalizeUsage", () => {
   it("normalizes snake_case Anthropic-style fields", () => {
@@ -34,6 +38,23 @@ describe("normalizeUsage", () => {
       cacheRead: 6,
       cacheWrite: 2,
       total: 56
+    });
+  });
+
+  it("normalizes the Claude ACP adapter result.usage shape", () => {
+    expect(
+      normalizeUsage({
+        inputTokens: 200,
+        outputTokens: 40,
+        cachedReadTokens: 15,
+        cachedWriteTokens: 9
+      })
+    ).toEqual({
+      input: 200,
+      output: 40,
+      cacheRead: 15,
+      cacheWrite: 9,
+      total: 264
     });
   });
 
@@ -184,6 +205,71 @@ describe("normalizeUsage", () => {
     expect(normalized.total).toBe(
       normalized.input + normalized.output + normalized.cacheRead + normalized.cacheWrite
     );
+  });
+});
+
+describe("normalizeCodexUsage", () => {
+  it("splits codex input_tokens (cache-inclusive) into disjoint buckets", () => {
+    // Codex reports input_tokens INCLUDING cached_input_tokens; the normalizer
+    // must split them so the recomputed total does not double-count the cache.
+    expect(
+      normalizeCodexUsage({
+        input_tokens: 1000,
+        cached_input_tokens: 300,
+        output_tokens: 120,
+        reasoning_output_tokens: 40,
+        total_tokens: 1120
+      })
+    ).toEqual({
+      input: 700,
+      output: 120,
+      cacheRead: 300,
+      cacheWrite: 0,
+      total: 1120
+    });
+  });
+
+  it("accepts camelCase codex fields", () => {
+    expect(
+      normalizeCodexUsage({
+        inputTokens: 50,
+        cachedInputTokens: 10,
+        outputTokens: 8
+      })
+    ).toEqual({
+      input: 40,
+      output: 8,
+      cacheRead: 10,
+      cacheWrite: 0,
+      total: 58
+    });
+  });
+
+  it("handles no cache (cached_input_tokens absent)", () => {
+    expect(normalizeCodexUsage({ input_tokens: 30, output_tokens: 5 })).toEqual({
+      input: 30,
+      output: 5,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 35
+    });
+  });
+
+  it("clamps cached over input and returns zeros for non-object input", () => {
+    expect(
+      normalizeCodexUsage({
+        input_tokens: 5,
+        cached_input_tokens: 9,
+        output_tokens: 2
+      })
+    ).toEqual({ input: 0, output: 2, cacheRead: 5, cacheWrite: 0, total: 7 });
+    expect(normalizeCodexUsage(null)).toEqual({
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0
+    });
   });
 });
 

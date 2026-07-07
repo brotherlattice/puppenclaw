@@ -51,6 +51,8 @@ export function normalizeUsage(raw: unknown): NormalizedUsage {
     "cache_read",
     "cacheReadInputTokens",
     "cache_read_input_tokens",
+    "cachedReadTokens",
+    "cacheReadTokens",
     "cachedTokens",
     "cached_tokens"
   ]);
@@ -61,7 +63,9 @@ export function normalizeUsage(raw: unknown): NormalizedUsage {
     "cacheWrite",
     "cache_write",
     "cacheCreationInputTokens",
-    "cache_creation_input_tokens"
+    "cache_creation_input_tokens",
+    "cachedWriteTokens",
+    "cacheWriteTokens"
   ]);
   return {
     input,
@@ -69,6 +73,33 @@ export function normalizeUsage(raw: unknown): NormalizedUsage {
     cacheRead,
     cacheWrite,
     total: input + output + cacheRead + cacheWrite
+  };
+}
+
+/**
+ * Normalize a Codex (`codex exec --json`) usage payload — the object on
+ * `turn.completed.usage` or `token_count.info.{total,last}_token_usage`. Unlike
+ * the Anthropic/ACP shape, Codex's `input_tokens` is the TOTAL prompt tokens
+ * INCLUDING `cached_input_tokens`, so we split them into disjoint buckets (fresh
+ * input vs. cache read) to avoid double-counting the recomputed total. Codex has
+ * no cache-write notion.
+ */
+export function normalizeCodexUsage(raw: unknown): NormalizedUsage {
+  const source = isRecord(raw) ? raw : {};
+  const inputTotal = readUsageNumber(source, ["input_tokens", "inputTokens"]);
+  const cachedInput = readUsageNumber(source, [
+    "cached_input_tokens",
+    "cachedInputTokens"
+  ]);
+  const output = readUsageNumber(source, ["output_tokens", "outputTokens"]);
+  const cacheRead = Math.min(cachedInput, inputTotal);
+  const input = Math.max(0, inputTotal - cacheRead);
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite: 0,
+    total: input + output + cacheRead
   };
 }
 

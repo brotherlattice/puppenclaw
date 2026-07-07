@@ -6,7 +6,11 @@ import { fileURLToPath } from "node:url";
 
 import { SessionStore } from "../shared/store.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
-import { hasNonzeroUsage, normalizeUsage } from "../shared/usage.js";
+import {
+  hasNonzeroUsage,
+  normalizeCodexUsage,
+  normalizeUsage
+} from "../shared/usage.js";
 import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
@@ -619,6 +623,17 @@ function parsePromptEventLine(line: string): PromptEvent | null {
     const parsed = JSON.parse(trimmed) as unknown;
     if (!isRecord(parsed)) {
       return null;
+    }
+    // The JSON-RPC response to session/prompt carries the billable per-turn
+    // usage on result.usage (the Claude ACP adapter reports input/output/cache
+    // there). The session/update "usage_update" only carries the context-window
+    // used/size — so without this the persistent path records no real tokens.
+    // Surface it as a usage-bearing status event → recordNormalizedUsage.
+    if (isRecord(parsed.result) && isRecord(parsed.result.usage)) {
+      const usage = normalizeUsage(parsed.result.usage);
+      if (hasNonzeroUsage(usage)) {
+        return { type: "status", text: "usage recorded", usage };
+      }
     }
     const structured = resolveStructuredPayload(parsed);
     switch (structured.type) {
@@ -2444,6 +2459,7 @@ export class AcpxSessionManager implements ISessionManager {
     let pendingStdout = "";
     const liveOutputChunks: string[] = [];
     const dispatchTasks: Array<Promise<void>> = [];
+    let latestCodexUsage: NormalizedUsage | undefined;
     const appendLiveOutput = (text: string): void => {
       const sanitized = sanitizeActiveTurnText(text);
       if (sanitized.length === 0) {
@@ -2462,6 +2478,23 @@ export class AcpxSessionManager implements ISessionManager {
         const visibleText = extractCodexLiveOutput(parsed);
         if (visibleText != null && visibleText.length > 0) {
           appendLiveOutput(visibleText);
+        }
+        // Codex exec --json emits per-turn usage on `turn.completed.usage` and
+        // cumulative usage under `token_count.info.total_token_usage`. Capture
+        // it (last-writer-wins → final turn total) so the one-shot runtime
+        // records real tokens instead of nothing.
+        const codexEventType = asTrimmedString(parsed.type).toLowerCase();
+        let codexUsageRaw: unknown;
+        if (codexEventType === "turn.completed") {
+          codexUsageRaw = parsed.usage;
+        } else if (codexEventType === "token_count" && isRecord(parsed.info)) {
+          codexUsageRaw = parsed.info.total_token_usage;
+        }
+        if (isRecord(codexUsageRaw)) {
+          const usage = normalizeCodexUsage(codexUsageRaw);
+          if (hasNonzeroUsage(usage)) {
+            latestCodexUsage = usage;
+          }
         }
       } catch {
         if (line.trim().length > 0) {
@@ -2563,7 +2596,8 @@ export class AcpxSessionManager implements ISessionManager {
     }
     const result = await this.finishSuccessfulTurn({
       sessionName: params.session.name,
-      output: combinedOutput
+      output: combinedOutput,
+      ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {})
     });
     this.completeActiveTurnOutput(params.session.name);
     return result;
