@@ -1140,7 +1140,8 @@ export class AcpxSessionManager implements ISessionManager {
     const effectivePromptText = this.usesOneShotRuntime(session)
       ? this.buildOneShotContinuationPrompt(session, runtimePromptText)
       : runtimePromptText;
-    const effectivePermissionMode = this.effectivePermissionMode(session);
+    const effectivePermissionMode =
+      params.permissionMode ?? this.effectivePermissionMode(session);
     const turn = await this.runTurn({
       session,
       promptText: effectivePromptText,
@@ -1150,7 +1151,8 @@ export class AcpxSessionManager implements ISessionManager {
 
     const nextSession: SessionInfo = {
       ...session,
-      permissionMode: effectivePermissionMode,
+      permissionMode:
+        params.permissionMode == null ? effectivePermissionMode : session.permissionMode,
       state: stoppedDuringTurn ? "stopped" : turn.state,
       lastActivity: nowIso(),
       warnings: dedupeWarnings([...session.warnings, ...turn.warnings]),

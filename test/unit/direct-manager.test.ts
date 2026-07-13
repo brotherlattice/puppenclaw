@@ -272,6 +272,53 @@ describe("AcpxSessionManager", () => {
     expect(statusDetails.runtime.exists).toBe(true);
   });
 
+  it("applies a send permission override for one turn without persisting it", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-turn-permission-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const started = await manager.start({
+      agent: "claude",
+      name: "turn-permission-demo",
+      directory: workspaceDir,
+      task: "REPORT_PERMISSION_MODE",
+      contextFiles: []
+    });
+    expect((started.details as { output: string }).output).toBe(
+      "Permission mode: approve-reads"
+    );
+
+    const approved = await manager.send({
+      name: "turn-permission-demo",
+      message: "REPORT_PERMISSION_MODE",
+      permissionMode: "approve-all",
+      contextFiles: []
+    });
+    const approvedDetails = approved.details as { session: SessionInfo; output: string };
+    expect(approvedDetails.output).toBe("Permission mode: approve-all");
+    expect(approvedDetails.session.permissionMode).toBe("approve-reads");
+
+    const following = await manager.send({
+      name: "turn-permission-demo",
+      message: "REPORT_PERMISSION_MODE",
+      contextFiles: []
+    });
+    const followingDetails = following.details as { session: SessionInfo; output: string };
+    expect(followingDetails.output).toBe("Permission mode: approve-reads");
+    expect(followingDetails.session.permissionMode).toBe("approve-reads");
+  });
+
   it("preserves leading and whitespace-only assistant text chunks", async () => {
     const workspaceDir = await createTempDir("puppenclaw-whitespace-");
     const acpxCommand = await resolveWhitespaceFakeAcpxCommand(workspaceDir);

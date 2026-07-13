@@ -31,6 +31,7 @@ function splitText(text, size = 14) {
 
 let cwd = process.cwd();
 let agent = "";
+let permissionMode = "unspecified";
 const args = process.argv.slice(2);
 let index = 0;
 
@@ -47,6 +48,9 @@ while (index < args.length) {
     current === "--approve-all" ||
     current === "--deny-all"
   ) {
+    if (current !== "--json-strict") {
+      permissionMode = current.slice(2);
+    }
     index += 1;
   } else if (current === "--non-interactive-permissions") {
     index += 2;
@@ -202,6 +206,8 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
       "## Executive judgment\nPatched one obvious old-model mistake.\n## Imported sessions reviewed\n- Reviewed imported fixtures.\n## Findings by importance\n- functionality: missing reassessment-fix.txt was an obvious prior omission.\n## Patches made\n- Added reassessment-fix.txt.\n## Findings intentionally not patched\n- No refactor-only findings patched.\n## Validation instructions and residual risk\n- Run the configured validation command.";
   } else if (normalizedInput.includes("ASK_USER")) {
     reply = "Need input from the user?";
+  } else if (normalizedInput.includes("REPORT_PERMISSION_MODE")) {
+    reply = `Permission mode: ${permissionMode}`;
   } else {
     reply = `Handled: ${normalizedInput}`;
   }

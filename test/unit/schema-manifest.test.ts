@@ -4,7 +4,9 @@ import {
   buildPluginManifest,
   pluginConfigZod,
   reassessmentStartParamsZod,
-  REMOTE_CONTROL_VERBS
+  REMOTE_CONTROL_VERBS,
+  sendParamsZod,
+  toolSendSchema
 } from "../../src/shared/schema.js";
 
 describe("plugin manifest and config schema", () => {
@@ -39,5 +41,25 @@ describe("plugin manifest and config schema", () => {
     expect(REMOTE_CONTROL_VERBS).toContain("reassess-report");
     expect(REMOTE_CONTROL_VERBS).toContain("artifact-read");
     expect(REMOTE_CONTROL_VERBS).toContain("campaign-events");
+  });
+
+  it("exposes one-turn permission modes in both send schemas", () => {
+    expect(
+      sendParamsZod.parse({
+        name: "demo",
+        message: "Run the approved turn.",
+        permissionMode: "approve-all"
+      }).permissionMode
+    ).toBe("approve-all");
+    const permissionSchema = (
+      toolSendSchema as unknown as {
+        properties: { permissionMode: { anyOf?: Array<{ const?: string }> } };
+      }
+    ).properties.permissionMode;
+    expect(permissionSchema.anyOf?.map((entry) => entry.const)).toEqual([
+      "approve-reads",
+      "approve-all",
+      "deny-all"
+    ]);
   });
 });

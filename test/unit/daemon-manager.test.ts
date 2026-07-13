@@ -121,6 +121,25 @@ describe("DaemonSessionManager", () => {
       const startDetails = result.details as { session: SessionInfo };
       expect(startDetails.session.name).toBe("daemon-demo");
 
+      const approved = await manager.send({
+        name: "daemon-demo",
+        message: "REPORT_PERMISSION_MODE",
+        permissionMode: "approve-all",
+        contextFiles: []
+      });
+      const approvedDetails = approved.details as { session: SessionInfo; output: string };
+      expect(approvedDetails.output).toBe("Permission mode: approve-all");
+      expect(approvedDetails.session.permissionMode).toBe("approve-reads");
+
+      const following = await manager.send({
+        name: "daemon-demo",
+        message: "REPORT_PERMISSION_MODE",
+        contextFiles: []
+      });
+      const followingDetails = following.details as { session: SessionInfo; output: string };
+      expect(followingDetails.output).toBe("Permission mode: approve-reads");
+      expect(followingDetails.session.permissionMode).toBe("approve-reads");
+
       const cost = await manager.cost({ name: "daemon-demo" });
       const costDetails = cost.details as { name: string };
       expect(costDetails.name).toBe("daemon-demo");
@@ -129,7 +148,7 @@ describe("DaemonSessionManager", () => {
       const outputDetails = output.details as {
         output: { text: string; source: string; complete: boolean };
       };
-      expect(outputDetails.output.text).toContain("Handled:");
+      expect(outputDetails.output.text).toBe("Permission mode: approve-reads");
       expect(outputDetails.output.source).toBe("active-turn");
       expect(outputDetails.output.complete).toBe(true);
 

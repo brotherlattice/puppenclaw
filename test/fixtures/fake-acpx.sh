@@ -31,6 +31,7 @@ split_text() {
 
 cwd="$(pwd)"
 agent=""
+permission_mode="unspecified"
 args=("$@")
 index=0
 
@@ -46,6 +47,9 @@ while [[ $index -lt ${#args[@]} ]]; do
       index=$((index + 2))
       ;;
     --json-strict|--approve-reads|--approve-all|--deny-all)
+      if [[ "$current" != "--json-strict" ]]; then
+        permission_mode="${current#--}"
+      fi
       index=$((index + 1))
       ;;
     --non-interactive-permissions)
@@ -192,6 +196,8 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
     reply=$'## Executive judgment\nPatched one obvious old-model mistake.\n## Imported sessions reviewed\n- Reviewed imported fixtures.\n## Findings by importance\n- functionality: missing reassessment-fix.txt was an obvious prior omission.\n## Patches made\n- Added reassessment-fix.txt.\n## Findings intentionally not patched\n- No refactor-only findings patched.\n## Validation instructions and residual risk\n- Run the configured validation command.'
   elif [[ "$normalized_input" == *"ASK_USER"* ]]; then
     reply="Need input from the user?"
+  elif [[ "$normalized_input" == *"REPORT_PERMISSION_MODE"* ]]; then
+    reply="Permission mode: $permission_mode"
   else
     reply="Handled: $normalized_input"
   fi

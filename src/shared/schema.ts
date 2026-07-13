@@ -463,6 +463,7 @@ export const sendParamsZod = z
     format: responseFormatZod.optional(),
     stream: z.boolean().optional(),
     ultrathink: z.boolean().optional(),
+    permissionMode: permissionModeZod.optional(),
     contextFiles: z.array(nonEmptyString).default([])
   })
   .strict();
@@ -802,6 +803,13 @@ export const toolSendSchema = Type.Object({
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")])),
   stream: Type.Optional(Type.Boolean()),
   ultrathink: Type.Optional(Type.Boolean()),
+  permissionMode: Type.Optional(
+    Type.Union([
+      Type.Literal("approve-reads"),
+      Type.Literal("approve-all"),
+      Type.Literal("deny-all")
+    ])
+  ),
   contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 })))
 });
 
