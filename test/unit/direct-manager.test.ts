@@ -214,6 +214,47 @@ process.exit(1);
   return `node "${fakeCodexPath.replaceAll('"', '\\"')}"`;
 }
 
+async function resolveFakeCodexPermissionCommand(workspaceDir: string): Promise<string> {
+  const fakeCodexPath = join(workspaceDir, "fake-codex-permissions.mjs");
+  await writeFile(
+    fakeCodexPath,
+    `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { join } from "node:path";
+
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+const outputPath = outputIndex >= 0 ? args[outputIndex + 1] : null;
+const cwdIndex = args.indexOf("--cd");
+const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : process.cwd();
+const counterPath = join(cwd, ".fake-codex-permission-count");
+const invocation = existsSync(counterPath)
+  ? Number.parseInt(readFileSync(counterPath, "utf8"), 10) || 0
+  : 0;
+writeFileSync(counterPath, String(invocation + 1), "utf8");
+
+const promptText = readFileSync(0, "utf8");
+writeFileSync(join(cwd, \`.fake-codex-permission-args-\${invocation}.json\`), JSON.stringify(args), "utf8");
+writeFileSync(join(cwd, \`.fake-codex-permission-prompt-\${invocation}.txt\`), promptText, "utf8");
+
+const answer = \`Captured permission turn \${invocation}.\`;
+writeSync(1, JSON.stringify({
+  type: "response_item",
+  item: {
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text: answer }]
+  }
+}) + "\\n");
+if (outputPath != null) {
+  writeFileSync(outputPath, answer, "utf8");
+}
+`,
+    "utf8"
+  );
+  return `node "${fakeCodexPath.replaceAll('"', '\\"')}"`;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -375,6 +416,89 @@ describe("AcpxSessionManager", () => {
     const followingDetails = following.details as { session: SessionInfo; output: string };
     expect(followingDetails.output).toBe("Permission mode: approve-all");
     expect(followingDetails.session.permissionMode).toBe("approve-all");
+  });
+
+  it("maps one-shot Codex permissions to process arguments per turn", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-codex-permissions-");
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        agentCommands: { codex: codexCommand }
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const modelProvider = {
+      id: "fake-openai-compatible",
+      kind: "codex-openai-compatible" as const,
+      model: "fake-model",
+      baseUrl: "http://example.invalid/v1",
+      authTokenEnv: "FAKE_CODEX_TOKEN",
+      wireApi: "responses" as const
+    };
+
+    await manager.start({
+      agent: "codex",
+      name: "codex-permission-demo",
+      directory: workspaceDir,
+      task: "Start read-only.",
+      contextFiles: [],
+      modelProvider
+    });
+    const readOnlyArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-0.json"), "utf8")
+    ) as string[];
+    const readOnlySandboxIndex = readOnlyArgs.indexOf("--sandbox");
+    expect(readOnlyArgs).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(readOnlyArgs.slice(readOnlySandboxIndex, readOnlySandboxIndex + 2)).toEqual([
+      "--sandbox",
+      "read-only"
+    ]);
+
+    const approved = await manager.send({
+      name: "codex-permission-demo",
+      message: "Run the approved write turn.",
+      permissionMode: "approve-all",
+      contextFiles: []
+    });
+    const approveAllArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-1.json"), "utf8")
+    ) as string[];
+    expect(approveAllArgs).toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(approveAllArgs).not.toContain("--sandbox");
+    expect((approved.details as { session: SessionInfo }).session.permissionMode).toBe(
+      "approve-reads"
+    );
+
+    await manager.send({
+      name: "codex-permission-demo",
+      message: "Answer without tools.",
+      permissionMode: "deny-all",
+      contextFiles: []
+    });
+    const denyAllArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-2.json"), "utf8")
+    ) as string[];
+    const denyAllPrompt = await readFile(
+      join(workspaceDir, ".fake-codex-permission-prompt-2.txt"),
+      "utf8"
+    );
+    const denyAllSandboxIndex = denyAllArgs.indexOf("--sandbox");
+    expect(denyAllArgs).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(denyAllArgs.slice(denyAllSandboxIndex, denyAllSandboxIndex + 2)).toEqual([
+      "--sandbox",
+      "read-only"
+    ]);
+    expect(denyAllPrompt).toContain("Permission mode for this turn is deny-all.");
+    expect(denyAllPrompt).toContain("Do not call tools");
+    expect(denyAllPrompt).toContain("Answer without tools.");
   });
 
   it("preserves leading and whitespace-only assistant text chunks", async () => {

@@ -277,6 +277,13 @@ Daemon mode:
 }
 ```
 
+For direct one-shot Codex providers, `approve-reads` runs `codex exec` with
+`--sandbox read-only` and without the bypass flag. `approve-all` retains
+`--dangerously-bypass-approvals-and-sandbox`; deployments should still confine that process with
+their outer sandbox. Codex has no exact Puppenclaw `deny-all` process flag, so Puppenclaw uses the
+read-only sandbox and adds explicit no-tool guidance to the prompt. That guidance is defense in
+depth, not a hard no-read/no-tool boundary.
+
 ### Config Notes
 
 - `backend`

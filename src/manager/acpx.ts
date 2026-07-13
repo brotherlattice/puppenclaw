@@ -214,6 +214,24 @@ function buildPermissionArgs(mode: PermissionMode): string[] {
   return ["--approve-reads"];
 }
 
+function buildCodexPermissionArgs(mode: PermissionMode): string[] {
+  return mode === "approve-all"
+    ? ["--dangerously-bypass-approvals-and-sandbox"]
+    : ["--sandbox", "read-only"];
+}
+
+function buildCodexPermissionPrompt(promptText: string, mode: PermissionMode): string {
+  if (mode !== "deny-all") {
+    return promptText;
+  }
+  return [
+    "Permission mode for this turn is deny-all.",
+    "Do not call tools, execute commands, access external resources, or modify files. Answer only from the prompt and prior transcript.",
+    "",
+    promptText
+  ].join("\n");
+}
+
 function parseJsonLines(value: string): JsonRecord[] {
   const events: JsonRecord[] = [];
   for (const line of value.split(/\r?\n/u)) {
@@ -2412,7 +2430,7 @@ export class AcpxSessionManager implements ISessionManager {
       "--cd",
       params.session.directory,
       "--skip-git-repo-check",
-      "--dangerously-bypass-approvals-and-sandbox",
+      ...buildCodexPermissionArgs(params.permissionMode),
       "--json",
       "--output-last-message",
       outputPath,
@@ -2539,7 +2557,7 @@ export class AcpxSessionManager implements ISessionManager {
       );
     });
     child.stdin.setDefaultEncoding("utf8");
-    child.stdin.write(params.promptText);
+    child.stdin.write(buildCodexPermissionPrompt(params.promptText, params.permissionMode));
     child.stdin.end();
 
     const exitCode = await new Promise<number | null>((resolve, reject) => {
