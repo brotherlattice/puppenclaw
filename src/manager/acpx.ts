@@ -39,6 +39,7 @@ import type {
   SuspendParams,
   ToolResult,
   TokenUsage,
+  TurnOutputRole,
   UnfocusParams
 } from "../shared/types.js";
 import { loadContextFiles, nowIso, summarizePromptEvents } from "../shared/utils.js";
@@ -69,6 +70,10 @@ type TurnResult = {
   transcript: SessionTranscriptEntry[];
   state: SessionInfo["state"];
 };
+
+function outputRoleForTurn(turn: TurnResult): TurnOutputRole {
+  return turn.state === "failed" ? "status" : "assistant";
+}
 
 type ActiveTurnOutput = {
   sessionName: string;
@@ -1103,6 +1108,7 @@ export class AcpxSessionManager implements ISessionManager {
     return textToolResult(`Started session ${params.name}.`, {
       session: nextSession,
       output: turn.output,
+      outputRole: outputRoleForTurn(turn),
       contextFiles: context.files,
       skills: installedSkills
     });
@@ -1169,6 +1175,7 @@ export class AcpxSessionManager implements ISessionManager {
     return textToolResult(`Updated session ${params.name}.`, {
       session: nextSession,
       output: turn.output,
+      outputRole: outputRoleForTurn(turn),
       contextFiles: context.files
     });
     });

@@ -254,9 +254,11 @@ describe("AcpxSessionManager", () => {
     const startDetails = result.details as {
       session: SessionInfo;
       output: string;
+      outputRole: "assistant" | "status";
     };
     expect(startDetails.session.name).toBe("demo");
     expect(startDetails.output).toContain("Handled:");
+    expect(startDetails.outputRole).toBe("assistant");
     expect(chunks.join("")).toContain("Handled:");
 
     const status = await manager.status({ name: "demo" });
@@ -451,8 +453,12 @@ describe("AcpxSessionManager", () => {
     });
     const sendDetails = result.details as {
       session: SessionInfo;
+      output: string;
+      outputRole: "assistant" | "status";
     };
     expect(sendDetails.session.state).toBe("failed");
+    expect(sendDetails.output).toContain("stream disconnected before completion");
+    expect(sendDetails.outputRole).toBe("status");
 
     const output = await manager.output({ name: "codex-failure-demo" });
     const outputDetails = output.details as {
@@ -501,6 +507,40 @@ describe("AcpxSessionManager", () => {
     };
     expect(sendDetails.session.state).toBe("waiting_input");
     expect(sendDetails.session.pendingQuestion).toBe("Need input from the user?");
+  });
+
+  it("classifies ACP error events as status output", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-error-role-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const result = await manager.start({
+      agent: "claude",
+      name: "error-role-demo",
+      directory: workspaceDir,
+      task: "FAIL_TURN",
+      contextFiles: []
+    });
+    const details = result.details as {
+      session: SessionInfo;
+      output: string;
+      outputRole: "assistant" | "status";
+    };
+
+    expect(details.session.state).toBe("failed");
+    expect(details.output).toBe("Simulated turn failure");
+    expect(details.outputRole).toBe("status");
   });
 
   it("creates a runtime session when acpx status reports no-session", async () => {
@@ -791,8 +831,10 @@ process.exit(1);
     });
     const details = result.details as {
       session: SessionInfo;
+      outputRole: "assistant" | "status";
     };
     expect(details.session.state).toBe("failed");
+    expect(details.outputRole).toBe("status");
   });
 
   it("gc skips sessions with in-flight turns and clears tracking maps for reaped sessions", async () => {

@@ -115,11 +115,41 @@ describe("daemon/local parity", () => {
         task: "Implement parity test task.",
         contextFiles: []
       });
-      const localDetails = local.details as { output: string };
-      const remoteDetails = remote.details as { output: string };
+      const localDetails = local.details as {
+        output: string;
+        outputRole: "assistant" | "status";
+      };
+      const remoteDetails = remote.details as typeof localDetails;
 
       expect(localDetails.output).toContain("Handled:");
       expect(remoteDetails.output).toContain("Handled:");
+      expect(localDetails.outputRole).toBe("assistant");
+      expect(remoteDetails.outputRole).toBe(localDetails.outputRole);
+
+      const localFailure = await localManager.start({
+        agent: "claude",
+        name: "parity-failed",
+        directory: localDir,
+        task: "FAIL_TURN",
+        contextFiles: []
+      });
+      const remoteFailure = await daemonManager.start({
+        agent: "claude",
+        name: "parity-failed",
+        directory: daemonDir,
+        task: "FAIL_TURN",
+        contextFiles: []
+      });
+      const localFailureDetails = localFailure.details as {
+        output: string;
+        outputRole: "assistant" | "status";
+      };
+      const remoteFailureDetails = remoteFailure.details as typeof localFailureDetails;
+
+      expect(localFailureDetails.output).toBe("Simulated turn failure");
+      expect(remoteFailureDetails.output).toBe(localFailureDetails.output);
+      expect(localFailureDetails.outputRole).toBe("status");
+      expect(remoteFailureDetails.outputRole).toBe(localFailureDetails.outputRole);
 
       // Per-session usage parity: local cost() vs daemon GET /session/:name/cost.
       const localCost = await localManager.cost({ name: "parity" });

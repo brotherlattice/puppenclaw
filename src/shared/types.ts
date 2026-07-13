@@ -109,6 +109,8 @@ export type ToolResult<TDetails = Record<string, unknown>> = {
   details: TDetails;
 };
 
+export type TurnOutputRole = "assistant" | "status";
+
 export type SessionState =
   | "idle"
   | "running"
