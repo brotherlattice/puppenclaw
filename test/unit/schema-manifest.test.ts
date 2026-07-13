@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildPluginManifest,
+  pluginSendParamsZod,
   pluginConfigZod,
   reassessmentStartParamsZod,
   REMOTE_CONTROL_VERBS,
@@ -43,7 +44,7 @@ describe("plugin manifest and config schema", () => {
     expect(REMOTE_CONTROL_VERBS).toContain("campaign-events");
   });
 
-  it("exposes one-turn permission modes in both send schemas", () => {
+  it("keeps one-turn permission modes on the internal send boundary", () => {
     expect(
       sendParamsZod.parse({
         name: "demo",
@@ -51,15 +52,23 @@ describe("plugin manifest and config schema", () => {
         permissionMode: "approve-all"
       }).permissionMode
     ).toBe("approve-all");
-    const permissionSchema = (
-      toolSendSchema as unknown as {
-        properties: { permissionMode: { anyOf?: Array<{ const?: string }> } };
-      }
-    ).properties.permissionMode;
-    expect(permissionSchema.anyOf?.map((entry) => entry.const)).toEqual([
-      "approve-reads",
-      "approve-all",
-      "deny-all"
-    ]);
+    expect(
+      sendParamsZod.safeParse({
+        name: "demo",
+        message: "Run the approved turn.",
+        permissionMode: "unrestricted"
+      }).success
+    ).toBe(false);
+    expect(
+      pluginSendParamsZod.safeParse({
+        name: "demo",
+        message: "Try to elevate from the plugin.",
+        permissionMode: "approve-all"
+      }).success
+    ).toBe(false);
+    const toolProperties = (
+      toolSendSchema as unknown as { properties: Record<string, unknown> }
+    ).properties;
+    expect(toolProperties).not.toHaveProperty("permissionMode");
   });
 });

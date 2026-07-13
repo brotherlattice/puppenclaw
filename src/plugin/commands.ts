@@ -19,13 +19,13 @@ import {
   focusParamsZod,
   forkParamsZod,
   logsParamsZod,
+  pluginSendParamsZod,
   projectCreateParamsZod,
   reassessmentReportParamsZod,
   reassessmentStartParamsZod,
   reassessmentStatusParamsZod,
   resumeParamsZod,
   siteStatusParamsZod,
-  sendParamsZod,
   startParamsZod,
   statusParamsZod,
   stopParamsZod,
@@ -712,7 +712,7 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
             };
           }
           case "send": {
-            const params = sendParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            const params = pluginSendParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
             requestedFormat = params.format;
             if (remote) {
               const session = await resolveSessionForRemoteVerb(params.name);

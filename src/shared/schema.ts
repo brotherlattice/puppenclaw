@@ -468,6 +468,10 @@ export const sendParamsZod = z
   })
   .strict();
 
+export const pluginSendParamsZod = sendParamsZod
+  .omit({ permissionMode: true })
+  .strict();
+
 export const stopParamsZod = z
   .object({
     name: nonEmptyString,
@@ -803,13 +807,6 @@ export const toolSendSchema = Type.Object({
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")])),
   stream: Type.Optional(Type.Boolean()),
   ultrathink: Type.Optional(Type.Boolean()),
-  permissionMode: Type.Optional(
-    Type.Union([
-      Type.Literal("approve-reads"),
-      Type.Literal("approve-all"),
-      Type.Literal("deny-all")
-    ])
-  ),
   contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 })))
 });
 

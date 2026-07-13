@@ -277,7 +277,7 @@ describe("AcpxSessionManager", () => {
     const acpxCommand = await resolveFakeAcpxCommand();
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
     const manager = new AcpxSessionManager({
-      config: makeConfig({ acpxCommand }),
+      config: makeConfig({ acpxCommand, permissionMode: "approve-all" }),
       logger: {
         info() {},
         warn() {},
@@ -293,6 +293,7 @@ describe("AcpxSessionManager", () => {
       name: "turn-permission-demo",
       directory: workspaceDir,
       task: "REPORT_PERMISSION_MODE",
+      permissionMode: "approve-reads",
       contextFiles: []
     });
     expect((started.details as { output: string }).output).toBe(
@@ -309,6 +310,16 @@ describe("AcpxSessionManager", () => {
     expect(approvedDetails.output).toBe("Permission mode: approve-all");
     expect(approvedDetails.session.permissionMode).toBe("approve-reads");
 
+    const denied = await manager.send({
+      name: "turn-permission-demo",
+      message: "REPORT_PERMISSION_MODE",
+      permissionMode: "deny-all",
+      contextFiles: []
+    });
+    const deniedDetails = denied.details as { session: SessionInfo; output: string };
+    expect(deniedDetails.output).toBe("Permission mode: deny-all");
+    expect(deniedDetails.session.permissionMode).toBe("approve-reads");
+
     const following = await manager.send({
       name: "turn-permission-demo",
       message: "REPORT_PERMISSION_MODE",
@@ -317,6 +328,53 @@ describe("AcpxSessionManager", () => {
     const followingDetails = following.details as { session: SessionInfo; output: string };
     expect(followingDetails.output).toBe("Permission mode: approve-reads");
     expect(followingDetails.session.permissionMode).toBe("approve-reads");
+  });
+
+  it("allows a lower permission mode for one turn without lowering the baseline", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-lower-turn-permission-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand, permissionMode: "approve-all" }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const started = await manager.start({
+      agent: "claude",
+      name: "lower-turn-permission-demo",
+      directory: workspaceDir,
+      task: "REPORT_PERMISSION_MODE",
+      contextFiles: []
+    });
+    expect((started.details as { output: string }).output).toBe(
+      "Permission mode: approve-all"
+    );
+
+    const lowered = await manager.send({
+      name: "lower-turn-permission-demo",
+      message: "REPORT_PERMISSION_MODE",
+      permissionMode: "approve-reads",
+      contextFiles: []
+    });
+    const loweredDetails = lowered.details as { session: SessionInfo; output: string };
+    expect(loweredDetails.output).toBe("Permission mode: approve-reads");
+    expect(loweredDetails.session.permissionMode).toBe("approve-all");
+
+    const following = await manager.send({
+      name: "lower-turn-permission-demo",
+      message: "REPORT_PERMISSION_MODE",
+      contextFiles: []
+    });
+    const followingDetails = following.details as { session: SessionInfo; output: string };
+    expect(followingDetails.output).toBe("Permission mode: approve-all");
+    expect(followingDetails.session.permissionMode).toBe("approve-all");
   });
 
   it("preserves leading and whitespace-only assistant text chunks", async () => {

@@ -1786,9 +1786,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private effectivePermissionMode(session: SessionInfo): PermissionMode {
-    return this.deps.config.permissionMode === "approve-all"
-      ? "approve-all"
-      : session.permissionMode;
+    return session.permissionMode;
   }
 
   private modelProviderRuntimeEnv(
@@ -2316,7 +2314,9 @@ export class AcpxSessionManager implements ISessionManager {
             : {})
         });
         return await this.runTurn({
-          ...params,
+          session: params.session,
+          promptText: params.promptText,
+          permissionMode: params.permissionMode,
           retryAfterReconnect: true,
           ...(baselineMessageCount != null ? { baselineMessageCount } : {})
         });
