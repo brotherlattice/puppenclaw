@@ -7,6 +7,7 @@ import {
   reassessmentStartParamsZod,
   REMOTE_CONTROL_VERBS,
   sendParamsZod,
+  startParamsZod,
   toolSendSchema
 } from "../../src/shared/schema.js";
 
@@ -70,5 +71,34 @@ describe("plugin manifest and config schema", () => {
       toolSendSchema as unknown as { properties: Record<string, unknown> }
     ).properties;
     expect(toolProperties).not.toHaveProperty("permissionMode");
+  });
+
+  it.each(["xhigh", "max", "ultra"] as const)(
+    "accepts the Codex %s reasoning level on start and follow-up turns",
+    (effort) => {
+      expect(
+        startParamsZod.parse({
+          agent: "codex",
+          name: "demo",
+          directory: "/tmp/demo",
+          task: "Use the requested reasoning level.",
+          effort
+        }).effort
+      ).toBe(effort);
+      expect(
+        sendParamsZod.parse({
+          name: "demo",
+          message: "Keep using the requested reasoning level.",
+          effort
+        }).effort
+      ).toBe(effort);
+    }
+  );
+
+  it("exposes a follow-up effort override through the send tool", () => {
+    const toolProperties = (
+      toolSendSchema as unknown as { properties: Record<string, unknown> }
+    ).properties;
+    expect(toolProperties).toHaveProperty("effort");
   });
 });

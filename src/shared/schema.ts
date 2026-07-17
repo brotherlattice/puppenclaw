@@ -58,7 +58,14 @@ const skillNameString = nonEmptyString.regex(/^[a-zA-Z0-9._-]+$/u);
 export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
 export const permissionModeZod = z.enum(["approve-reads", "approve-all", "deny-all"]);
-export const effortLevelZod = z.enum(["low", "medium", "high"]);
+export const effortLevelZod = z.enum([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra"
+]);
 export const planningProfileZod = z.enum(["off", "quick", "deep"]);
 export const responseFormatZod = z.enum(["text", "json"]);
 export const exposureModeZod = z.enum(["read-only", "execute"]);
@@ -463,6 +470,7 @@ export const sendParamsZod = z
     format: responseFormatZod.optional(),
     stream: z.boolean().optional(),
     ultrathink: z.boolean().optional(),
+    effort: effortLevelZod.optional(),
     permissionMode: permissionModeZod.optional(),
     contextFiles: z.array(nonEmptyString).default([])
   })
@@ -773,7 +781,14 @@ export const toolStartSchema = Type.Object({
     ])
   ),
   effort: Type.Optional(
-    Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])
+    Type.Union([
+      Type.Literal("low"),
+      Type.Literal("medium"),
+      Type.Literal("high"),
+      Type.Literal("xhigh"),
+      Type.Literal("max"),
+      Type.Literal("ultra")
+    ])
   ),
   planningProfile: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])
@@ -807,6 +822,16 @@ export const toolSendSchema = Type.Object({
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")])),
   stream: Type.Optional(Type.Boolean()),
   ultrathink: Type.Optional(Type.Boolean()),
+  effort: Type.Optional(
+    Type.Union([
+      Type.Literal("low"),
+      Type.Literal("medium"),
+      Type.Literal("high"),
+      Type.Literal("xhigh"),
+      Type.Literal("max"),
+      Type.Literal("ultra")
+    ])
+  ),
   contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 })))
 });
 
@@ -847,7 +872,14 @@ export const toolForkSchema = Type.Object({
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")])),
   model: Type.Optional(Type.String({ minLength: 1 })),
   effort: Type.Optional(
-    Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])
+    Type.Union([
+      Type.Literal("low"),
+      Type.Literal("medium"),
+      Type.Literal("high"),
+      Type.Literal("xhigh"),
+      Type.Literal("max"),
+      Type.Literal("ultra")
+    ])
   )
 });
 
@@ -878,7 +910,14 @@ export const toolProjectCreateSchema = Type.Object({
     ])
   ),
   effort: Type.Optional(
-    Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])
+    Type.Union([
+      Type.Literal("low"),
+      Type.Literal("medium"),
+      Type.Literal("high"),
+      Type.Literal("xhigh"),
+      Type.Literal("max"),
+      Type.Literal("ultra")
+    ])
   ),
   model: Type.Optional(Type.String({ minLength: 1 })),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))

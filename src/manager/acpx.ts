@@ -1136,6 +1136,8 @@ export class AcpxSessionManager implements ISessionManager {
   async send(params: SendParams): Promise<ToolResult> {
     return await this.withSessionTurnLock(params.name, async () => {
     const session = this.requireSession(params.name);
+    const effectiveSession =
+      params.effort == null ? session : { ...session, effort: params.effort };
     if (!isConnectedSession(session)) {
       await this.ensureConnectedCapacity(params.name);
     }
@@ -1149,26 +1151,31 @@ export class AcpxSessionManager implements ISessionManager {
       });
     }
     const context = await loadContextFiles(session.directory, params.contextFiles);
-    const prefix = params.ultrathink ? "Use a high-effort reasoning pass for this reply.\n\n" : "";
+    const prefix =
+      params.effort != null
+        ? `Use a ${params.effort}-effort reasoning pass for this reply.\n\n`
+        : params.ultrathink
+          ? "Use a high-effort reasoning pass for this reply.\n\n"
+          : "";
     const promptText = [prefix + params.message.trim(), context.promptText].filter(Boolean).join("\n\n");
     const runtimePromptText =
       session.state === "suspended"
         ? this.buildRehydrationPrompt(session, promptText)
         : promptText;
-    const effectivePromptText = this.usesOneShotRuntime(session)
-      ? this.buildOneShotContinuationPrompt(session, runtimePromptText)
+    const effectivePromptText = this.usesOneShotRuntime(effectiveSession)
+      ? this.buildOneShotContinuationPrompt(effectiveSession, runtimePromptText)
       : runtimePromptText;
     const effectivePermissionMode =
       params.permissionMode ?? this.effectivePermissionMode(session);
     const turn = await this.runTurn({
-      session,
+      session: effectiveSession,
       promptText: effectivePromptText,
       permissionMode: effectivePermissionMode
     });
     const stoppedDuringTurn = this.stopRequests.delete(params.name);
 
     const nextSession: SessionInfo = {
-      ...session,
+      ...effectiveSession,
       permissionMode:
         params.permissionMode == null ? effectivePermissionMode : session.permissionMode,
       state: stoppedDuringTurn ? "stopped" : turn.state,

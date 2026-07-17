@@ -501,6 +501,60 @@ describe("AcpxSessionManager", () => {
     expect(denyAllPrompt).toContain("Answer without tools.");
   });
 
+  it("applies and persists an Ultra effort override for Codex follow-up turns", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-codex-ultra-");
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ agentCommands: { codex: codexCommand } }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const modelProvider = {
+      id: "codex-openai",
+      kind: "codex-openai" as const,
+      model: "gpt-5.6-sol"
+    };
+
+    await manager.start({
+      agent: "codex",
+      name: "codex-ultra-demo",
+      directory: workspaceDir,
+      task: "Start with the provider default.",
+      contextFiles: [],
+      modelProvider
+    });
+
+    const upgraded = await manager.send({
+      name: "codex-ultra-demo",
+      message: "Use Ultra for this and later turns.",
+      effort: "ultra",
+      contextFiles: []
+    });
+    const upgradedArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-1.json"), "utf8")
+    ) as string[];
+    expect(upgradedArgs).toContain('model_reasoning_effort="ultra"');
+    expect((upgraded.details as { session: SessionInfo }).session.effort).toBe("ultra");
+
+    await manager.send({
+      name: "codex-ultra-demo",
+      message: "Keep the stored effort.",
+      contextFiles: []
+    });
+    const followingArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-2.json"), "utf8")
+    ) as string[];
+    expect(followingArgs).toContain('model_reasoning_effort="ultra"');
+    expect(store.getSession("codex-ultra-demo")?.effort).toBe("ultra");
+  });
+
   it("preserves leading and whitespace-only assistant text chunks", async () => {
     const workspaceDir = await createTempDir("puppenclaw-whitespace-");
     const acpxCommand = await resolveWhitespaceFakeAcpxCommand(workspaceDir);
