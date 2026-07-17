@@ -85,6 +85,13 @@ session_file() {
   printf '%s/%s.session' "$state_dir" "$1"
 }
 
+setting_file() {
+  local name="$1"
+  local key="$2"
+  key="${key//[^a-zA-Z0-9_.-]/_}"
+  printf '%s/%s.%s.setting' "$state_dir" "$name" "$key"
+}
+
 session_exists() {
   [[ -f "$(session_file "$1")" ]]
 }
@@ -148,6 +155,19 @@ if [[ "${command[0]:-}" == "cancel" && "${command[1]:-}" == "--session" && -n "$
     write_session "$name" "alive" "$(read_session_agent "$name")"
   fi
   emit_json '{"status":"cancelled"}'
+  exit 0
+fi
+
+if [[ "${command[0]:-}" == "set" && -n "${command[1]:-}" && -n "${command[2]:-}" && "${command[3]:-}" == "--session" && -n "${command[4]:-}" ]]; then
+  key="${command[1]}"
+  value="${command[2]}"
+  name="${command[4]}"
+  if ! session_exists "$name"; then
+    emit_json '{"jsonrpc":"2.0","id":null,"error":{"code":-32002,"message":"No acpx session found","data":{"acpxCode":"NO_SESSION","origin":"cli","sessionId":"unknown"}}}'
+    exit 4
+  fi
+  printf '%s\n' "$value" > "$(setting_file "$name" "$key")"
+  emit_json "{\"status\":\"set\",\"session\":\"$(json_escape "$name")\",\"key\":\"$(json_escape "$key")\",\"value\":\"$(json_escape "$value")\"}"
   exit 0
 fi
 

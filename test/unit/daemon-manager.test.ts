@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { DaemonSessionManager } from "../../src/manager/daemon.js";
 import { createDaemonServer } from "../../src/daemon/server.js";
 import { OutputRouter } from "../../src/plugin/output-router.js";
+import { REASONING_CAPABILITIES } from "../../src/shared/reasoning.js";
 import type { SessionInfo } from "../../src/shared/types.js";
 import { createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
 
@@ -32,6 +33,7 @@ describe("DaemonSessionManager", () => {
         sessionOutput?: boolean;
         sessionPurge?: boolean;
         sessionSkills?: boolean;
+        reasoning?: unknown;
         maxSessions?: { min?: number; max?: number; current?: number };
       };
 
@@ -41,6 +43,7 @@ describe("DaemonSessionManager", () => {
       expect(payload.sessionOutput).toBe(true);
       expect(payload.sessionPurge).toBe(true);
       expect(payload.sessionSkills).toBe(true);
+      expect(payload.reasoning).toEqual(REASONING_CAPABILITIES);
       expect(payload.maxSessions).toEqual({
         min: 1,
         max: 100,

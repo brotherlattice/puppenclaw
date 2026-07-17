@@ -3820,7 +3820,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         this.deps.config.agentCommands[agent] ??
         this.deps.config.acpxCommand ??
         (agent === "claude"
-          ? "npx -y @zed-industries/claude-agent-acp"
+          ? "npx -y @agentclientprotocol/claude-agent-acp"
           : "npx @zed-industries/codex-acp"),
       configured: true
     }));

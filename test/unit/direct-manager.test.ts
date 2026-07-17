@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
@@ -553,6 +553,217 @@ describe("AcpxSessionManager", () => {
     ) as string[];
     expect(followingArgs).toContain('model_reasoning_effort="ultra"');
     expect(store.getSession("codex-ultra-demo")?.effort).toBe("ultra");
+  });
+
+  it("applies Claude reasoning natively across start, follow-up, resume, and fork", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-claude-reasoning-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const settingPath = (name: string) =>
+      join(workspaceDir, ".fake-acpx-state", `${name}.effort.setting`);
+
+    const started = await manager.start({
+      agent: "claude",
+      name: "claude-reasoning-demo",
+      directory: workspaceDir,
+      task: "Use the selected reasoning mode.",
+      effort: "ultra",
+      contextFiles: []
+    });
+    const startedSession = (started.details as { session: SessionInfo }).session;
+    expect(await readFile(settingPath("claude-reasoning-demo"), "utf8")).toBe("max\n");
+    expect(startedSession).toMatchObject({
+      effort: "ultra",
+      effectiveEffort: "max",
+      runtimeEffort: "max",
+      reasoningProfile: "claude"
+    });
+    expect(startedSession.warnings).toContain(
+      'Claude does not define an "ultra" effort level; legacy Ultra was mapped to Claude Max.'
+    );
+
+    const upgraded = await manager.send({
+      name: "claude-reasoning-demo",
+      message: "Use XHigh from this turn onward.",
+      effort: "xhigh",
+      ultrathink: true,
+      contextFiles: []
+    });
+    const upgradedSession = (upgraded.details as { session: SessionInfo }).session;
+    expect(await readFile(settingPath("claude-reasoning-demo"), "utf8")).toBe("xhigh\n");
+    expect(upgradedSession).toMatchObject({
+      effort: "xhigh",
+      effectiveEffort: "xhigh",
+      runtimeEffort: "xhigh",
+      reasoningProfile: "claude"
+    });
+    expect(upgradedSession.transcript.at(-2)?.text).toBe("Use XHigh from this turn onward.");
+
+    await unlink(settingPath("claude-reasoning-demo"));
+    await manager.resume({ name: "claude-reasoning-demo" });
+    expect(await readFile(settingPath("claude-reasoning-demo"), "utf8")).toBe("xhigh\n");
+
+    await manager.fork({
+      source: "claude-reasoning-demo",
+      target: "claude-reasoning-fork"
+    });
+    expect(await readFile(settingPath("claude-reasoning-fork"), "utf8")).toBe("xhigh\n");
+  });
+
+  it("rejects Claude Ultracode before creating an ACP runtime", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-claude-ultracode-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    await expect(
+      manager.start({
+        agent: "claude",
+        name: "claude-ultracode-demo",
+        directory: workspaceDir,
+        task: "Try the workflow mode.",
+        effort: "ultracode",
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({
+      code: "UNAVAILABLE_REASONING_MODE"
+    });
+    await expect(
+      readFile(
+        join(workspaceDir, ".fake-acpx-state", "claude-ultracode-demo.session"),
+        "utf8"
+      )
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses Codex's native reasoning_effort ACP setting", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-codex-native-reasoning-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    await manager.start({
+      agent: "codex",
+      name: "codex-native-reasoning-demo",
+      directory: workspaceDir,
+      task: "Use the native Codex setting.",
+      effort: "xhigh",
+      contextFiles: []
+    });
+
+    expect(
+      await readFile(
+        join(
+          workspaceDir,
+          ".fake-acpx-state",
+          "codex-native-reasoning-demo.reasoning_effort.setting"
+        ),
+        "utf8"
+      )
+    ).toBe("xhigh\n");
+  });
+
+  it("normalizes GLM-5.2 aliases before launching the Codex-compatible runtime", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-glm-reasoning-");
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ agentCommands: { codex: codexCommand } }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const modelProvider = {
+      id: "local-glm",
+      kind: "codex-openai-compatible" as const,
+      model: "zai-org/GLM-5.2",
+      reasoningProfile: "glm-5.2" as const
+    };
+
+    const started = await manager.start({
+      agent: "codex",
+      name: "glm-reasoning-demo",
+      directory: workspaceDir,
+      task: "Use standard GLM thinking.",
+      effort: "low",
+      contextFiles: [],
+      modelProvider
+    });
+    const startArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-0.json"), "utf8")
+    ) as string[];
+    const startedSession = (started.details as { session: SessionInfo }).session;
+    expect(startArgs).toContain('model_reasoning_effort="high"');
+    expect(startedSession).toMatchObject({
+      effort: "low",
+      effectiveEffort: "high",
+      runtimeEffort: "high",
+      reasoningProfile: "glm-5.2"
+    });
+
+    const maximum = await manager.send({
+      name: "glm-reasoning-demo",
+      message: "Use the maximum GLM tier.",
+      effort: "ultracode",
+      contextFiles: []
+    });
+    const maximumArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-1.json"), "utf8")
+    ) as string[];
+    expect(maximumArgs).toContain('model_reasoning_effort="max"');
+    expect((maximum.details as { session: SessionInfo }).session).toMatchObject({
+      effort: "ultracode",
+      effectiveEffort: "max",
+      runtimeEffort: "max",
+      reasoningProfile: "glm-5.2"
+    });
+
+    await manager.send({
+      name: "glm-reasoning-demo",
+      message: "Disable GLM thinking.",
+      effort: "none",
+      contextFiles: []
+    });
+    const disabledArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-2.json"), "utf8")
+    ) as string[];
+    expect(disabledArgs).toContain('model_reasoning_effort="minimal"');
   });
 
   it("preserves leading and whitespace-only assistant text chunks", async () => {

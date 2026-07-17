@@ -16,6 +16,11 @@ import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
 import type { OutputRouter } from "../shared/output-router.js";
 import { killProcessTree } from "../shared/process-tree.js";
+import {
+  acceptedReasoningModes,
+  reasoningProfileFor,
+  resolveReasoningMode
+} from "../shared/reasoning.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import type {
   AgentKind,
@@ -133,6 +138,13 @@ function isRecord(value: unknown): value is JsonRecord {
 
 function asTrimmedString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function isReasoningOptionRejection(error: unknown): boolean {
+  const message = ensureError(error).message;
+  return /(?:unknown config option.*(?:effort|reasoning_effort)|invalid value for config option (?:effort|reasoning_effort)|(?:effort|reasoning).*not (?:available|supported)|unsupported.*(?:effort|reasoning))/iu.test(
+    message
+  );
 }
 
 function asOptionalString(value: unknown): string | undefined {
@@ -1024,7 +1036,7 @@ export class AcpxSessionManager implements ISessionManager {
 
     const installedSkills = await this.installSessionSkills(directory, requestedSkills);
     const installedSkillNames = installedSkills.map((skill) => skill.name);
-    const session = existing ?? this.createSession({
+    const baseSession = existing ?? this.createSession({
       name: params.name,
       agent: params.agent,
       directory,
@@ -1037,6 +1049,12 @@ export class AcpxSessionManager implements ISessionManager {
       ...(installedSkillNames.length > 0 ? { skills: installedSkillNames } : {}),
       createdAt: now
     });
+    const requestedSession =
+      existing != null && params.effort != null
+        ? { ...baseSession, effort: params.effort }
+        : baseSession;
+    const reasoning = this.resolveSessionReasoning(requestedSession);
+    const session = reasoning.session;
     const sessionSkills = dedupeSkillNames([
       ...(session.skills ?? []),
       ...installedSkillNames
@@ -1044,6 +1062,7 @@ export class AcpxSessionManager implements ISessionManager {
 
     const warnings = dedupeWarnings([
       ...session.warnings,
+      ...(reasoning.warning != null ? [reasoning.warning] : []),
       ...this.resolveCapabilityWarnings({
         agent: params.agent,
         ...(params.model != null ? { model: params.model } : {}),
@@ -1058,6 +1077,7 @@ export class AcpxSessionManager implements ISessionManager {
         agent: params.agent,
         directory,
         ...(params.model ?? session.model ? { model: params.model ?? session.model } : {}),
+        ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
         ...(params.modelProvider ?? session.modelProvider
           ? { modelProvider: params.modelProvider ?? session.modelProvider }
           : {})
@@ -1136,27 +1156,34 @@ export class AcpxSessionManager implements ISessionManager {
   async send(params: SendParams): Promise<ToolResult> {
     return await this.withSessionTurnLock(params.name, async () => {
     const session = this.requireSession(params.name);
-    const effectiveSession =
+    const requestedSession =
       params.effort == null ? session : { ...session, effort: params.effort };
+    const reasoning = this.resolveSessionReasoning(requestedSession);
+    const effectiveSession = reasoning.session;
     if (!isConnectedSession(session)) {
       await this.ensureConnectedCapacity(params.name);
     }
-    if (!this.usesOneShotRuntime(session)) {
+    if (!this.usesOneShotRuntime(effectiveSession)) {
       await this.ensureRuntimeSession({
-        name: session.name,
-        agent: session.agent,
-        directory: session.directory,
-        ...(session.model != null ? { model: session.model } : {}),
-        ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+        name: effectiveSession.name,
+        agent: effectiveSession.agent,
+        directory: effectiveSession.directory,
+        ...(effectiveSession.model != null ? { model: effectiveSession.model } : {}),
+        ...(effectiveSession.runtimeEffort != null
+          ? { effort: effectiveSession.runtimeEffort }
+          : {}),
+        ...(effectiveSession.modelProvider != null
+          ? { modelProvider: effectiveSession.modelProvider }
+          : {})
       });
     }
     const context = await loadContextFiles(session.directory, params.contextFiles);
     const prefix =
-      params.effort != null
-        ? `Use a ${params.effort}-effort reasoning pass for this reply.\n\n`
-        : params.ultrathink
-          ? "Use a high-effort reasoning pass for this reply.\n\n"
-          : "";
+      effectiveSession.effort == null && params.ultrathink === true
+        ? effectiveSession.reasoningProfile === "claude"
+          ? "ultrathink\n\n"
+          : "Use a high-effort reasoning pass for this reply.\n\n"
+        : "";
     const promptText = [prefix + params.message.trim(), context.promptText].filter(Boolean).join("\n\n");
     const runtimePromptText =
       session.state === "suspended"
@@ -1180,7 +1207,11 @@ export class AcpxSessionManager implements ISessionManager {
         params.permissionMode == null ? effectivePermissionMode : session.permissionMode,
       state: stoppedDuringTurn ? "stopped" : turn.state,
       lastActivity: nowIso(),
-      warnings: dedupeWarnings([...session.warnings, ...turn.warnings]),
+      warnings: dedupeWarnings([
+        ...session.warnings,
+        ...(reasoning.warning != null ? [reasoning.warning] : []),
+        ...turn.warnings
+      ]),
       transcript: mergeTranscript(session.transcript, [
         ...makeUserTranscript(promptText),
         ...turn.transcript
@@ -1251,7 +1282,9 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async resume(params: ResumeParams): Promise<ToolResult> {
-    const session = this.requireSession(params.name);
+    const storedSession = this.requireSession(params.name);
+    const reasoning = this.resolveSessionReasoning(storedSession);
+    const session = reasoning.session;
     if (!isConnectedSession(session)) {
       await this.ensureConnectedCapacity(session.name);
     }
@@ -1261,12 +1294,17 @@ export class AcpxSessionManager implements ISessionManager {
         agent: session.agent,
         directory: session.directory,
         ...(session.model != null ? { model: session.model } : {}),
+        ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
         ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
       });
     }
     const nextSession: SessionInfo = {
       ...session,
-      state: "idle"
+      state: "idle",
+      warnings: dedupeWarnings([
+        ...session.warnings,
+        ...(reasoning.warning != null ? [reasoning.warning] : [])
+      ])
     };
     await this.deps.store.upsertSession(nextSession);
     return textToolResult(`Resumed session ${params.name}.`, {
@@ -1814,6 +1852,53 @@ export class AcpxSessionManager implements ISessionManager {
     return session.permissionMode;
   }
 
+  private resolveSessionReasoning(session: SessionInfo): {
+    session: SessionInfo;
+    warning?: string;
+  } {
+    const profile = reasoningProfileFor(session);
+    if (session.effort == null) {
+      return {
+        session: {
+          ...session,
+          reasoningProfile: profile
+        }
+      };
+    }
+    const resolution = resolveReasoningMode(session, session.effort);
+    if (resolution == null) {
+      if (profile === "claude" && session.effort === "ultracode") {
+        throw new PuppenclawError(
+          "UNAVAILABLE_REASONING_MODE",
+          "Claude Ultracode is exposed as a future workflow capability, but the current ACP boundary cannot safely execute its approval, progress, background-run, and multiplexing lifecycle.",
+          {
+            profile,
+            requested: session.effort,
+            accepted: acceptedReasoningModes(profile)
+          }
+        );
+      }
+      throw new PuppenclawError(
+        "UNSUPPORTED_REASONING_MODE",
+        `Reasoning mode "${session.effort}" is not supported by the ${profile} profile.`,
+        {
+          profile,
+          requested: session.effort,
+          accepted: acceptedReasoningModes(profile)
+        }
+      );
+    }
+    return {
+      session: {
+        ...session,
+        reasoningProfile: resolution.profile,
+        effectiveEffort: resolution.effective,
+        runtimeEffort: resolution.runtimeValue
+      },
+      ...(resolution.warning != null ? { warning: resolution.warning } : {})
+    };
+  }
+
   private modelProviderRuntimeEnv(
     modelProvider: ModelProviderConfig | undefined
   ): NodeJS.ProcessEnv | undefined {
@@ -1837,6 +1922,9 @@ export class AcpxSessionManager implements ISessionManager {
         : {}),
       ...(modelProvider.wireApi != null
         ? { PUPPENCLAW_MODEL_PROVIDER_WIRE_API: modelProvider.wireApi }
+        : {}),
+      ...(modelProvider.reasoningProfile != null
+        ? { PUPPENCLAW_MODEL_PROVIDER_REASONING_PROFILE: modelProvider.reasoningProfile }
         : {})
     };
   }
@@ -1881,11 +1969,6 @@ export class AcpxSessionManager implements ISessionManager {
     if (params.model != null) {
       warnings.push(
         `Requested model override "${params.model}" is forwarded to the selected agent runtime.`
-      );
-    }
-    if (params.effort != null) {
-      warnings.push(
-        `Requested effort "${params.effort}" is forwarded when the selected runtime supports effort controls.`
       );
     }
     if (params.planningProfile != null) {
@@ -1963,11 +2046,13 @@ export class AcpxSessionManager implements ISessionManager {
     agent: AgentKind;
     directory: string;
     model?: string;
+    effort?: EffortLevel;
     modelProvider?: ModelProviderConfig;
   }): Promise<void> {
     const runtimeEnv = this.modelProviderRuntimeEnv(params.modelProvider);
     const status = await this.getRuntimeStatus(params);
-    if (!status.exists || status.status === "dead") {
+    const createdRuntime = !status.exists || status.status === "dead";
+    if (createdRuntime) {
       const args = this.buildVerbArgs(params.agent, params.directory, [
         "sessions",
         "new",
@@ -1984,10 +2069,10 @@ export class AcpxSessionManager implements ISessionManager {
       await this.runControlCommand({
         args: this.buildVerbArgs(params.agent, params.directory, [
           "set",
-          "--session",
-          params.name,
           "model",
-          params.model
+          params.model,
+          "--session",
+          params.name
         ]),
         cwd: params.directory,
         ...(runtimeEnv != null ? { env: runtimeEnv } : {})
@@ -1995,6 +2080,46 @@ export class AcpxSessionManager implements ISessionManager {
         this.deps.logger.warn(
           `Unable to set ACPX model for session ${params.name}: ${ensureError(error).message}`
         );
+      });
+    }
+    if (params.effort != null) {
+      const effortConfigId = params.agent === "claude" ? "effort" : "reasoning_effort";
+      await this.runControlCommand({
+        args: this.buildVerbArgs(params.agent, params.directory, [
+          "set",
+          effortConfigId,
+          params.effort,
+          "--session",
+          params.name
+        ]),
+        cwd: params.directory,
+        ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+      }).catch(async (error) => {
+        const cause = ensureError(error).message;
+        if (createdRuntime) {
+          await this.runControlCommand({
+            args: this.buildVerbArgs(params.agent, params.directory, [
+              "sessions",
+              "close",
+              params.name
+            ]),
+            cwd: params.directory,
+            ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+          }).catch(() => {
+            // Best-effort cleanup of a runtime that never became usable.
+          });
+        }
+        if (isReasoningOptionRejection(error)) {
+          throw new PuppenclawError(
+            "UNSUPPORTED_REASONING_MODE",
+            `ACP runtime rejected reasoning mode "${params.effort}" for session ${params.name}: ${cause}`,
+            {
+              agent: params.agent,
+              requested: params.effort
+            }
+          );
+        }
+        throw error;
       });
     }
     await this.waitForRuntimeSessionReady(params);
@@ -2442,8 +2567,8 @@ export class AcpxSessionManager implements ISessionManager {
       "--output-last-message",
       outputPath,
       ...(params.session.model != null ? ["-m", params.session.model] : []),
-      ...(params.session.effort != null
-        ? ["-c", `model_reasoning_effort="${params.session.effort}"`]
+      ...(params.session.runtimeEffort != null
+        ? ["-c", `model_reasoning_effort="${params.session.runtimeEffort}"`]
         : []),
       "-"
     ];

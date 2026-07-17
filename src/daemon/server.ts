@@ -8,6 +8,7 @@ import { OrchestratorRuntime } from "../orchestrator/runtime.js";
 import { OrchestratorStore } from "../orchestrator/store.js";
 import type { PluginLogger } from "../shared/logger.js";
 import { OutputRouter, type OutputRouteEvent } from "../shared/output-router.js";
+import { REASONING_CAPABILITIES } from "../shared/reasoning.js";
 import { SessionStore } from "../shared/store.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import {
@@ -127,6 +128,7 @@ export async function createDaemonServer(params: {
     sessionFocus: true,
     sessionFork: true,
     sessionSkills: true,
+    reasoning: REASONING_CAPABILITIES,
     maxSessions: {
       min: 1,
       max: 100,

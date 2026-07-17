@@ -1,5 +1,6 @@
 import type { z } from "zod";
 
+import type { ReasoningProfile } from "./reasoning.js";
 import type {
   agentKindZod,
   backendZod,
@@ -190,6 +191,9 @@ export type SessionInfo = {
   focusedUntil?: string;
   permissionMode: PermissionMode;
   effort?: EffortLevel;
+  effectiveEffort?: EffortLevel;
+  runtimeEffort?: EffortLevel;
+  reasoningProfile?: ReasoningProfile;
   planningProfile?: PlanningProfile;
   model?: string;
   modelProviderId?: string;

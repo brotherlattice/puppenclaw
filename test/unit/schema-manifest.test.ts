@@ -2,13 +2,16 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildPluginManifest,
-  pluginSendParamsZod,
   pluginConfigZod,
+  pluginSendParamsZod,
+  projectCreateParamsZod,
   reassessmentStartParamsZod,
   REMOTE_CONTROL_VERBS,
   sendParamsZod,
   startParamsZod,
-  toolSendSchema
+  toolProjectCreateSchema,
+  toolSendSchema,
+  toolStartSchema
 } from "../../src/shared/schema.js";
 
 describe("plugin manifest and config schema", () => {
@@ -101,4 +104,53 @@ describe("plugin manifest and config schema", () => {
     ).properties;
     expect(toolProperties).toHaveProperty("effort");
   });
+
+  it.each(["none", "minimal", "ultracode"] as const)(
+    "accepts and exposes provider-specific reasoning mode %s",
+    (effort) => {
+      expect(
+        startParamsZod.parse({
+          agent: "codex",
+          name: "provider-demo",
+          directory: "/tmp/provider-demo",
+          task: "Use the provider-specific reasoning mode.",
+          effort,
+          modelProvider: {
+            id: "local-glm",
+            model: "zai-org/GLM-5.2",
+            reasoningProfile: "glm-5.2"
+          }
+        }).effort
+      ).toBe(effort);
+
+      const startProperties = (
+        toolStartSchema as unknown as {
+          properties: { effort: { anyOf: Array<{ const: string }> } };
+        }
+      ).properties;
+      expect(startProperties.effort.anyOf.map((entry) => entry.const)).toContain(effort);
+    }
+  );
+
+  it.each(["none", "minimal", "ultracode"] as const)(
+    "rejects provider-specific reasoning mode %s for mixed-agent projects",
+    (effort) => {
+      expect(
+        projectCreateParamsZod.safeParse({
+          name: "mixed-project",
+          rootDir: "/tmp/mixed-project",
+          effort
+        }).success
+      ).toBe(false);
+
+      const projectProperties = (
+        toolProjectCreateSchema as unknown as {
+          properties: { effort: { anyOf: Array<{ const: string }> } };
+        }
+      ).properties;
+      expect(projectProperties.effort.anyOf.map((entry) => entry.const)).not.toContain(
+        effort
+      );
+    }
+  );
 });

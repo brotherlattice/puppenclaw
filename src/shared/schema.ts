@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { REASONING_MODE_VALUES } from "./reasoning.ts";
 import { Type } from "./typebox-lite.ts";
 
 export const PACKAGE_NAME = "@puppenclaw/openclaw-plugin";
@@ -47,7 +48,7 @@ export const REMOTE_CONTROL_VERBS = [
   "cost"
 ] as const;
 export const DEFAULT_ACPX_AGENT_COMMANDS = {
-  claude: "npx -y @zed-industries/claude-agent-acp",
+  claude: "npx -y @agentclientprotocol/claude-agent-acp",
   codex: "npx @zed-industries/codex-acp"
 } as const;
 
@@ -58,7 +59,8 @@ const skillNameString = nonEmptyString.regex(/^[a-zA-Z0-9._-]+$/u);
 export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
 export const permissionModeZod = z.enum(["approve-reads", "approve-all", "deny-all"]);
-export const effortLevelZod = z.enum([
+export const effortLevelZod = z.enum(REASONING_MODE_VALUES);
+export const projectEffortLevelZod = z.enum([
   "low",
   "medium",
   "high",
@@ -78,6 +80,7 @@ export const modelProviderConfigZod = z
       .enum(["claude-code", "codex-openai", "codex-openai-compatible"])
       .optional(),
     model: nonEmptyString,
+    reasoningProfile: z.enum(["claude", "codex", "glm-5.2"]).optional(),
     baseUrl: nonEmptyString.optional(),
     authTokenEnv: nonEmptyString.optional(),
     wireApi: z.enum(["responses"]).optional()
@@ -273,7 +276,7 @@ export const projectCreateParamsZod = z
     fusionPreferredAgent: agentKindZod.optional(),
     planningProfile: planningProfileZod.optional(),
     permissionMode: permissionModeZod.optional(),
-    effort: effortLevelZod.optional(),
+    effort: projectEffortLevelZod.optional(),
     model: nonEmptyString.optional(),
     format: responseFormatZod.optional()
   })
@@ -767,6 +770,12 @@ export const pluginManifestConfigSchema = {
   }
 } as const;
 
+const reasoningModeType = () =>
+  Type.Union(REASONING_MODE_VALUES.map((mode) => Type.Literal(mode)));
+
+const projectReasoningModeType = () =>
+  Type.Union(projectEffortLevelZod.options.map((mode) => Type.Literal(mode)));
+
 export const toolStartSchema = Type.Object({
   agent: Type.Union([Type.Literal("claude"), Type.Literal("codex")]),
   name: Type.String({ minLength: 1 }),
@@ -780,16 +789,7 @@ export const toolStartSchema = Type.Object({
       Type.Literal("deny-all")
     ])
   ),
-  effort: Type.Optional(
-    Type.Union([
-      Type.Literal("low"),
-      Type.Literal("medium"),
-      Type.Literal("high"),
-      Type.Literal("xhigh"),
-      Type.Literal("max"),
-      Type.Literal("ultra")
-    ])
-  ),
+  effort: Type.Optional(reasoningModeType()),
   planningProfile: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])
   ),
@@ -807,6 +807,13 @@ export const toolStartSchema = Type.Object({
         ])
       ),
       model: Type.String({ minLength: 1 }),
+      reasoningProfile: Type.Optional(
+        Type.Union([
+          Type.Literal("claude"),
+          Type.Literal("codex"),
+          Type.Literal("glm-5.2")
+        ])
+      ),
       baseUrl: Type.Optional(Type.String({ minLength: 1 })),
       authTokenEnv: Type.Optional(Type.String({ minLength: 1 })),
       wireApi: Type.Optional(Type.Literal("responses"))
@@ -822,16 +829,7 @@ export const toolSendSchema = Type.Object({
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")])),
   stream: Type.Optional(Type.Boolean()),
   ultrathink: Type.Optional(Type.Boolean()),
-  effort: Type.Optional(
-    Type.Union([
-      Type.Literal("low"),
-      Type.Literal("medium"),
-      Type.Literal("high"),
-      Type.Literal("xhigh"),
-      Type.Literal("max"),
-      Type.Literal("ultra")
-    ])
-  ),
+  effort: Type.Optional(reasoningModeType()),
   contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 })))
 });
 
@@ -871,16 +869,7 @@ export const toolForkSchema = Type.Object({
   target: Type.String({ minLength: 1 }),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")])),
   model: Type.Optional(Type.String({ minLength: 1 })),
-  effort: Type.Optional(
-    Type.Union([
-      Type.Literal("low"),
-      Type.Literal("medium"),
-      Type.Literal("high"),
-      Type.Literal("xhigh"),
-      Type.Literal("max"),
-      Type.Literal("ultra")
-    ])
-  )
+  effort: Type.Optional(reasoningModeType())
 });
 
 export const toolCostSchema = Type.Object({
@@ -909,16 +898,7 @@ export const toolProjectCreateSchema = Type.Object({
       Type.Literal("deny-all")
     ])
   ),
-  effort: Type.Optional(
-    Type.Union([
-      Type.Literal("low"),
-      Type.Literal("medium"),
-      Type.Literal("high"),
-      Type.Literal("xhigh"),
-      Type.Literal("max"),
-      Type.Literal("ultra")
-    ])
-  ),
+  effort: Type.Optional(projectReasoningModeType()),
   model: Type.Optional(Type.String({ minLength: 1 })),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")]))
 });

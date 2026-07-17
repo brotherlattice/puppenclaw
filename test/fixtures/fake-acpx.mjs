@@ -80,6 +80,11 @@ function sessionFile(name) {
   return join(stateDir, `${basename(name)}.session`);
 }
 
+function settingFile(name, key) {
+  const safeKey = String(key).replace(/[^A-Za-z0-9_.-]+/gu, "_");
+  return join(stateDir, `${basename(name)}.${safeKey}.setting`);
+}
+
 function readSession(name) {
   try {
     const [status = "alive", sessionAgent = agent] = readFileSync(sessionFile(name), "utf8").split(/\r?\n/u);
@@ -144,6 +149,31 @@ if (command[0] === "cancel" && command[1] === "--session" && command[2] != null)
     writeSession(name, "alive", session.agent);
   }
   emitJson('{"status":"cancelled"}');
+  process.exit(0);
+}
+
+if (
+  command[0] === "set" &&
+  command[1] != null &&
+  command[2] != null &&
+  command[3] === "--session" &&
+  command[4] != null
+) {
+  const key = command[1];
+  const value = command[2];
+  const name = command[4];
+  if (readSession(name) == null) {
+    emitJson(
+      '{"jsonrpc":"2.0","id":null,"error":{"code":-32002,"message":"No acpx session found","data":{"acpxCode":"NO_SESSION","origin":"cli","sessionId":"unknown"}}}'
+    );
+    process.exit(4);
+  }
+  writeFileSync(settingFile(name, key), `${value}\n`, "utf8");
+  emitJson(
+    `{"status":"set","session":"${jsonEscape(name)}","key":"${jsonEscape(
+      key
+    )}","value":"${jsonEscape(value)}"}`
+  );
   process.exit(0);
 }
 

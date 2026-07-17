@@ -55,7 +55,7 @@ If you install from the repo path, run `npm run build` first. `dist/` is not mea
 - working ACP adapter commands for the agents you plan to use
 
 Default ACP adapter commands:
-- Claude: `npx -y @zed-industries/claude-agent-acp`
+- Claude: `npx -y @agentclientprotocol/claude-agent-acp`
 - Codex: `npx @zed-industries/codex-acp`
 
 Puppenclaw does not log you into model providers for you. Make sure the ACP adapter you plan to use already works on that machine before blaming Puppenclaw.
@@ -71,7 +71,7 @@ Puppenclaw launches ACP agents in two layers:
   - the actual ACP adapters that `acpx` runs
   - examples:
     - `npx @zed-industries/codex-acp`
-    - `npx -y @zed-industries/claude-agent-acp`
+    - `npx -y @agentclientprotocol/claude-agent-acp`
 
 The execution path is:
 
@@ -110,7 +110,7 @@ Example local config:
           "defaultAgent": "codex",
           "agentCommands": {
             "codex": "npx @zed-industries/codex-acp",
-            "claude": "npx -y @zed-industries/claude-agent-acp"
+            "claude": "npx -y @agentclientprotocol/claude-agent-acp"
           }
         }
       }
@@ -132,7 +132,7 @@ Local development fallback example:
           "acpxCommand": "/absolute/path/to/acpx",
           "agentCommands": {
             "codex": "env HOME=/home/your-user npx @zed-industries/codex-acp",
-            "claude": "env HOME=/home/your-user npx -y @zed-industries/claude-agent-acp"
+            "claude": "env HOME=/home/your-user npx -y @agentclientprotocol/claude-agent-acp"
           }
         }
       }
@@ -203,7 +203,7 @@ Minimal local mode:
           "sessionTtlMinutes": 60,
           "streamOutput": true,
           "agentCommands": {
-            "claude": "npx -y @zed-industries/claude-agent-acp",
+            "claude": "npx -y @agentclientprotocol/claude-agent-acp",
             "codex": "npx @zed-industries/codex-acp"
           },
           "mcpServers": {},
@@ -254,7 +254,7 @@ Daemon mode:
           "permissionMode": "approve-reads",
           "streamOutput": true,
           "agentCommands": {
-            "claude": "npx -y @zed-industries/claude-agent-acp",
+            "claude": "npx -y @agentclientprotocol/claude-agent-acp",
             "codex": "npx @zed-industries/codex-acp"
           },
           "orchestration": {
@@ -283,6 +283,26 @@ For direct one-shot Codex providers, `approve-reads` runs `codex exec` with
 their outer sandbox. Codex has no exact Puppenclaw `deny-all` process flag, so Puppenclaw uses the
 read-only sandbox and adds explicit no-tool guidance to the prompt. That guidance is defense in
 depth, not a hard no-read/no-tool boundary.
+
+### Provider reasoning controls
+
+Session start and follow-up requests accept an optional `effort` value. Puppenclaw resolves that
+value against the selected provider rather than assuming that every backend uses the same scale:
+
+| Provider profile | Canonical controls | Compatibility behavior |
+| --- | --- | --- |
+| Claude Code | `low`, `medium`, `high`, `xhigh`, `max` | Legacy `ultra` maps to `max`. `ultracode` is exposed separately as an unavailable workflow capability; it is not an effort alias. |
+| Codex | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | The selected tier is forwarded to the runtime. |
+| GLM-5.2 | `none` (shown as Off), `high`, `max` | `minimal` maps to Off; `low` and `medium` map to High; `xhigh`, `ultra`, and `ultracode` map to Max. |
+
+GLM-5.2 is detected from its model identifier. For a relay that uses an opaque model name, set
+`modelProvider.reasoningProfile` to `glm-5.2` explicitly.
+
+Provider or model support still governs whether a forwarded setting is usable. In particular,
+Claude Ultracode is not another name for Max. Puppenclaw exposes it in capability metadata but
+marks it unavailable: the current ACP boundary cannot safely represent Ultracode's approval,
+progress, background-run, and multiplexing lifecycle. A Claude Ultracode request therefore fails
+clearly instead of silently substituting Max or a prompt instruction.
 
 ### Config Notes
 
