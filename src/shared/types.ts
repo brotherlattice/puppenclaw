@@ -120,6 +120,29 @@ export type SessionState =
   | "failed"
   | "stopped";
 
+export type ActiveTurnLifecycleState =
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped"
+  | "orphaned";
+
+export type ActiveTurnMetadata = {
+  id: string;
+  state: ActiveTurnLifecycleState;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  pid?: number;
+  processGroupId?: number;
+  processStartIdentity?: string;
+  lastOutputAt?: string;
+  outputChars: number;
+  exitCode?: number | null;
+  signal?: string | null;
+  error?: string;
+};
+
 /**
  * Canonical four-bucket per-turn token usage, mirroring OpenClaw core's
  * NormalizedUsage. `total` is the sum of the four buckets.
@@ -202,6 +225,7 @@ export type SessionInfo = {
   transcript: SessionTranscriptEntry[];
   handle?: AcpxSessionHandle;
   lastStopReason?: string;
+  activeTurn?: ActiveTurnMetadata;
   source?: SessionSourceInfo;
   origin?: ConversationScope;
 };

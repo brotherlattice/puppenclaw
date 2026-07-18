@@ -1107,7 +1107,8 @@ process.exit(1);
       text: "leftover output",
       startedAt: staleActivity,
       updatedAt: staleActivity,
-      complete: true
+      complete: true,
+      totalChars: "leftover output".length
     });
 
     await manager.gc();
