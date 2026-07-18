@@ -714,6 +714,18 @@ describe("AcpxSessionManager", () => {
     expect(details.turn.processAlive).toBe(false);
     expect(details.turn.identityMatches).toBe(false);
     expect(details.turn.conflict).toContain("different process");
+
+    const persisted = store.getSession("orphaned-demo");
+    expect(persisted).not.toBeNull();
+    expect(manager["isTurnActive"](persisted as SessionInfo)).toBe(false);
+
+    const listed = await manager.status();
+    const listedDetails = listed.details as {
+      sessions: Array<SessionInfo & { turn: { classification: string } }>;
+    };
+    const orphaned = listedDetails.sessions.find((entry) => entry.name === "orphaned-demo");
+    expect(orphaned?.state).toBe("failed");
+    expect(orphaned?.turn.classification).toBe("orphaned");
   });
 
   it("reports a failed Codex follow-up turn instead of stale prior assistant output", async () => {
