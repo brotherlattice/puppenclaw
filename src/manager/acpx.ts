@@ -91,6 +91,30 @@ type ActiveTurnProcess = {
   turnId: string;
 };
 
+type ActiveTurnRuntimeStatus = {
+  classification:
+    | "inactive"
+    | "starting"
+    | "running"
+    | "completed"
+    | "failed"
+    | "stopped"
+    | "orphaned";
+  lockHeld: boolean;
+  trackedChild: boolean;
+  processAlive: boolean | null;
+  identityMatches: boolean | null;
+  pid: number | null;
+  processGroupId: number | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  lastOutputAt: string | null;
+  outputChars: number;
+  ageMs: number | null;
+  outputAgeMs: number | null;
+  conflict: string | null;
+};
+
 type SpawnCommand = {
   command: string;
   args: string[];
@@ -1437,16 +1461,24 @@ export class AcpxSessionManager implements ISessionManager {
 
   async status(params: StatusParams = {}): Promise<ToolResult> {
     if (params.name == null) {
+      const sessions = await Promise.all(
+        this.deps.store.listSessions().map(async (session) => {
+          const reconciled = await this.reconcileVisibleSession(session);
+          return {
+            ...reconciled.session,
+            turn: reconciled.turn
+          };
+        })
+      );
       return jsonToolResult(
         {
-          sessions: this.deps.store
-            .listSessions()
-            .map((session) => this.decorateVisibleSession(session))
+          sessions
         },
         "Tracked Puppenclaw sessions"
       );
     }
-    const session = this.decorateVisibleSession(this.requireSession(params.name));
+    const reconciled = await this.reconcileVisibleSession(this.requireSession(params.name));
+    const session = reconciled.session;
     const runtimeStatus = await this.getRuntimeStatus({
       name: session.name,
       agent: session.agent,
@@ -1455,7 +1487,8 @@ export class AcpxSessionManager implements ISessionManager {
     });
     const details = {
       session,
-      runtime: runtimeStatus
+      runtime: runtimeStatus,
+      turn: reconciled.turn
     };
     return jsonToolResult(details, `Status for ${params.name}`);
   }
@@ -1465,6 +1498,7 @@ export class AcpxSessionManager implements ISessionManager {
       throw new PuppenclawError("MISSING_SESSION", "Session name is required.");
     }
     const session = this.requireSession(params.name);
+    const reconciled = await this.reconcileVisibleSession(session);
     const active = this.activeTurnOutputs.get(params.name);
     const runningActive = active != null && !active.complete ? active : undefined;
     const latestTranscriptOutput = [...session.transcript]
@@ -1486,7 +1520,8 @@ export class AcpxSessionManager implements ISessionManager {
       : latestTranscriptOutput?.text ?? active?.text ?? "";
     return jsonToolResult(
       {
-        session: this.decorateVisibleSession(session),
+        session: reconciled.session,
+        turn: reconciled.turn,
         output: {
           text,
           chars: text.length,
@@ -1672,19 +1707,124 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private isTurnActive(session: SessionInfo): boolean {
-    return this.activeTurns.has(session.name) || session.state === "running";
+    const tracked = this.activeTurnProcesses.get(session.name)?.child;
+    return (
+      this.activeTurns.has(session.name) ||
+      (tracked != null && tracked.exitCode == null && tracked.signalCode == null)
+    );
   }
 
-  private decorateVisibleSession(session: SessionInfo): SessionInfo {
-    if (this.stopRequests.has(session.name)) {
-      return session;
+  private async reconcileVisibleSession(session: SessionInfo): Promise<{
+    session: SessionInfo;
+    turn: ActiveTurnRuntimeStatus;
+  }> {
+    const turn = await this.activeTurnRuntimeStatus(session);
+    if (turn.classification === "orphaned") {
+      const warning =
+        "Persisted active turn has no matching live process; the turn is orphaned.";
+      return {
+        session: {
+          ...session,
+          state: "failed",
+          lastError: session.lastError ?? warning,
+          warnings: dedupeWarnings([...session.warnings, warning]),
+          ...(session.activeTurn != null
+            ? {
+                activeTurn: {
+                  ...session.activeTurn,
+                  state: "orphaned"
+                }
+              }
+            : {})
+        },
+        turn
+      };
     }
-    if (!this.activeTurns.has(session.name)) {
-      return session;
+    if (turn.classification === "running" || turn.classification === "starting") {
+      return {
+        session: {
+          ...session,
+          state: "running"
+        },
+        turn
+      };
     }
+    return { session, turn };
+  }
+
+  private async activeTurnRuntimeStatus(
+    session: SessionInfo
+  ): Promise<ActiveTurnRuntimeStatus> {
+    const activeTurn = session.activeTurn;
+    const lockHeld = this.activeTurns.has(session.name);
+    const tracked = this.activeTurnProcesses.get(session.name);
+    const trackedChild = tracked != null;
+    const pid = tracked?.child.pid ?? activeTurn?.pid ?? null;
+    const observedIdentity = pid != null ? await readLinuxProcessIdentity(pid) : null;
+    const expectedIdentity = activeTurn?.processStartIdentity;
+    const identityMatches =
+      expectedIdentity == null
+        ? observedIdentity == null
+          ? null
+          : true
+        : observedIdentity == null
+          ? false
+          : observedIdentity.processStartIdentity === expectedIdentity;
+    const trackedChildRunning =
+      tracked != null && tracked.child.exitCode == null && tracked.child.signalCode == null;
+    const processAlive =
+      pid == null
+        ? null
+        : process.platform === "linux"
+          ? observedIdentity != null && identityMatches !== false
+          : trackedChild
+            ? trackedChildRunning
+            : null;
+    let classification: ActiveTurnRuntimeStatus["classification"] = "inactive";
+    let conflict: string | null = null;
+    if (activeTurn?.state === "running") {
+      if (processAlive === true || trackedChildRunning) {
+        classification = "running";
+      } else if (pid == null && lockHeld) {
+        classification = "starting";
+      } else {
+        classification = "orphaned";
+        conflict =
+          pid == null
+            ? "turn metadata says running but no process identity was recorded"
+            : identityMatches === false
+              ? "recorded PID is absent or belongs to a different process"
+              : "turn metadata says running but process liveness is unverified";
+      }
+    } else if (activeTurn != null) {
+      classification = activeTurn.state;
+      if (lockHeld || trackedChildRunning) {
+        conflict = `turn metadata says ${activeTurn.state} while an in-memory turn remains active`;
+      }
+    } else if (lockHeld || trackedChildRunning) {
+      classification = pid == null ? "starting" : "running";
+      conflict = "in-memory turn activity has no persisted lifecycle metadata";
+    }
+    const nowMs = Date.now();
+    const startedMs = activeTurn?.startedAt != null ? Date.parse(activeTurn.startedAt) : Number.NaN;
+    const outputMs =
+      activeTurn?.lastOutputAt != null ? Date.parse(activeTurn.lastOutputAt) : Number.NaN;
     return {
-      ...session,
-      state: "running"
+      classification,
+      lockHeld,
+      trackedChild,
+      processAlive,
+      identityMatches,
+      pid,
+      processGroupId:
+        observedIdentity?.processGroupId ?? activeTurn?.processGroupId ?? null,
+      startedAt: activeTurn?.startedAt ?? null,
+      updatedAt: activeTurn?.updatedAt ?? null,
+      lastOutputAt: activeTurn?.lastOutputAt ?? null,
+      outputChars: activeTurn?.outputChars ?? 0,
+      ageMs: Number.isFinite(startedMs) ? Math.max(0, nowMs - startedMs) : null,
+      outputAgeMs: Number.isFinite(outputMs) ? Math.max(0, nowMs - outputMs) : null,
+      conflict
     };
   }
 
