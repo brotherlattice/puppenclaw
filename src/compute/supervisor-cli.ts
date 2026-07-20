@@ -31,8 +31,7 @@ function bubblewrapCommand(spec: ReturnType<typeof computeJobSpecZod.parse>): {
       "--ro-bind",
       "/",
       "/",
-      "--dev-bind",
-      "/dev",
+      "--dev",
       "/dev",
       "--proc",
       "/proc",
@@ -196,4 +195,3 @@ main().catch((error) => {
   console.error(error instanceof Error ? error.stack ?? error.message : String(error));
   process.exitCode = 1;
 });
-

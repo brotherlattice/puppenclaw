@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { computeExecutorCapabilities } from "../../src/compute/capabilities.js";
-import { isPathWithinRoots } from "../../src/compute/runtime.js";
+import {
+  executorConstraintError,
+  isPathWithinRoots,
+} from "../../src/compute/runtime.js";
 import { ComputeStore } from "../../src/compute/store.js";
 import { createTempDir } from "../helpers.js";
 
@@ -16,6 +19,25 @@ describe("managed compute runtime", () => {
     expect(capabilities.find((entry) => entry.id === "bubblewrap-local")?.available).toBe(false);
     expect(capabilities.find((entry) => entry.id === "rootless-docker")?.available).toBe(false);
     expect(capabilities.find((entry) => entry.id === "slurm")?.available).toBe(false);
+  });
+
+  it("rejects GPU requests until device allocation is enforceable", () => {
+    expect(
+      executorConstraintError({
+        jobId: "job-gpu",
+        executor: "bubblewrap-local",
+        command: ["true"],
+        cwd: "/share/work/chat",
+        env: {},
+        resources: {
+          cpuCores: 1,
+          memoryMiB: 128,
+          wallTimeSeconds: 30,
+          gpuCount: 1,
+          diskMiB: 0,
+        },
+      }),
+    ).toMatch(/device isolation/iu);
   });
 
   it("persists job identity and state in sqlite", async () => {

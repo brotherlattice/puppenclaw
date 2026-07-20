@@ -28,6 +28,13 @@ export function isPathWithinRoots(candidate: string, roots: readonly string[]): 
   });
 }
 
+export function executorConstraintError(spec: ComputeJobSpec): string | null {
+  if (spec.executor === "bubblewrap-local" && spec.resources.gpuCount > 0) {
+    return "Bubblewrap GPU allocation is unavailable because device isolation cannot be enforced.";
+  }
+  return null;
+}
+
 export class ComputeRuntime {
   private constructor(
     private readonly store: ComputeStore,
@@ -87,6 +94,8 @@ export class ComputeRuntime {
     if (!capability?.available) {
       throw new Error(capability?.reason ?? `Executor ${spec.executor} is unavailable.`);
     }
+    const constraintError = executorConstraintError(spec);
+    if (constraintError) throw new Error(constraintError);
     const normalizedSpec: ComputeJobSpec = { ...spec, cwd };
     const jobDir = join(this.rootDir, "jobs", spec.jobId);
     await ensureDir(jobDir);
