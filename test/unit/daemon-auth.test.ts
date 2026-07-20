@@ -31,6 +31,11 @@ describe("daemon auth", () => {
 
       const usage = await app.inject({ method: "GET", url: "/usage" });
       expect(usage.statusCode).toBe(401);
+      const computeCapacity = await app.inject({
+        method: "GET",
+        url: "/compute/capacity"
+      });
+      expect(computeCapacity.statusCode).toBe(401);
 
       // Writes without the header are rejected.
       const gc = await app.inject({ method: "POST", url: "/gc" });
@@ -74,6 +79,12 @@ describe("daemon auth", () => {
         headers: { authorization: "Bearer secret-token" }
       });
       expect(authorizedUsage.statusCode).toBe(200);
+      const authorizedComputeCapacity = await app.inject({
+        method: "GET",
+        url: "/compute/capacity",
+        headers: { authorization: "Bearer secret-token" }
+      });
+      expect(authorizedComputeCapacity.statusCode).toBe(200);
     } finally {
       await app.close();
     }
