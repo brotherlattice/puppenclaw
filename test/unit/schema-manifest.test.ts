@@ -115,6 +115,79 @@ describe("plugin manifest and config schema", () => {
     ).toBe(false);
   });
 
+  it("keeps lifecycle epochs on the authenticated daemon boundary", () => {
+    expect(
+      startParamsZod.parse({
+        agent: "claude",
+        name: "fenced-start",
+        directory: "/tmp/fenced-start",
+        task: "Resume the current lifecycle.",
+        lifecycleEpoch: 7
+      }).lifecycleEpoch
+    ).toBe(7);
+    expect(
+      sendParamsZod.parse({
+        name: "fenced-send",
+        message: "Continue the current lifecycle.",
+        lifecycleEpoch: 8
+      }).lifecycleEpoch
+    ).toBe(8);
+    expect(
+      pluginStartParamsZod.safeParse({
+        agent: "claude",
+        name: "fenced-start",
+        directory: "/tmp/fenced-start",
+        task: "Try to supply an internal lifecycle epoch.",
+        lifecycleEpoch: 7
+      }).success
+    ).toBe(false);
+    expect(
+      pluginSendParamsZod.safeParse({
+        name: "fenced-send",
+        message: "Try to supply an internal lifecycle epoch.",
+        lifecycleEpoch: 8
+      }).success
+    ).toBe(false);
+    expect(
+      (toolStartSchema as unknown as { properties: Record<string, unknown> }).properties
+    ).not.toHaveProperty("lifecycleEpoch");
+    expect(
+      (toolSendSchema as unknown as { properties: Record<string, unknown> }).properties
+    ).not.toHaveProperty("lifecycleEpoch");
+  });
+
+  it("keeps follow-up model-provider refresh on the authenticated daemon boundary", () => {
+    const refresh = {
+      modelProviderId: "local-glm",
+      modelProvider: {
+        id: "local-glm",
+        kind: "codex-openai-compatible" as const,
+        model: "zai-org/GLM-5.2",
+        baseUrl: "http://127.0.0.1:18000/v1",
+        wireApi: "responses" as const
+      }
+    };
+    expect(
+      sendParamsZod.parse({
+        name: "provider-refresh",
+        message: "Continue with the current provider configuration.",
+        ...refresh
+      })
+    ).toMatchObject(refresh);
+    expect(
+      pluginSendParamsZod.safeParse({
+        name: "provider-refresh",
+        message: "Try to refresh a provider from the plugin.",
+        ...refresh
+      }).success
+    ).toBe(false);
+    const toolProperties = (
+      toolSendSchema as unknown as { properties: Record<string, unknown> }
+    ).properties;
+    expect(toolProperties).not.toHaveProperty("modelProviderId");
+    expect(toolProperties).not.toHaveProperty("modelProvider");
+  });
+
   it.each(["xhigh", "max", "ultra"] as const)(
     "accepts the Codex %s reasoning level on start and follow-up turns",
     (effort) => {

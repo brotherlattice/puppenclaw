@@ -138,18 +138,28 @@ export async function createDaemonServer(params: {
     sessionStartStream: true,
     sessionSend: true,
     sessionSendStream: true,
+    sessionModelProviderRefresh: true,
     interactionModes: ["plan", "execute"],
+    codexTurnPolicy: {
+      version: 1,
+      serverControlled: true,
+      userExecutionMarkersTrusted: false
+    },
     structuredTurnSignals: true,
     structuredOutputEvents: true,
     sessionOutput: true,
     sessionPurge: true,
+    sessionPurgeTransientFencing: true,
     sessionQuiesce: true,
     sessionQuiesceRelease: true,
     sessionQuiescence: {
-      version: 1,
+      version: 2,
       durable: true,
       releaseRequired: true,
-      mutationFencing: true
+      mutationFencing: true,
+      dispatchEpoch: true,
+      unknownSessionFencing: true,
+      historyPersistent: true
     },
     sessionSuspend: true,
     sessionFocus: true,
@@ -495,6 +505,8 @@ function daemonStatusForError(code: string): number {
       return 404;
     case "SESSION_QUIESCED":
     case "STALE_QUIESCENCE_EPOCH":
+    case "LIFECYCLE_EPOCH_REQUIRED":
+    case "STALE_LIFECYCLE_EPOCH":
     case "TURN_ALREADY_RUNNING":
       return 409;
     case "QUIESCENCE_UNAVAILABLE":
@@ -507,19 +519,39 @@ function daemonStatusForError(code: string): number {
 
 function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unknown> | null {
   if (
-    !["SESSION_QUIESCED", "STALE_QUIESCENCE_EPOCH", "QUIESCENCE_UNAVAILABLE"].includes(
-      error.code
-    ) ||
+    ![
+      "NO_SESSION",
+      "SESSION_QUIESCED",
+      "STALE_QUIESCENCE_EPOCH",
+      "LIFECYCLE_EPOCH_REQUIRED",
+      "STALE_LIFECYCLE_EPOCH",
+      "QUIESCENCE_UNAVAILABLE"
+    ].includes(error.code) ||
     error.details == null
   ) {
     return null;
   }
   const details: Record<string, unknown> = {};
-  for (const key of ["name", "quiescenceEpoch", "requestedEpoch", "activeEpoch", "lastEpoch"]) {
+  for (const key of [
+    "name",
+    "quiescenceEpoch",
+    "requestedEpoch",
+    "activeEpoch",
+    "latestEpoch",
+    "lastEpoch"
+  ]) {
     const value = error.details[key];
-    if (typeof value === "string" || typeof value === "number" || value === null) {
+    if (
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean" ||
+      value === null
+    ) {
       details[key] = value;
     }
+  }
+  if (error.details.transientFence === true) {
+    details.transientFence = true;
   }
   return details;
 }
@@ -574,10 +606,14 @@ async function streamToolResult(params: {
     write({ kind: "done" });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const lifecycleDetails =
+      error instanceof PuppenclawError ? daemonLifecycleErrorDetails(error) : null;
     write({
       kind: "error",
       sessionName: params.sessionName,
-      text: message
+      text: message,
+      ...(error instanceof PuppenclawError ? { code: error.code } : {}),
+      ...(lifecycleDetails != null ? { details: lifecycleDetails } : {})
     });
     write({ kind: "done" });
   } finally {

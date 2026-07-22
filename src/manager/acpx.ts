@@ -414,6 +414,28 @@ function buildCodexPermissionPrompt(promptText: string, mode: PermissionMode): s
   ].join("\n");
 }
 
+type CodexTurnPolicy =
+  | "default"
+  | "plan-no-tools"
+  | "execute-tools"
+  | "deny-all-no-tools";
+
+function deriveCodexTurnPolicy(
+  interactionMode: InteractionMode | undefined,
+  permissionMode: PermissionMode
+): CodexTurnPolicy {
+  if (permissionMode === "deny-all") {
+    return "deny-all-no-tools";
+  }
+  if (interactionMode === "plan") {
+    return "plan-no-tools";
+  }
+  if (interactionMode === "execute") {
+    return "execute-tools";
+  }
+  return "default";
+}
+
 function parseJsonLines(value: string): JsonRecord[] {
   const events: JsonRecord[] = [];
   for (const line of value.split(/\r?\n/u)) {
@@ -493,6 +515,18 @@ function extractCodexLiveOutput(event: JsonRecord): string | undefined {
     return undefined;
   }
 
+  // Tool protocol records are exposed only through structured activity
+  // events. Check them before generic message/delta extraction because some
+  // compatible providers wrap tool calls in message-shaped envelopes.
+  const toolName = extractToolCallName(event, subject);
+  if (
+    toolName != null ||
+    isToolCallEvent(type, subjectType) ||
+    isToolOutputEvent(type, subjectType)
+  ) {
+    return undefined;
+  }
+
   const assistantText = extractVisibleContentText(subject.content).join("");
   if (assistantText.length > 0 && isAssistantLikeEvent(type, subject)) {
     return assistantText;
@@ -506,24 +540,6 @@ function extractCodexLiveOutput(event: JsonRecord): string | undefined {
         : undefined;
   if (deltaText != null) {
     return deltaText;
-  }
-
-  const toolName = extractToolCallName(event, subject);
-  if (toolName != null || isToolCallEvent(type, subjectType)) {
-    const name = toolName ?? "tool";
-    const args = extractToolCallArguments(event, subject);
-    return `\n[tool] ${name}${args != null ? ` ${truncateOneLine(args, 280)}` : ""}\n`;
-  }
-
-  if (isToolOutputEvent(type, subjectType)) {
-    const output =
-      asOptionalString(subject.output) ??
-      asOptionalString(subject.result) ??
-      asOptionalString(event.output) ??
-      extractVisibleContentText(subject.content).join("");
-    if (output != null && output.length > 0) {
-      return `\n[tool output]\n${tailText(output, MAX_CODEX_EVENT_TEXT_CHARS)}\n`;
-    }
   }
 
   if (type === "error" || subjectType === "error") {
@@ -1308,7 +1324,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async start(params: StartParams): Promise<ToolResult> {
-    return await this.withSessionTurnLock(params.name, async () => {
+    return await this.withSessionTurnLock(params.name, params.lifecycleEpoch, async () => {
       const directory = resolvePath(params.directory);
       const now = nowIso();
       const requestedSkills = validateSkillNames(params.skills ?? []);
@@ -1482,12 +1498,20 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async send(params: SendParams): Promise<ToolResult> {
-    return await this.withSessionTurnLock(params.name, async () => {
-      const session = this.requireSession(params.name);
+    return await this.withSessionTurnLock(params.name, params.lifecycleEpoch, async () => {
+      const storedSession = this.requireSession(params.name);
+      const providerRefresh = await this.prepareModelProviderRefresh(storedSession, params);
+      const session = providerRefresh.session;
       const requestedSession =
         params.effort == null ? session : { ...session, effort: params.effort };
       const reasoning = this.resolveSessionReasoning(requestedSession);
       const effectiveSession = reasoning.session;
+      if (providerRefresh.refreshed) {
+        // Persist the daemon-validated provider selection before launching the
+        // external turn. A failed provider turn must not make the next retry
+        // silently fall back to stale endpoint or model metadata.
+        await this.deps.store.upsertSession(effectiveSession);
+      }
       if (!isConnectedSession(session)) {
         await this.ensureConnectedCapacity(params.name);
       }
@@ -1619,34 +1643,36 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async resume(params: ResumeParams): Promise<ToolResult> {
-    this.deps.store.assertSessionMutable(params.name);
-    const storedSession = this.requireSession(params.name);
-    const reasoning = this.resolveSessionReasoning(storedSession);
-    const session = reasoning.session;
-    if (!isConnectedSession(session)) {
-      await this.ensureConnectedCapacity(session.name);
-    }
-    if (!this.usesOneShotRuntime(session)) {
-      await this.ensureRuntimeSession({
-        name: session.name,
-        agent: session.agent,
-        directory: session.directory,
-        ...(session.model != null ? { model: session.model } : {}),
-        ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
-        ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+    return await this.withLifecycleLock(params.name, async () => {
+      this.deps.store.assertSessionMutable(params.name);
+      const storedSession = this.requireSession(params.name);
+      const reasoning = this.resolveSessionReasoning(storedSession);
+      const session = reasoning.session;
+      if (!isConnectedSession(session)) {
+        await this.ensureConnectedCapacity(session.name);
+      }
+      if (!this.usesOneShotRuntime(session)) {
+        await this.ensureRuntimeSession({
+          name: session.name,
+          agent: session.agent,
+          directory: session.directory,
+          ...(session.model != null ? { model: session.model } : {}),
+          ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
+          ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+        });
+      }
+      const nextSession: SessionInfo = {
+        ...session,
+        state: "idle",
+        warnings: dedupeWarnings([
+          ...session.warnings,
+          ...(reasoning.warning != null ? [reasoning.warning] : [])
+        ])
+      };
+      await this.deps.store.upsertSession(nextSession);
+      return textToolResult(`Resumed session ${params.name}.`, {
+        session: nextSession
       });
-    }
-    const nextSession: SessionInfo = {
-      ...session,
-      state: "idle",
-      warnings: dedupeWarnings([
-        ...session.warnings,
-        ...(reasoning.warning != null ? [reasoning.warning] : [])
-      ])
-    };
-    await this.deps.store.upsertSession(nextSession);
-    return textToolResult(`Resumed session ${params.name}.`, {
-      session: nextSession
     });
   }
 
@@ -1695,44 +1721,46 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async fork(params: ForkParams): Promise<ToolResult> {
-    this.deps.store.assertSessionMutable(params.source);
-    this.deps.store.assertSessionMutable(params.target);
-    const source = this.requireSession(params.source);
-    if (this.deps.store.getSession(params.target) != null) {
-      throw new PuppenclawError(
-        "SESSION_EXISTS",
-        `Target session ${params.target} already exists.`
-      );
-    }
-    const transcriptText = source.transcript
-      .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
-      .join("\n\n");
-    const forkPrompt = [
-      `This is a fork of session ${source.name}.`,
-      "Treat the following transcript as prior context for the new branch.",
-      transcriptText
-    ].join("\n\n");
+    return await this.withLifecycleLock(params.source, async () => {
+      this.deps.store.assertSessionMutable(params.source);
+      this.deps.store.assertSessionMutable(params.target);
+      const source = this.requireSession(params.source);
+      if (this.deps.store.getSession(params.target) != null) {
+        throw new PuppenclawError(
+          "SESSION_EXISTS",
+          `Target session ${params.target} already exists.`
+        );
+      }
+      const transcriptText = source.transcript
+        .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
+        .join("\n\n");
+      const forkPrompt = [
+        `This is a fork of session ${source.name}.`,
+        "Treat the following transcript as prior context for the new branch.",
+        transcriptText
+      ].join("\n\n");
 
-    const startParams: StartParams = {
-      agent: source.agent,
-      name: params.target,
-      directory: source.directory,
-      task: forkPrompt,
-      permissionMode: source.permissionMode,
-      effort: params.effort ?? source.effort,
-      planningProfile: source.planningProfile,
-      model: params.model ?? source.model,
-      contextFiles: [],
-      skills: source.skills ?? []
-    };
-    if (source.modelProviderId != null) {
-      startParams.modelProviderId = source.modelProviderId;
-    }
-    if (source.modelProvider != null) {
-      startParams.modelProvider = source.modelProvider;
-    }
-    const result = await this.start(startParams);
-    return textToolResult(`Forked ${params.source} into ${params.target}.`, result.details);
+      const startParams: StartParams = {
+        agent: source.agent,
+        name: params.target,
+        directory: source.directory,
+        task: forkPrompt,
+        permissionMode: source.permissionMode,
+        effort: params.effort ?? source.effort,
+        planningProfile: source.planningProfile,
+        model: params.model ?? source.model,
+        contextFiles: [],
+        skills: source.skills ?? []
+      };
+      if (source.modelProviderId != null) {
+        startParams.modelProviderId = source.modelProviderId;
+      }
+      if (source.modelProvider != null) {
+        startParams.modelProvider = source.modelProvider;
+      }
+      const result = await this.start(startParams);
+      return textToolResult(`Forked ${params.source} into ${params.target}.`, result.details);
+    });
   }
 
   async listSkills(): Promise<ToolResult> {
@@ -1756,15 +1784,22 @@ export class AcpxSessionManager implements ISessionManager {
       );
     }
     const session = this.decorateVisibleSession(this.requireSession(params.name));
-    const runtimeStatus = await this.getRuntimeStatus({
-      name: session.name,
-      agent: session.agent,
-      directory: session.directory,
-      ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
-    });
+    const activeQuiescence = this.deps.store.getQuiescence(session.name);
+    const runtimeStatus =
+      activeQuiescence != null
+        ? { exists: false, status: "quiesced" }
+        : await this.getRuntimeStatus({
+            name: session.name,
+            agent: session.agent,
+            directory: session.directory,
+            ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+          });
     const details = {
       session,
-      runtime: runtimeStatus
+      runtime: runtimeStatus,
+      ...(activeQuiescence != null
+        ? { lifecycle: { quiesced: true, epoch: activeQuiescence.epoch } }
+        : {})
     };
     return jsonToolResult(details, `Status for ${params.name}`);
   }
@@ -1889,9 +1924,10 @@ export class AcpxSessionManager implements ISessionManager {
 
   async purge(params: StopParams): Promise<ToolResult> {
     return await this.withLifecycleLock(params.name, async () => {
-      const session = this.deps.store.getSession(params.name);
       const existingReservation = this.deps.store.getQuiescence(params.name);
-      if (session == null) {
+      const locallyTrackedTurn =
+        this.activeTurns.has(params.name) || this.activeTurnProcesses.has(params.name);
+      if (this.deps.store.getSession(params.name) == null) {
         if (existingReservation != null && existingReservation.purpose === "purge") {
           await this.deps.store.releaseQuiescence(params.name, existingReservation.epoch);
           this.stopRequests.delete(params.name);
@@ -1899,14 +1935,30 @@ export class AcpxSessionManager implements ISessionManager {
             sessionName: params.name,
             purged: true,
             alreadyAbsent: true,
-            quiescenceEpoch: existingReservation.epoch
+            quiescenceEpoch: existingReservation.epoch,
+            transientFence: true
           });
         }
-        throw new PuppenclawError("NO_SESSION", `Unknown session ${params.name}.`);
+        if (!locallyTrackedTurn) {
+          throw new PuppenclawError("NO_SESSION", `Unknown session ${params.name}.`, {
+            name: params.name,
+            transientFence: existingReservation == null
+          });
+        }
       }
       const reservation = await this.deps.store.reserveQuiescence(params.name, "purge");
       const epoch = reservation.epoch;
-      await this.closeQuiescedRuntime(session, epoch);
+      const session = this.deps.store.getSession(params.name);
+      if (session != null) {
+        await this.closeQuiescedRuntime(session, epoch, { locallyTrackedTurn });
+      } else {
+        const startedSession = await this.drainUnknownQuiescedTurn(params.name, epoch);
+        if (startedSession != null) {
+          await this.closeQuiescedRuntime(startedSession, epoch, {
+            locallyTrackedTurn: true
+          });
+        }
+      }
       await this.deps.store.removeSession(params.name);
       this.deps.outputRouter.clear(params.name);
       this.activeTurnOutputs.delete(params.name);
@@ -1918,22 +1970,28 @@ export class AcpxSessionManager implements ISessionManager {
       return textToolResult(`Purged session ${params.name}.`, {
         sessionName: params.name,
         purged: true,
-        quiescenceEpoch: epoch
+        quiescenceEpoch: epoch,
+        transientFence: reservation.purpose === "purge"
       });
     });
   }
 
   async quiesce(params: QuiesceParams): Promise<ToolResult> {
     return await this.withLifecycleLock(params.name, async () => {
-      const session = this.deps.store.getSession(params.name);
-      const activeReservation = this.deps.store.getQuiescence(params.name);
-      if (session == null && activeReservation == null) {
-        throw new PuppenclawError("NO_SESSION", `Unknown session ${params.name}.`);
-      }
       const reservation = await this.deps.store.reserveQuiescence(params.name, "external");
       const epoch = reservation.epoch;
+      const locallyTrackedTurn =
+        this.activeTurns.has(params.name) || this.activeTurnProcesses.has(params.name);
+      const session = this.deps.store.getSession(params.name);
       if (session != null) {
-        await this.closeQuiescedRuntime(session, epoch);
+        await this.closeQuiescedRuntime(session, epoch, { locallyTrackedTurn });
+      } else if (locallyTrackedTurn) {
+        const startedSession = await this.drainUnknownQuiescedTurn(params.name, epoch);
+        if (startedSession != null) {
+          await this.closeQuiescedRuntime(startedSession, epoch, {
+            locallyTrackedTurn: true
+          });
+        }
       }
       return textToolResult(`Quiesced session ${params.name}.`, {
         ...(session != null ? { session: this.decorateVisibleSession(session) } : {}),
@@ -1988,16 +2046,22 @@ export class AcpxSessionManager implements ISessionManager {
     }
   }
 
-  private async withSessionTurnLock<T>(name: string, run: () => Promise<T>): Promise<T> {
-    this.deps.store.assertSessionMutable(name);
-    if (this.activeTurns.has(name)) {
-      throw new PuppenclawError(
-        "TURN_ALREADY_RUNNING",
-        `Session ${name} is already running a turn.`
-      );
-    }
-    this.activeTurns.add(name);
-    this.stopRequests.delete(name);
+  private async withSessionTurnLock<T>(
+    name: string,
+    lifecycleEpoch: number | undefined,
+    run: () => Promise<T>
+  ): Promise<T> {
+    await this.withLifecycleLock(name, async () => {
+      if (this.activeTurns.has(name)) {
+        throw new PuppenclawError(
+          "TURN_ALREADY_RUNNING",
+          `Session ${name} is already running a turn.`
+        );
+      }
+      await this.deps.store.enterLifecycleTurn(name, lifecycleEpoch);
+      this.activeTurns.add(name);
+      this.stopRequests.delete(name);
+    });
     try {
       return await run();
     } finally {
@@ -2022,7 +2086,15 @@ export class AcpxSessionManager implements ISessionManager {
     }
   }
 
-  private async closeQuiescedRuntime(session: SessionInfo, epoch: number): Promise<void> {
+  private async closeQuiescedRuntime(
+    session: SessionInfo,
+    epoch: number,
+    options: { locallyTrackedTurn?: boolean } = {}
+  ): Promise<void> {
+    const oneShotRuntime = this.usesOneShotRuntime(session);
+    const locallyTrackedTurn =
+      options.locallyTrackedTurn ??
+      (this.activeTurns.has(session.name) || this.activeTurnProcesses.has(session.name));
     this.stopRequests.add(session.name);
     const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
     this.terminateActiveTurnProcess(session.name, "SIGTERM");
@@ -2050,7 +2122,15 @@ export class AcpxSessionManager implements ISessionManager {
       );
     }
 
-    if (this.usesOneShotRuntime(session)) {
+    if (oneShotRuntime) {
+      if (session.state === "running" && !locallyTrackedTurn) {
+        throw new PuppenclawError(
+          "QUIESCENCE_UNAVAILABLE",
+          `Direct one-shot runtime closure cannot be proved for session ${session.name} after manager restart.`,
+          { name: session.name, quiescenceEpoch: epoch }
+        );
+      }
+      await this.recordQuiescedSessionState(session.name, epoch);
       return;
     }
 
@@ -2080,6 +2160,7 @@ export class AcpxSessionManager implements ISessionManager {
         ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
       }).catch(() => ({ exists: true }));
       if (!status.exists) {
+        await this.recordQuiescedSessionState(session.name, epoch);
         return;
       }
       await sleep(QUIESCENCE_POLL_MS);
@@ -2089,6 +2170,32 @@ export class AcpxSessionManager implements ISessionManager {
       `ACP runtime closure could not be proved for session ${session.name}.`,
       { name: session.name, quiescenceEpoch: epoch }
     );
+  }
+
+  private async drainUnknownQuiescedTurn(
+    name: string,
+    epoch: number
+  ): Promise<SessionInfo | null> {
+    this.stopRequests.add(name);
+    this.terminateActiveTurnProcess(name, "SIGTERM");
+    const drained = await this.waitForActiveTurnDrain(name);
+    if (!drained) {
+      throw new PuppenclawError(
+        "QUIESCENCE_UNAVAILABLE",
+        `Initial start for session ${name} did not drain for quiescence epoch ${epoch}.`,
+        { name, quiescenceEpoch: epoch }
+      );
+    }
+    return this.deps.store.getSession(name);
+  }
+
+  private async recordQuiescedSessionState(name: string, epoch: number): Promise<void> {
+    await this.deps.store.patchQuiescedSession(name, epoch, (current) => ({
+      ...withoutFocusLease(current),
+      state: "stopped",
+      lastActivity: nowIso(),
+      lastStopReason: `quiesced at lifecycle epoch ${epoch}`
+    }));
   }
 
   private async waitForActiveTurnDrain(name: string): Promise<boolean> {
@@ -2110,6 +2217,14 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private decorateVisibleSession(session: SessionInfo): SessionInfo {
+    const activeQuiescence = this.deps.store.getQuiescence(session.name);
+    if (activeQuiescence != null) {
+      return {
+        ...session,
+        state: "stopped",
+        lastStopReason: `quiesced at lifecycle epoch ${activeQuiescence.epoch}`
+      };
+    }
     if (this.stopRequests.has(session.name)) {
       return session;
     }
@@ -2397,6 +2512,97 @@ export class AcpxSessionManager implements ISessionManager {
     modelProvider?: ModelProviderConfig;
   }): boolean {
     return session.agent === "codex" && session.modelProvider != null;
+  }
+
+  private async prepareModelProviderRefresh(
+    session: SessionInfo,
+    params: Pick<SendParams, "modelProviderId" | "modelProvider">
+  ): Promise<{ session: SessionInfo; refreshed: boolean }> {
+    const requestedId = params.modelProviderId;
+    const requestedProvider = params.modelProvider;
+    if (requestedId == null && requestedProvider == null) {
+      return { session, refreshed: false };
+    }
+    if (requestedId == null || requestedProvider == null) {
+      throw new PuppenclawError(
+        "MODEL_PROVIDER_REFRESH_INVALID",
+        "A daemon model-provider refresh requires both modelProviderId and modelProvider."
+      );
+    }
+    if (requestedId !== requestedProvider.id) {
+      throw new PuppenclawError(
+        "MODEL_PROVIDER_REFRESH_INVALID",
+        "modelProviderId must exactly match modelProvider.id."
+      );
+    }
+    if (
+      session.agent !== "codex" ||
+      !["codex-openai", "codex-openai-compatible"].includes(requestedProvider.kind ?? "")
+    ) {
+      throw new PuppenclawError(
+        "MODEL_PROVIDER_REFRESH_UNSUPPORTED",
+        "Model-provider refresh is restricted to Codex one-shot providers."
+      );
+    }
+
+    const storedIds = [session.modelProviderId, session.modelProvider?.id].filter(
+      (value): value is string => value != null
+    );
+    if (storedIds.some((storedId) => storedId !== requestedId)) {
+      throw new PuppenclawError(
+        "MODEL_PROVIDER_REFRESH_CONFLICT",
+        `Session ${session.name} is already bound to a different model provider.`
+      );
+    }
+
+    if (session.modelProvider == null) {
+      await this.closeLegacyRuntimeForProviderRefresh(session);
+    }
+
+    return {
+      session: {
+        ...session,
+        model: requestedProvider.model,
+        modelProviderId: requestedId,
+        modelProvider: requestedProvider
+      },
+      refreshed: true
+    };
+  }
+
+  private async closeLegacyRuntimeForProviderRefresh(session: SessionInfo): Promise<void> {
+    const status = await this.getRuntimeStatus({
+      name: session.name,
+      agent: session.agent,
+      directory: session.directory,
+      timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS
+    });
+    if (!status.exists || status.status === "dead") {
+      return;
+    }
+
+    await this.runControlCommand({
+      args: this.buildVerbArgs(session.agent, session.directory, [
+        "sessions",
+        "close",
+        session.name
+      ]),
+      cwd: session.directory,
+      allowNoSession: true,
+      timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS
+    });
+    const closedStatus = await this.getRuntimeStatus({
+      name: session.name,
+      agent: session.agent,
+      directory: session.directory,
+      timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS
+    });
+    if (closedStatus.exists && closedStatus.status !== "dead") {
+      throw new PuppenclawError(
+        "MODEL_PROVIDER_REFRESH_UNSAFE",
+        `Persistent ACP runtime ${session.name} remained active; provider refresh was not applied.`
+      );
+    }
   }
 
   private buildOneShotContinuationPrompt(session: SessionInfo, promptText: string): string {
@@ -3197,6 +3403,7 @@ export class AcpxSessionManager implements ISessionManager {
     session: SessionInfo;
     promptText: string;
     permissionMode: PermissionMode;
+    interactionMode?: InteractionMode;
   }): Promise<TurnResult> {
     const tmpDir = join(params.session.directory, ".puppenclaw", "tmp");
     await mkdir(tmpDir, { recursive: true });
@@ -3231,6 +3438,13 @@ export class AcpxSessionManager implements ISessionManager {
     const env = {
       ...process.env,
       ...(runtimeEnv ?? {}),
+      // Derived only from Puppenclaw's validated turn controls. The Codex
+      // wrapper converts this out-of-band value into trusted model
+      // instructions, so user prompt text cannot elevate a planning turn.
+      PUPPENCLAW_CODEX_TURN_POLICY: deriveCodexTurnPolicy(
+        params.interactionMode,
+        params.permissionMode
+      ),
       PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND:
         process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND ?? process.env.CODEX_EXECUTABLE ?? "codex"
     };
@@ -3298,9 +3512,12 @@ export class AcpxSessionManager implements ISessionManager {
           }
         }
       } catch {
-        if (line.trim().length > 0) {
-          appendLiveOutput(`\n[codex] ${line}\n`);
-        }
+        // `codex exec --json` stdout is a protocol channel. Never turn an
+        // unparsable record into assistant prose: it may contain raw tool
+        // arguments, tool output, or credentials from a broken relay.
+        this.deps.logger.debug(
+          `Ignored malformed Codex JSON event for session ${params.session.name}.`
+        );
       }
     };
     child.stdout.setEncoding("utf8");
@@ -3352,11 +3569,13 @@ export class AcpxSessionManager implements ISessionManager {
     const finalOutput = (await readFile(outputPath, "utf8").catch(() => "")).trim();
     await unlink(outputPath).catch(() => {});
     const liveOutput = liveOutputChunks.join("").trim();
-    const combinedOutput = finalOutput || liveOutput;
+    const canonicalFinalOutput = sanitizeActiveTurnText(finalOutput);
+    const combinedOutput = canonicalFinalOutput || liveOutput;
 
     if ((exitCode ?? 0) !== 0) {
-      const message =
-        stderr.trim() || combinedOutput || `codex exited with code ${exitCode ?? "unknown"}`;
+      const message = sanitizeActiveTurnText(
+        stderr.trim() || combinedOutput || `codex exited with code ${exitCode ?? "unknown"}`
+      );
       this.deps.logger.warn(
         `Codex session ${params.session.name} exited with code ${exitCode ?? "unknown"}: ${message}`
       );
@@ -3386,10 +3605,12 @@ export class AcpxSessionManager implements ISessionManager {
         this.appendActiveTurnOutput(params.session.name, combinedOutput);
         await this.deps.outputRouter.onChunk(params.session.name, combinedOutput);
       } else if (
-        finalOutput.length > 0 &&
-        !activeText.includes(finalOutput.slice(0, Math.min(finalOutput.length, 240)))
+        canonicalFinalOutput.length > 0 &&
+        !activeText.includes(
+          canonicalFinalOutput.slice(0, Math.min(canonicalFinalOutput.length, 240))
+        )
       ) {
-        const finalChunk = `\n\n${sanitizeActiveTurnText(finalOutput)}`;
+        const finalChunk = `\n\n${canonicalFinalOutput}`;
         this.appendActiveTurnOutput(params.session.name, finalChunk);
         await this.deps.outputRouter.onChunk(params.session.name, finalChunk);
       }

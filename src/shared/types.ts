@@ -261,6 +261,7 @@ export type SessionQuiescenceReservation = {
 export type SessionQuiescenceState = {
   lastEpoch: number;
   active: Record<string, SessionQuiescenceReservation>;
+  latestByName: Record<string, number>;
 };
 
 export type ExposureRecord = {

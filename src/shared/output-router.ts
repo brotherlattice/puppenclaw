@@ -32,6 +32,8 @@ export type OutputRouteEvent =
       kind: "error";
       sessionName: string;
       text: string;
+      code?: string;
+      details?: Record<string, unknown>;
     }
   | {
       kind: "question";

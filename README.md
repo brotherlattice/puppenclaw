@@ -383,21 +383,42 @@ Stop it:
 node dist/daemon/cli.js stop --host 127.0.0.1 --port 18795
 ```
 
-The authenticated daemon API exposes a fenced cleanup lifecycle for callers
-that must remove a session workspace safely:
+The authenticated daemon API exposes a fenced lifecycle for callers that must
+stop work or remove a session workspace without allowing a delayed dispatch to
+reopen it:
 
 1. `POST /session/:name/quiesce` durably fences new mutations, drains the
-   active turn, closes the runtime, and returns a positive
+   active turn when one exists, closes the runtime, and returns a positive
    `details.quiescenceEpoch` with `details.runtimeClosed: true`.
+   Quiescing an as-yet unknown session name is valid and fences a racing first
+   start.
 2. `POST /session/:name/purge` removes the tracked session while retaining an
    externally acquired fence.
-3. `POST /session/:name/quiesce/release` with `{ "epoch": <epoch> }` releases
-   that exact fence. Repeated release of the same epoch is idempotent; stale
-   epochs are rejected.
+3. An authenticated `POST /session/start` or `POST /session/:name/send` may
+   resume work by supplying that exact positive `lifecycleEpoch`. Entering the
+   turn atomically releases a matching active reservation. Once a session name
+   has lifecycle history, every later start or send must carry its latest
+   epoch; missing and stale epochs remain rejected even after release or daemon
+   restart.
+4. `POST /session/:name/quiesce/release` with `{ "epoch": <epoch> }` explicitly
+   releases that exact fence without starting a turn. Repeated release of the
+   latest epoch is idempotent; stale epochs are rejected and the per-name
+   lifecycle history remains.
 
-Missing sessions return HTTP 404 with `{ "ok": false, "code": "NO_SESSION" }`.
-The epoch reservation is stored independently from the session, so a daemon
-restart or retried cleanup cannot silently reopen the mutation window.
+External epoch reservations and their latest epoch per session name are stored
+independently from the session, so a daemon restart, purge, or retried cleanup
+cannot silently reopen an externally fenced mutation window. Puppenclaw's own
+purge and TTL-GC operations use transient reservations: they still fence
+concurrent mutations and survive an interrupted purge, but do not create new
+per-name lifecycle history or make an ordinary session name require an epoch.
+An external quiescence request that encounters an interrupted transient purge
+atomically adopts that reservation as the external lifecycle fence.
+Session status reports an active external fence as stopped and its runtime as
+`quiesced`. Legacy clients remain compatible for names that have no external
+lifecycle history. `lifecycleEpoch` is confined to the authenticated daemon
+boundary and is deliberately absent from the OpenClaw plugin command and tool
+schemas. Capability discovery advertises these semantics under
+`sessionQuiescence.version: 2`.
 
 ## OpenClaw Usage Surfaces
 

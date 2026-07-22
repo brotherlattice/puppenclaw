@@ -108,7 +108,7 @@ function sleep(ms) {
 }
 
 emit({ type: "turn_started" });
-writeSync(1, "LIVE RAW PROGRESS\\n");
+writeSync(1, "LIVE RAW PROGRESS token=malformed-stream-secret\\n");
 emit({
   type: "response_item",
   item: {
@@ -137,7 +137,7 @@ emit({
   type: "response_item",
   item: {
     type: "function_call_output",
-    output: "command output line\\nsecond line"
+    output: "command output line\\nsecond line\\ntoken=tool-output-secret"
   }
 });
 await sleep(80);
@@ -203,9 +203,10 @@ emit({
   item: {
     type: "function_call",
     name: "exec_command",
-    arguments: "{\\"cmd\\":\\"build report\\"}"
+    arguments: "{\\"cmd\\":\\"build report\\",\\"authorization\\":\\"Bearer failure-tool-secret\\"}"
   }
 });
+writeSync(1, "MALFORMED FAILURE token=failure-stream-secret\\n");
 writeSync(2, "stream disconnected before completion: {\\"error\\":\\"The operation was aborted due to timeout\\"}\\n");
 process.exit(1);
 `,
@@ -238,7 +239,12 @@ writeFileSync(join(cwd, \`.fake-codex-permission-args-\${invocation}.json\`), JS
 writeFileSync(join(cwd, \`.fake-codex-permission-prompt-\${invocation}.txt\`), promptText, "utf8");
 writeFileSync(join(cwd, \`.fake-codex-permission-env-\${invocation}.json\`), JSON.stringify({
   direct: process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND ?? null,
-  persistent: process.env.PUPPENCLAW_REAL_CODEX_AGENT_COMMAND ?? null
+  persistent: process.env.PUPPENCLAW_REAL_CODEX_AGENT_COMMAND ?? null,
+  turnPolicy: process.env.PUPPENCLAW_CODEX_TURN_POLICY ?? null,
+  modelProviderId: process.env.PUPPENCLAW_MODEL_PROVIDER_ID ?? null,
+  modelProviderModel: process.env.PUPPENCLAW_MODEL_PROVIDER_MODEL ?? null,
+  modelProviderKind: process.env.PUPPENCLAW_MODEL_PROVIDER_KIND ?? null,
+  modelProviderBaseUrl: process.env.PUPPENCLAW_MODEL_PROVIDER_BASE_URL ?? null
 }), "utf8");
 
 const answer = \`Captured permission turn \${invocation}.\`;
@@ -453,6 +459,7 @@ describe("AcpxSessionManager", () => {
       name: "codex-permission-demo",
       directory: workspaceDir,
       task: "Start read-only.",
+      interactionMode: "plan",
       contextFiles: [],
       modelProvider
     });
@@ -465,10 +472,15 @@ describe("AcpxSessionManager", () => {
       "--sandbox",
       "read-only"
     ]);
+    const readOnlyEnv = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-env-0.json"), "utf8")
+    ) as { turnPolicy: string | null };
+    expect(readOnlyEnv.turnPolicy).toBe("plan-no-tools");
 
     const approved = await manager.send({
       name: "codex-permission-demo",
       message: "Run the approved write turn.",
+      interactionMode: "execute",
       permissionMode: "approve-all",
       contextFiles: []
     });
@@ -477,6 +489,10 @@ describe("AcpxSessionManager", () => {
     ) as string[];
     expect(approveAllArgs).toContain("--dangerously-bypass-approvals-and-sandbox");
     expect(approveAllArgs).not.toContain("--sandbox");
+    const approveAllEnv = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-env-1.json"), "utf8")
+    ) as { turnPolicy: string | null };
+    expect(approveAllEnv.turnPolicy).toBe("execute-tools");
     expect((approved.details as { session: SessionInfo }).session.permissionMode).toBe(
       "approve-reads"
     );
@@ -484,6 +500,7 @@ describe("AcpxSessionManager", () => {
     await manager.send({
       name: "codex-permission-demo",
       message: "Answer without tools.",
+      interactionMode: "execute",
       permissionMode: "deny-all",
       contextFiles: []
     });
@@ -503,6 +520,10 @@ describe("AcpxSessionManager", () => {
     expect(denyAllPrompt).toContain("Permission mode for this turn is deny-all.");
     expect(denyAllPrompt).toContain("Do not call tools");
     expect(denyAllPrompt).toContain("Answer without tools.");
+    const denyAllEnv = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-env-2.json"), "utf8")
+    ) as { turnPolicy: string | null };
+    expect(denyAllEnv.turnPolicy).toBe("deny-all-no-tools");
   });
 
   it("keeps persistent and direct Codex runtime commands separate", async () => {
@@ -542,10 +563,23 @@ describe("AcpxSessionManager", () => {
 
       const captured = JSON.parse(
         await readFile(join(workspaceDir, ".fake-codex-permission-env-0.json"), "utf8")
-      ) as { direct: string | null; persistent: string | null };
+      ) as {
+        direct: string | null;
+        persistent: string | null;
+        turnPolicy: string | null;
+        modelProviderId: string | null;
+        modelProviderModel: string | null;
+        modelProviderKind: string | null;
+        modelProviderBaseUrl: string | null;
+      };
       expect(captured).toEqual({
         direct: "/opt/puppenclaw/codex",
-        persistent: "/opt/puppenclaw/codex-acp"
+        persistent: "/opt/puppenclaw/codex-acp",
+        turnPolicy: "default",
+        modelProviderId: "fake-openai-compatible",
+        modelProviderModel: "fake-model",
+        modelProviderKind: "codex-openai-compatible",
+        modelProviderBaseUrl: null
       });
     } finally {
       if (previousPersistent == null) {
@@ -559,6 +593,284 @@ describe("AcpxSessionManager", () => {
         process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND = previousDirect;
       }
     }
+  });
+
+  it("refreshes and persists a same-id Codex one-shot provider", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-provider-refresh-");
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ agentCommands: { codex: codexCommand } }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    await manager.start({
+      agent: "codex",
+      name: "provider-refresh-demo",
+      directory: workspaceDir,
+      task: "Start with the original endpoint.",
+      modelProviderId: "local-glm",
+      modelProvider: {
+        id: "local-glm",
+        kind: "codex-openai-compatible",
+        model: "old-model",
+        baseUrl: "http://127.0.0.1:18000/v1",
+        wireApi: "responses"
+      },
+      contextFiles: []
+    });
+
+    const refreshedProvider = {
+      id: "local-glm",
+      kind: "codex-openai-compatible" as const,
+      model: "new-model",
+      baseUrl: "http://127.0.0.1:18001/v1",
+      wireApi: "responses" as const
+    };
+    const refreshed = await manager.send({
+      name: "provider-refresh-demo",
+      message: "Use the refreshed endpoint.",
+      modelProviderId: "local-glm",
+      modelProvider: refreshedProvider,
+      contextFiles: []
+    });
+    const refreshedSession = (refreshed.details as { session: SessionInfo }).session;
+    expect(refreshedSession).toMatchObject({
+      model: "new-model",
+      modelProviderId: "local-glm",
+      modelProvider: refreshedProvider
+    });
+    const refreshArgs = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-args-1.json"), "utf8")
+    ) as string[];
+    expect(refreshArgs).toContain("new-model");
+    const refreshEnv = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-env-1.json"), "utf8")
+    ) as Record<string, string | null>;
+    expect(refreshEnv).toMatchObject({
+      modelProviderId: "local-glm",
+      modelProviderModel: "new-model",
+      modelProviderKind: "codex-openai-compatible",
+      modelProviderBaseUrl: "http://127.0.0.1:18001/v1"
+    });
+
+    await manager.send({
+      name: "provider-refresh-demo",
+      message: "Keep using the refreshed endpoint.",
+      contextFiles: []
+    });
+    const persistedEnv = JSON.parse(
+      await readFile(join(workspaceDir, ".fake-codex-permission-env-2.json"), "utf8")
+    ) as Record<string, string | null>;
+    expect(persistedEnv).toMatchObject({
+      modelProviderId: "local-glm",
+      modelProviderModel: "new-model",
+      modelProviderBaseUrl: "http://127.0.0.1:18001/v1"
+    });
+    expect(store.getSession("provider-refresh-demo")).toMatchObject({
+      model: "new-model",
+      modelProviderId: "local-glm",
+      modelProvider: refreshedProvider
+    });
+  });
+
+  it("rejects incomplete, mismatched, cross-provider, and non-Codex refreshes", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-provider-refresh-reject-");
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ agentCommands: { codex: codexCommand } }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const originalProvider = {
+      id: "local-glm",
+      kind: "codex-openai-compatible" as const,
+      model: "original-model"
+    };
+    await manager.start({
+      agent: "codex",
+      name: "provider-refresh-reject-demo",
+      directory: workspaceDir,
+      task: "Start with a bound provider.",
+      modelProviderId: "local-glm",
+      modelProvider: originalProvider,
+      contextFiles: []
+    });
+
+    await expect(
+      manager.send({
+        name: "provider-refresh-reject-demo",
+        message: "Supply only the provider id.",
+        modelProviderId: "local-glm",
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({ code: "MODEL_PROVIDER_REFRESH_INVALID" });
+    await expect(
+      manager.send({
+        name: "provider-refresh-reject-demo",
+        message: "Supply mismatched request fields.",
+        modelProviderId: "local-glm",
+        modelProvider: { ...originalProvider, id: "other-provider" },
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({ code: "MODEL_PROVIDER_REFRESH_INVALID" });
+    await expect(
+      manager.send({
+        name: "provider-refresh-reject-demo",
+        message: "Try to rebind the session.",
+        modelProviderId: "other-provider",
+        modelProvider: { ...originalProvider, id: "other-provider" },
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({ code: "MODEL_PROVIDER_REFRESH_CONFLICT" });
+    await expect(
+      manager.send({
+        name: "provider-refresh-reject-demo",
+        message: "Try an unsupported provider kind.",
+        modelProviderId: "local-glm",
+        modelProvider: {
+          id: "local-glm",
+          kind: "claude-code",
+          model: "claude-model"
+        },
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({ code: "MODEL_PROVIDER_REFRESH_UNSUPPORTED" });
+
+    expect(await readFile(join(workspaceDir, ".fake-codex-permission-count"), "utf8")).toBe(
+      "1"
+    );
+    expect(store.getSession("provider-refresh-reject-demo")).toMatchObject({
+      modelProviderId: "local-glm",
+      modelProvider: originalProvider
+    });
+  });
+
+  it("closes a legacy persistent Codex runtime before switching to one-shot", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-provider-refresh-legacy-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand, agentCommands: { codex: codexCommand } }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    await manager.start({
+      agent: "codex",
+      name: "legacy-provider-refresh-demo",
+      directory: workspaceDir,
+      task: "Start through the persistent ACP runtime.",
+      contextFiles: []
+    });
+    const legacyRuntimePath = join(
+      workspaceDir,
+      ".fake-acpx-state",
+      "legacy-provider-refresh-demo.session"
+    );
+    expect(await readFile(legacyRuntimePath, "utf8")).toContain("alive");
+
+    const refreshed = await manager.send({
+      name: "legacy-provider-refresh-demo",
+      message: "Continue through the one-shot provider.",
+      modelProviderId: "local-glm",
+      modelProvider: {
+        id: "local-glm",
+        kind: "codex-openai-compatible",
+        model: "zai-org/GLM-5.2",
+        baseUrl: "http://127.0.0.1:18000/v1",
+        wireApi: "responses"
+      },
+      contextFiles: []
+    });
+    await expect(readFile(legacyRuntimePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect((refreshed.details as { session: SessionInfo }).session).toMatchObject({
+      model: "zai-org/GLM-5.2",
+      modelProviderId: "local-glm",
+      modelProvider: {
+        id: "local-glm",
+        kind: "codex-openai-compatible"
+      }
+    });
+    expect(
+      JSON.parse(
+        await readFile(join(workspaceDir, ".fake-codex-permission-env-0.json"), "utf8")
+      )
+    ).toMatchObject({
+      modelProviderId: "local-glm",
+      modelProviderModel: "zai-org/GLM-5.2"
+    });
+  });
+
+  it("fails closed when a legacy persistent runtime cannot be closed", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-provider-refresh-close-failure-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand, agentCommands: { codex: codexCommand } }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const sessionName = "retry-close-provider-refresh";
+    await manager.start({
+      agent: "codex",
+      name: sessionName,
+      directory: workspaceDir,
+      task: "Start through the persistent ACP runtime.",
+      contextFiles: []
+    });
+
+    await expect(
+      manager.send({
+        name: sessionName,
+        message: "Do not overlap the persistent and one-shot runtimes.",
+        modelProviderId: "local-glm",
+        modelProvider: {
+          id: "local-glm",
+          kind: "codex-openai-compatible",
+          model: "zai-org/GLM-5.2"
+        },
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({ code: "SIM_CLOSE_FAIL" });
+    expect(
+      await readFile(
+        join(workspaceDir, ".fake-acpx-state", `${sessionName}.session`),
+        "utf8"
+      )
+    ).toContain("alive");
+    expect(store.getSession(sessionName)?.modelProvider).toBeUndefined();
+    await expect(
+      readFile(join(workspaceDir, ".fake-codex-permission-count"), "utf8")
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("applies and persists an Ultra effort override for Codex follow-up turns", async () => {
@@ -870,13 +1182,19 @@ describe("AcpxSessionManager", () => {
     const codexCommand = await resolveFakeCodexJsonCommand(workspaceDir);
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
     const chunks: string[] = [];
-    const structuredEvents: Array<{ kind: string; value?: string; text?: string }> = [];
+    const structuredEvents: Array<{
+      kind: string;
+      value?: string;
+      text?: string;
+      activityType?: string;
+    }> = [];
     outputRouter.attach("codex-json-demo", async (event) => {
       if (event.kind === "chunk") {
         chunks.push(event.text);
       } else if (event.kind === "activity") {
         structuredEvents.push({
           kind: event.kind,
+          activityType: event.activity.type,
           ...(event.activity.title != null ? { value: event.activity.title } : {}),
           ...(event.activity.text != null ? { text: event.activity.text } : {})
         });
@@ -918,6 +1236,7 @@ describe("AcpxSessionManager", () => {
       modelProvider
     });
     chunks.length = 0;
+    structuredEvents.length = 0;
 
     const sendPromise = manager.send({
       name: "codex-json-demo",
@@ -952,7 +1271,7 @@ describe("AcpxSessionManager", () => {
           text: liveOutput
         });
       }
-      if (liveOutput.includes("[tool] exec_command")) {
+      if (liveOutput.includes("Final streamed answer.")) {
         break;
       }
     }
@@ -962,20 +1281,46 @@ describe("AcpxSessionManager", () => {
       output: string;
     };
 
-    expect(
+    const completedOutput = await manager.output({ name: "codex-json-demo" });
+    const completedText = (
+      completedOutput.details as { output: { text: string } }
+    ).output.text;
+    const visibleSurfaces = JSON.stringify({
       liveOutput,
-      JSON.stringify({ observedOutputs, chunks }, null, 2)
-    ).toContain("[tool] exec_command");
-
-    expect(chunks.join("")).toContain("command output line");
-    expect(chunks.join("")).toContain("[tool] mcp__paper_search_mcp__search_pubmed");
-    expect(chunks.join("")).not.toContain("[final]");
+      observedOutputs,
+      chunks,
+      completedText,
+      result: details.output
+    });
+    expect(liveOutput, JSON.stringify({ observedOutputs, chunks }, null, 2)).toContain(
+      "Final streamed answer."
+    );
+    expect(completedText).toContain("Final file answer.");
+    for (const hiddenProtocolText of [
+      "[tool]",
+      "[tool output]",
+      "LIVE RAW PROGRESS",
+      "malformed-stream-secret",
+      "should-not-leak",
+      "command output line",
+      "tool-output-secret",
+      "mcp__paper_search_mcp__search_pubmed"
+    ]) {
+      expect(visibleSurfaces).not.toContain(hiddenProtocolText);
+    }
     expect(structuredEvents).toContainEqual({
       kind: "activity",
+      activityType: "tool_call",
       value: "exec_command",
       text: expect.stringContaining("Bearer [redacted]") as string
     });
+    expect(structuredEvents).toContainEqual({
+      kind: "activity",
+      activityType: "tool_output",
+      text: expect.stringContaining("command output line") as string
+    });
     expect(JSON.stringify(structuredEvents)).not.toContain("should-not-leak");
+    expect(JSON.stringify(structuredEvents)).not.toContain("tool-output-secret");
     expect(structuredEvents).toContainEqual({ kind: "final", value: "Final file answer." });
     expect(details.output).toBe("Final file answer.");
   });
@@ -984,6 +1329,19 @@ describe("AcpxSessionManager", () => {
     const workspaceDir = await createTempDir("puppenclaw-codex-failure-");
     const codexCommand = await resolveFakeCodexFailureCommand(workspaceDir);
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const chunks: string[] = [];
+    const activities: Array<{ type: string; title?: string; text?: string }> = [];
+    outputRouter.attach("codex-failure-demo", async (event) => {
+      if (event.kind === "chunk") {
+        chunks.push(event.text);
+      } else if (event.kind === "activity") {
+        activities.push({
+          type: event.activity.type,
+          ...(event.activity.title != null ? { title: event.activity.title } : {}),
+          ...(event.activity.text != null ? { text: event.activity.text } : {})
+        });
+      }
+    });
     const manager = new AcpxSessionManager({
       config: makeConfig({
         agentCommands: {
@@ -1016,6 +1374,8 @@ describe("AcpxSessionManager", () => {
       contextFiles: [],
       modelProvider
     });
+    chunks.length = 0;
+    activities.length = 0;
 
     const result = await manager.send({
       name: "codex-failure-demo",
@@ -1038,8 +1398,28 @@ describe("AcpxSessionManager", () => {
     expect(outputDetails.output.source).toBe("active-turn");
     expect(outputDetails.output.complete).toBe(true);
     expect(outputDetails.output.text).toContain("stream disconnected before completion");
-    expect(outputDetails.output.text).toContain("[tool] exec_command");
     expect(outputDetails.output.text).not.toContain("Initial successful report");
+    const visibleSurfaces = JSON.stringify({
+      result: sendDetails.output,
+      chunks,
+      activeOutput: outputDetails.output.text
+    });
+    for (const hiddenProtocolText of [
+      "[tool]",
+      "[tool output]",
+      "build report",
+      "failure-tool-secret",
+      "MALFORMED FAILURE",
+      "failure-stream-secret"
+    ]) {
+      expect(visibleSurfaces).not.toContain(hiddenProtocolText);
+    }
+    expect(activities).toContainEqual({
+      type: "tool_call",
+      title: "exec_command",
+      text: expect.stringContaining("Bearer [redacted]") as string
+    });
+    expect(JSON.stringify(activities)).not.toContain("failure-tool-secret");
   });
 
   it("marks a session as waiting_input when the reply is a question", async () => {

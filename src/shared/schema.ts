@@ -468,13 +468,14 @@ export const startParamsZod = z
     model: nonEmptyString.optional(),
     modelProviderId: skillNameString.optional(),
     modelProvider: modelProviderConfigZod.optional(),
+    lifecycleEpoch: z.number().int().positive().safe().optional(),
     contextFiles: z.array(nonEmptyString).default([]),
     skills: z.array(skillNameString).default([])
   })
   .strict();
 
 export const pluginStartParamsZod = startParamsZod
-  .omit({ permissionMode: true, interactionMode: true })
+  .omit({ permissionMode: true, interactionMode: true, lifecycleEpoch: true })
   .strict();
 
 export const sendParamsZod = z
@@ -487,12 +488,21 @@ export const sendParamsZod = z
     effort: effortLevelZod.optional(),
     permissionMode: permissionModeZod.optional(),
     interactionMode: interactionModeZod.optional(),
+    lifecycleEpoch: z.number().int().positive().safe().optional(),
+    modelProviderId: skillNameString.optional(),
+    modelProvider: modelProviderConfigZod.optional(),
     contextFiles: z.array(nonEmptyString).default([])
   })
   .strict();
 
 export const pluginSendParamsZod = sendParamsZod
-  .omit({ permissionMode: true, interactionMode: true })
+  .omit({
+    permissionMode: true,
+    interactionMode: true,
+    lifecycleEpoch: true,
+    modelProviderId: true,
+    modelProvider: true
+  })
   .strict();
 
 export const stopParamsZod = z

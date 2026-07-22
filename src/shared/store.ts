@@ -24,7 +24,7 @@ export class SessionStore {
       version: SESSION_STORE_VERSION,
       sessions: {},
       exposures: {},
-      quiescence: { lastEpoch: 0, active: {} }
+      quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
     });
     return new SessionStore(
       rootDir,
@@ -39,7 +39,7 @@ export class SessionStore {
             version: SESSION_STORE_VERSION,
             sessions: {},
             exposures: {},
-            quiescence: { lastEpoch: 0, active: {} }
+            quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
           }
     );
   }
@@ -77,6 +77,32 @@ export class SessionStore {
       } else {
         state.sessions[name] = next;
       }
+      return next;
+    });
+  }
+
+  async patchQuiescedSession(
+    name: string,
+    epoch: number,
+    patch: (current: SessionInfo) => SessionInfo
+  ): Promise<SessionInfo | null> {
+    return await this.mutate((state) => {
+      const reservation = state.quiescence.active[name];
+      if (reservation?.epoch !== epoch) {
+        throw staleQuiescenceEpoch(
+          name,
+          epoch,
+          reservation,
+          state.quiescence.latestByName[name],
+          state.quiescence.lastEpoch
+        );
+      }
+      const current = state.sessions[name];
+      if (current == null) {
+        return null;
+      }
+      const next = patch(current);
+      state.sessions[name] = next;
       return next;
     });
   }
@@ -129,6 +155,10 @@ export class SessionStore {
     return this.state.quiescence.active[name]?.epoch ?? null;
   }
 
+  getLatestLifecycleEpoch(name: string): number | null {
+    return this.state.quiescence.latestByName[name] ?? null;
+  }
+
   assertSessionMutable(name: string): void {
     assertSessionMutable(this.state, name);
   }
@@ -140,6 +170,16 @@ export class SessionStore {
     return await this.mutate((state) => {
       const current = state.quiescence.active[name];
       if (current != null) {
+        if (purpose === "external" && current.purpose === "purge") {
+          const promoted: SessionQuiescenceReservation = {
+            ...current,
+            purpose: "external",
+            updatedAt: nowIso()
+          };
+          state.quiescence.active[name] = promoted;
+          state.quiescence.latestByName[name] = promoted.epoch;
+          return promoted;
+        }
         return current;
       }
       const lastEpoch = state.quiescence.lastEpoch;
@@ -158,6 +198,9 @@ export class SessionStore {
       };
       state.quiescence.lastEpoch = epoch;
       state.quiescence.active[name] = next;
+      if (purpose === "external") {
+        state.quiescence.latestByName[name] = epoch;
+      }
       return next;
     });
   }
@@ -165,8 +208,9 @@ export class SessionStore {
   async releaseQuiescence(name: string, epoch: number): Promise<SessionQuiescenceReservation> {
     return await this.mutate((state) => {
       const current = state.quiescence.active[name];
+      const latestEpoch = state.quiescence.latestByName[name];
       if (current == null) {
-        if (Number.isSafeInteger(epoch) && epoch > 0 && epoch <= state.quiescence.lastEpoch) {
+        if (latestEpoch === epoch) {
           return {
             name,
             epoch,
@@ -174,13 +218,82 @@ export class SessionStore {
             updatedAt: nowIso()
           };
         }
-        throw staleQuiescenceEpoch(name, epoch, undefined, state.quiescence.lastEpoch);
+        throw staleQuiescenceEpoch(name, epoch, undefined, latestEpoch, state.quiescence.lastEpoch);
       }
       if (current.epoch !== epoch) {
-        throw staleQuiescenceEpoch(name, epoch, current, state.quiescence.lastEpoch);
+        throw staleQuiescenceEpoch(name, epoch, current, latestEpoch, state.quiescence.lastEpoch);
       }
       delete state.quiescence.active[name];
       return current;
+    });
+  }
+
+  async enterLifecycleTurn(name: string, requestedEpoch?: number): Promise<{
+    lifecycleEpoch: number | null;
+    releasedQuiescence: boolean;
+  }> {
+    return await this.mutate((state) => {
+      const latestEpoch = state.quiescence.latestByName[name];
+      const activeReservation = state.quiescence.active[name];
+      if (activeReservation?.purpose === "purge") {
+        throw new PuppenclawError(
+          "SESSION_QUIESCED",
+          `Session ${name} is fenced by transient purge epoch ${activeReservation.epoch}.`,
+          {
+            name,
+            quiescenceEpoch: activeReservation.epoch,
+            latestEpoch: latestEpoch ?? null,
+            lastEpoch: state.quiescence.lastEpoch
+          }
+        );
+      }
+      if (latestEpoch == null) {
+        if (requestedEpoch != null) {
+          throw staleLifecycleEpoch(name, requestedEpoch, undefined, state.quiescence.lastEpoch);
+        }
+        return { lifecycleEpoch: null, releasedQuiescence: false };
+      }
+      if (requestedEpoch == null) {
+        const activeEpoch = state.quiescence.active[name]?.epoch;
+        if (activeEpoch != null) {
+          throw new PuppenclawError(
+            "SESSION_QUIESCED",
+            `Session ${name} is fenced by quiescence epoch ${activeEpoch}.`,
+            { name, quiescenceEpoch: activeEpoch, latestEpoch, lastEpoch: state.quiescence.lastEpoch }
+          );
+        }
+        throw new PuppenclawError(
+          "LIFECYCLE_EPOCH_REQUIRED",
+          `Session ${name} requires lifecycle epoch ${latestEpoch} before another turn can start.`,
+          {
+            name,
+            requestedEpoch: null,
+            activeEpoch: state.quiescence.active[name]?.epoch ?? null,
+            latestEpoch,
+            lastEpoch: state.quiescence.lastEpoch
+          }
+        );
+      }
+      if (requestedEpoch !== latestEpoch) {
+        throw staleLifecycleEpoch(name, requestedEpoch, latestEpoch, state.quiescence.lastEpoch);
+      }
+      const current = state.quiescence.active[name];
+      if (current != null && current.epoch !== requestedEpoch) {
+        throw staleQuiescenceEpoch(
+          name,
+          requestedEpoch,
+          current,
+          latestEpoch,
+          state.quiescence.lastEpoch
+        );
+      }
+      if (current != null) {
+        delete state.quiescence.active[name];
+      }
+      return {
+        lifecycleEpoch: latestEpoch,
+        releasedQuiescence: current != null
+      };
     });
   }
 
@@ -220,6 +333,7 @@ function staleQuiescenceEpoch(
   name: string,
   epoch: number,
   current: SessionQuiescenceReservation | undefined,
+  latestEpoch: number | undefined,
   lastEpoch: number
 ): PuppenclawError {
   return new PuppenclawError(
@@ -229,6 +343,26 @@ function staleQuiescenceEpoch(
       name,
       requestedEpoch: epoch,
       activeEpoch: current?.epoch ?? null,
+      latestEpoch: latestEpoch ?? null,
+      lastEpoch
+    }
+  );
+}
+
+function staleLifecycleEpoch(
+  name: string,
+  requestedEpoch: number,
+  latestEpoch: number | undefined,
+  lastEpoch: number
+): PuppenclawError {
+  return new PuppenclawError(
+    "STALE_LIFECYCLE_EPOCH",
+    `Lifecycle epoch ${requestedEpoch} is not current for session ${name}.`,
+    {
+      name,
+      requestedEpoch,
+      activeEpoch: null,
+      latestEpoch: latestEpoch ?? null,
       lastEpoch
     }
   );
@@ -236,15 +370,37 @@ function staleQuiescenceEpoch(
 
 function normalizeQuiescenceState(value: unknown): StoredState["quiescence"] {
   if (value == null || typeof value !== "object" || Array.isArray(value)) {
-    return { lastEpoch: 0, active: {} };
+    return { lastEpoch: 0, active: {}, latestByName: {} };
   }
   const candidate = value as Partial<StoredState["quiescence"]>;
+  const active =
+    candidate.active != null && typeof candidate.active === "object" ? candidate.active : {};
+  const latestByName =
+    candidate.latestByName != null && typeof candidate.latestByName === "object"
+      ? Object.fromEntries(
+          Object.entries(candidate.latestByName).filter(
+            (entry): entry is [string, number] =>
+              Number.isSafeInteger(entry[1]) && entry[1] > 0
+          )
+        )
+      : {};
+  for (const [name, reservation] of Object.entries(active)) {
+    if (
+      reservation != null &&
+      reservation.purpose !== "purge" &&
+      Number.isSafeInteger(reservation.epoch) &&
+      reservation.epoch > (latestByName[name] ?? 0)
+    ) {
+      latestByName[name] = reservation.epoch;
+    }
+  }
   return {
     lastEpoch:
       Number.isSafeInteger(candidate.lastEpoch) && (candidate.lastEpoch ?? 0) >= 0
         ? (candidate.lastEpoch ?? 0)
         : 0,
-    active: candidate.active != null && typeof candidate.active === "object" ? candidate.active : {}
+    active,
+    latestByName
   };
 }
 
