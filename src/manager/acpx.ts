@@ -2731,7 +2731,7 @@ export class AcpxSessionManager implements ISessionManager {
     const env = {
       ...process.env,
       ...(runtimeEnv ?? {}),
-      PUPPENCLAW_REAL_CODEX_AGENT_COMMAND:
+      PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND:
         process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND ?? process.env.CODEX_EXECUTABLE ?? "codex"
     };
 

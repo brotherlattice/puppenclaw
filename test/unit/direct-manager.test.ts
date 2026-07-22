@@ -236,6 +236,10 @@ writeFileSync(counterPath, String(invocation + 1), "utf8");
 const promptText = readFileSync(0, "utf8");
 writeFileSync(join(cwd, \`.fake-codex-permission-args-\${invocation}.json\`), JSON.stringify(args), "utf8");
 writeFileSync(join(cwd, \`.fake-codex-permission-prompt-\${invocation}.txt\`), promptText, "utf8");
+writeFileSync(join(cwd, \`.fake-codex-permission-env-\${invocation}.json\`), JSON.stringify({
+  direct: process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND ?? null,
+  persistent: process.env.PUPPENCLAW_REAL_CODEX_AGENT_COMMAND ?? null
+}), "utf8");
 
 const answer = \`Captured permission turn \${invocation}.\`;
 writeSync(1, JSON.stringify({
@@ -499,6 +503,62 @@ describe("AcpxSessionManager", () => {
     expect(denyAllPrompt).toContain("Permission mode for this turn is deny-all.");
     expect(denyAllPrompt).toContain("Do not call tools");
     expect(denyAllPrompt).toContain("Answer without tools.");
+  });
+
+  it("keeps persistent and direct Codex runtime commands separate", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-codex-runtime-env-");
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const previousPersistent = process.env.PUPPENCLAW_REAL_CODEX_AGENT_COMMAND;
+    const previousDirect = process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND;
+    process.env.PUPPENCLAW_REAL_CODEX_AGENT_COMMAND = "/opt/puppenclaw/codex-acp";
+    process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND = "/opt/puppenclaw/codex";
+
+    try {
+      const manager = new AcpxSessionManager({
+        config: makeConfig({ agentCommands: { codex: codexCommand } }),
+        logger: {
+          info() {},
+          warn() {},
+          error() {},
+          debug() {}
+        },
+        store,
+        outputRouter
+      });
+
+      await manager.start({
+        agent: "codex",
+        name: "codex-runtime-env-demo",
+        directory: workspaceDir,
+        task: "Capture the isolated runtime environment.",
+        contextFiles: [],
+        modelProvider: {
+          id: "fake-openai-compatible",
+          kind: "codex-openai-compatible",
+          model: "fake-model"
+        }
+      });
+
+      const captured = JSON.parse(
+        await readFile(join(workspaceDir, ".fake-codex-permission-env-0.json"), "utf8")
+      ) as { direct: string | null; persistent: string | null };
+      expect(captured).toEqual({
+        direct: "/opt/puppenclaw/codex",
+        persistent: "/opt/puppenclaw/codex-acp"
+      });
+    } finally {
+      if (previousPersistent == null) {
+        delete process.env.PUPPENCLAW_REAL_CODEX_AGENT_COMMAND;
+      } else {
+        process.env.PUPPENCLAW_REAL_CODEX_AGENT_COMMAND = previousPersistent;
+      }
+      if (previousDirect == null) {
+        delete process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND;
+      } else {
+        process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND = previousDirect;
+      }
+    }
   });
 
   it("applies and persists an Ultra effort override for Codex follow-up turns", async () => {
