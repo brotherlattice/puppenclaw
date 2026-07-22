@@ -6,6 +6,8 @@ import type {
   FocusParams,
   ForkParams,
   ParsedPluginConfig,
+  QuiesceParams,
+  QuiescenceReleaseParams,
   ResumeParams,
   SendParams,
   StartParams,
@@ -160,6 +162,24 @@ export class DaemonSessionManager implements ISessionManager {
     });
   }
 
+  async quiesce(params: QuiesceParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    return this.request({
+      method: "POST",
+      path: `/session/${encodeURIComponent(params.name)}/quiesce`,
+      body: {}
+    });
+  }
+
+  async releaseQuiescence(params: QuiescenceReleaseParams): Promise<ToolResult> {
+    await this.ensureHealthy();
+    return this.request({
+      method: "POST",
+      path: `/session/${encodeURIComponent(params.name)}/quiesce/release`,
+      body: { epoch: params.epoch }
+    });
+  }
+
   async gc(): Promise<void> {
     await this.ensureHealthy();
     await this.request({
@@ -201,7 +221,13 @@ export class DaemonSessionManager implements ISessionManager {
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
         ...(init.body != null ? { body: JSON.stringify(init.body) } : {})
       });
-      const payload = (await response.json()) as ToolResult | { error: string };
+      const payload = (await response.json()) as
+        | ToolResult
+        | {
+            error?: string;
+            code?: string;
+            details?: Record<string, unknown>;
+          };
       if (!response.ok) {
         const message =
           payload != null &&
@@ -210,7 +236,22 @@ export class DaemonSessionManager implements ISessionManager {
           typeof payload.error === "string"
             ? payload.error
             : `daemon request failed with ${response.status}`;
-        throw new PuppenclawError("DAEMON_REQUEST_FAILED", message);
+        const code =
+          payload != null &&
+          typeof payload === "object" &&
+          "code" in payload &&
+          typeof payload.code === "string"
+            ? payload.code
+            : "DAEMON_REQUEST_FAILED";
+        const details =
+          payload != null &&
+          typeof payload === "object" &&
+          "details" in payload &&
+          payload.details != null &&
+          typeof payload.details === "object"
+            ? payload.details
+            : undefined;
+        throw new PuppenclawError(code, message, details);
       }
       return payload as ToolResult;
     } catch (error) {

@@ -2,6 +2,8 @@ import type {
   CostParams,
   FocusParams,
   ForkParams,
+  QuiesceParams,
+  QuiescenceReleaseParams,
   ResumeParams,
   SendParams,
   StartParams,
@@ -25,5 +27,7 @@ export interface ISessionManager {
   output(params: StatusParams): Promise<ToolResult>;
   cost(params?: CostParams): Promise<ToolResult>;
   purge(params: StopParams): Promise<ToolResult>;
+  quiesce(params: QuiesceParams): Promise<ToolResult>;
+  releaseQuiescence(params: QuiescenceReleaseParams): Promise<ToolResult>;
   gc(): Promise<void>;
 }

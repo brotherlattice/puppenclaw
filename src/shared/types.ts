@@ -30,6 +30,8 @@ import type {
   reassessmentStatusParamsZod,
   remoteControlConfigZod,
   resumeParamsZod,
+  quiescenceReleaseParamsZod,
+  quiesceParamsZod,
   focusParamsZod,
   suspendParamsZod,
   modelProviderConfigZod,
@@ -69,6 +71,8 @@ export type StartParams = Omit<z.infer<typeof startParamsZod>, "skills"> & {
 };
 export type SendParams = z.infer<typeof sendParamsZod>;
 export type StopParams = z.infer<typeof stopParamsZod>;
+export type QuiesceParams = z.infer<typeof quiesceParamsZod>;
+export type QuiescenceReleaseParams = z.infer<typeof quiescenceReleaseParamsZod>;
 export type ResumeParams = z.infer<typeof resumeParamsZod>;
 export type SuspendParams = z.infer<typeof suspendParamsZod>;
 export type FocusParams = z.infer<typeof focusParamsZod>;
@@ -225,6 +229,18 @@ export type SessionSourceInfo = {
   bindingId?: string;
 };
 
+export type SessionQuiescenceReservation = {
+  name: string;
+  epoch: number;
+  purpose: "external" | "purge";
+  updatedAt: string;
+};
+
+export type SessionQuiescenceState = {
+  lastEpoch: number;
+  active: Record<string, SessionQuiescenceReservation>;
+};
+
 export type ExposureRecord = {
   bindingId: string;
   conversation: ConversationScope;
@@ -338,6 +354,7 @@ export type StoredState = {
   version: 1;
   sessions: Record<string, SessionInfo>;
   exposures: Record<string, ExposureRecord>;
+  quiescence: SessionQuiescenceState;
 };
 
 export type PromptEvent =

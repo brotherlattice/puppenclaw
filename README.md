@@ -3,6 +3,7 @@
 Puppenclaw is a native OpenClaw plugin that turns ACP-backed coding agents into a project-aware orchestration runtime.
 
 Today it provides:
+
 - named Claude Code or Codex ACP sessions
 - project registration and context capture
 - campaign templates for baseline work, literature review, ablations, self-improvement loops, and Codex-vs-Claude fusion runs
@@ -35,6 +36,7 @@ Puppenclaw does **not** yet implement a full typed orchestration transport insid
 This is a source repository.
 
 Checked-in source:
+
 - `index.ts`
 - `src/**`
 - `test/**`
@@ -43,6 +45,7 @@ Checked-in source:
 - `openclaw.plugin.json`
 
 Generated at build time:
+
 - `dist/**`
 
 If you install from the repo path, run `npm run build` first. `dist/` is not meant to be committed.
@@ -55,6 +58,7 @@ If you install from the repo path, run `npm run build` first. `dist/` is not mea
 - working ACP adapter commands for the agents you plan to use
 
 Default ACP adapter commands:
+
 - Claude: `npx -y @agentclientprotocol/claude-agent-acp`
 - Codex: `npx @zed-industries/codex-acp`
 
@@ -289,11 +293,11 @@ depth, not a hard no-read/no-tool boundary.
 Session start and follow-up requests accept an optional `effort` value. Puppenclaw resolves that
 value against the selected provider rather than assuming that every backend uses the same scale:
 
-| Provider profile | Canonical controls | Compatibility behavior |
-| --- | --- | --- |
-| Claude Code | `low`, `medium`, `high`, `xhigh`, `max` | Legacy `ultra` maps to `max`. `ultracode` is exposed separately as an unavailable workflow capability; it is not an effort alias. |
-| Codex | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | The selected tier is forwarded to the runtime. |
-| GLM-5.2 | `none` (shown as Off), `high`, `max` | `minimal` maps to Off; `low` and `medium` map to High; `xhigh`, `ultra`, and `ultracode` map to Max. |
+| Provider profile | Canonical controls                               | Compatibility behavior                                                                                                            |
+| ---------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code      | `low`, `medium`, `high`, `xhigh`, `max`          | Legacy `ultra` maps to `max`. `ultracode` is exposed separately as an unavailable workflow capability; it is not an effort alias. |
+| Codex            | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | The selected tier is forwarded to the runtime.                                                                                    |
+| GLM-5.2          | `none` (shown as Off), `high`, `max`             | `minimal` maps to Off; `low` and `medium` map to High; `xhigh`, `ultra`, and `ultracode` map to Max.                              |
 
 GLM-5.2 is detected from its model identifier. For a relay that uses an opaque model name, set
 `modelProvider.reasoningProfile` to `glm-5.2` explicitly.
@@ -379,11 +383,28 @@ Stop it:
 node dist/daemon/cli.js stop --host 127.0.0.1 --port 18795
 ```
 
+The authenticated daemon API exposes a fenced cleanup lifecycle for callers
+that must remove a session workspace safely:
+
+1. `POST /session/:name/quiesce` durably fences new mutations, drains the
+   active turn, closes the runtime, and returns a positive
+   `details.quiescenceEpoch` with `details.runtimeClosed: true`.
+2. `POST /session/:name/purge` removes the tracked session while retaining an
+   externally acquired fence.
+3. `POST /session/:name/quiesce/release` with `{ "epoch": <epoch> }` releases
+   that exact fence. Repeated release of the same epoch is idempotent; stale
+   epochs are rejected.
+
+Missing sessions return HTTP 404 with `{ "ok": false, "code": "NO_SESSION" }`.
+The epoch reservation is stored independently from the session, so a daemon
+restart or retried cleanup cannot silently reopen the mutation window.
+
 ## OpenClaw Usage Surfaces
 
 Puppenclaw exposes three main surfaces:
 
 1. Agent tools
+
 - `puppenclaw_project_create`
 - `puppenclaw_worker_register`
 - `puppenclaw_context_sync`
@@ -397,6 +418,7 @@ Puppenclaw exposes three main surfaces:
 - `puppenclaw_reassessment_report`
 
 2. Raw ACP session tools
+
 - `puppenclaw_start`
 - `puppenclaw_send`
 - `puppenclaw_status`
@@ -406,9 +428,11 @@ Puppenclaw exposes three main surfaces:
 - `puppenclaw_cost`
 
 3. `/puppenclaw` command
+
 - mirrors the same behavior for deterministic command-style control
 
 Gateway methods:
+
 - `puppenclaw.projectCreate`
 - `puppenclaw.workerRegister`
 - `puppenclaw.contextSync`
@@ -437,6 +461,7 @@ openclaw plugins install /absolute/path/to/puppenclaw
 2. Restart the gateway
 
 3. Configure the plugin in OpenClaw with at least:
+
 - `backend`
 - `defaultAgent`
 - `agentCommands`
@@ -505,12 +530,14 @@ Or reassess older Puppenclaw, Codex, and Claude Code sessions with a newer model
 Use for citation-conscious research or landscape mapping.
 
 Behavior:
+
 - by default, runs as an ACP `research` step
 - if `orchestration.gptResearcherCommand` is configured, Puppenclaw runs that command instead and stores stdout as a `research-dossier` artifact
 
 ### `baseline_from_scratch`
 
 Use for:
+
 - plan
 - implement
 - optionally evaluate with `evaluationCommand`
@@ -528,6 +555,7 @@ Example:
 ### `self_improvement_loop`
 
 Repeats:
+
 - planning
 - implementation
 - optional evaluation
@@ -540,6 +568,7 @@ Control loop size with `iterations`.
 Use when you want both Codex and Claude to work from the same sealed project brief, then fuse the results into a stronger final implementation.
 
 Behavior:
+
 - requires a clean git worktree at campaign start
 - creates separate local-only worktrees for the Codex candidate, the Claude candidate, and the final merged candidate
 - gives both planning and implementation runs the same sealed bundle:
@@ -630,12 +659,14 @@ same `HOME`, not your normal shell profile.
 ## oc2oc Integration
 
 Current state:
+
 - Puppenclaw recognizes `oc2oc` as a remote channel
 - mediated remote control is supported
 - deterministic pure-pipe control is supported only when explicitly enabled and exposed
 - full typed Puppenclaw-over-`oc2oc` orchestration transport is not yet implemented
 
 Remote control safety gates:
+
 - `remoteControl.requireConversationBinding`
 - `/puppenclaw bind`
 - `/puppenclaw expose {"agents":["codex"],"allowPurePipe":true}`
@@ -695,6 +726,7 @@ npm run verify
 ```
 
 Useful source files:
+
 - `src/orchestrator/runtime.ts`
 - `src/orchestrator/store.ts`
 - `src/plugin/service.ts`

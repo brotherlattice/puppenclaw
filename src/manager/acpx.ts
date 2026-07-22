@@ -6,16 +6,12 @@ import { fileURLToPath } from "node:url";
 
 import { SessionStore } from "../shared/store.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
-import {
-  hasNonzeroUsage,
-  normalizeCodexUsage,
-  normalizeUsage
-} from "../shared/usage.js";
+import { hasNonzeroUsage, normalizeCodexUsage, normalizeUsage } from "../shared/usage.js";
 import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
 import type { OutputRouter } from "../shared/output-router.js";
-import { killProcessTree } from "../shared/process-tree.js";
+import { killProcessTree, killProcessTreeWithEscalation } from "../shared/process-tree.js";
 import {
   acceptedReasoningModes,
   reasoningProfileFor,
@@ -34,6 +30,8 @@ import type {
   PermissionMode,
   PlanningProfile,
   PromptEvent,
+  QuiesceParams,
+  QuiescenceReleaseParams,
   ResumeParams,
   SendParams,
   SessionInfo,
@@ -131,6 +129,9 @@ const RECONNECT_HISTORY_TIMEOUT_MS = 120_000;
 const RECONNECT_HISTORY_POLL_MS = 750;
 const MAX_ACTIVE_TURN_OUTPUT_CHARS = 120_000;
 const MAX_CODEX_EVENT_TEXT_CHARS = 6_000;
+const QUIESCENCE_CONTROL_TIMEOUT_MS = 1_000;
+const QUIESCENCE_DRAIN_TIMEOUT_MS = 4_000;
+const QUIESCENCE_POLL_MS = 25;
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -278,9 +279,7 @@ function extractTextContent(value: unknown): string[] {
     return [];
   }
   const directText =
-    asOptionalString(value.Text) ??
-    asOptionalString(value.text) ??
-    asOptionalString(value.content);
+    asOptionalString(value.Text) ?? asOptionalString(value.text) ?? asOptionalString(value.content);
   return directText != null ? [directText] : [];
 }
 
@@ -443,8 +442,7 @@ function extractToolCallArgumentsFromRecord(value: unknown, depth = 0): string |
   }
   const functionRecord = isRecord(value.function) ? value.function : undefined;
   const functionArgs =
-    asOptionalString(functionRecord?.arguments) ??
-    asOptionalString(functionRecord?.args);
+    asOptionalString(functionRecord?.arguments) ?? asOptionalString(functionRecord?.args);
   if (functionArgs != null) {
     return functionArgs;
   }
@@ -484,7 +482,9 @@ function isLikelyToolCallRecord(value: JsonRecord): boolean {
 function isTransientCodexReconnectMessage(message: string): boolean {
   return (
     /reconnecting\.\.\.\s+\d+\/\d+/iu.test(message) &&
-    /stream disconnected before completion|operation was aborted due to timeout|timeout/iu.test(message)
+    /stream disconnected before completion|operation was aborted due to timeout|timeout/iu.test(
+      message
+    )
   );
 }
 
@@ -500,9 +500,9 @@ function isAssistantLikeEvent(type: string, subject: JsonRecord): boolean {
 
 function isToolCallEvent(type: string, subjectType: string): boolean {
   return (
-    /(?:tool|function)_?call/iu.test(type) ||
-    /(?:tool|function)_?call/iu.test(subjectType)
-  ) && !isToolOutputEvent(type, subjectType);
+    (/(?:tool|function)_?call/iu.test(type) || /(?:tool|function)_?call/iu.test(subjectType)) &&
+    !isToolOutputEvent(type, subjectType)
+  );
 }
 
 function isToolOutputEvent(type: string, subjectType: string): boolean {
@@ -518,10 +518,7 @@ function sanitizeActiveTurnText(text: string): string {
       "[redacted private key]"
     )
     .replace(/(authorization:\s*bearer\s+)[^\s"']+/giu, "$1[redacted]")
-    .replace(
-      /\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*["']?[^"'\s]+/giu,
-      "$1=[redacted]"
-    );
+    .replace(/\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*["']?[^"'\s]+/giu, "$1=[redacted]");
 }
 
 function truncateOneLine(text: string, maxChars: number): string {
@@ -706,24 +703,21 @@ function parsePromptEventLine(line: string): PromptEvent | null {
         const usage = normalizeUsage(structured.payload);
         return {
           type: "status",
-          text:
-            used != null && size != null ? `usage updated: ${used}/${size}` : "usage updated",
+          text: used != null && size != null ? `usage updated: ${used}/${size}` : "usage updated",
           ...(structured.tag != null ? { tag: structured.tag } : {}),
           ...(used != null ? { used } : {}),
           ...(size != null ? { size } : {}),
           ...(hasNonzeroUsage(usage) ? { usage } : {})
         };
       }
-      case "done":
-        {
+      case "done": {
         const stopReason = asOptionalString(structured.payload.stopReason);
         return {
           type: "done",
           ...(stopReason != null ? { stopReason } : {})
         };
       }
-      case "error":
-        {
+      case "error": {
         const code = asOptionalString(structured.payload.code);
         return {
           type: "error",
@@ -849,7 +843,7 @@ function splitCommandLine(input: string): string[] {
   const matches = input.match(/"([^"]*)"|'([^']*)'|[^\s]+/gu) ?? [];
   return matches.map((part) => {
     if (
-      (part.startsWith("\"") && part.endsWith("\"")) ||
+      (part.startsWith('"') && part.endsWith('"')) ||
       (part.startsWith("'") && part.endsWith("'"))
     ) {
       return part.slice(1, -1);
@@ -972,6 +966,7 @@ export class AcpxSessionManager implements ISessionManager {
   private readonly stopRequests = new Set<string>();
   private readonly activeTurnOutputs = new Map<string, ActiveTurnOutput>();
   private readonly activeTurnProcesses = new Map<string, ActiveTurnProcess>();
+  private readonly lifecycleTails = new Map<string, Promise<void>>();
 
   constructor(
     private readonly deps: {
@@ -1012,234 +1007,265 @@ export class AcpxSessionManager implements ISessionManager {
 
   async start(params: StartParams): Promise<ToolResult> {
     return await this.withSessionTurnLock(params.name, async () => {
-    const directory = resolvePath(params.directory);
-    const now = nowIso();
-    const requestedSkills = validateSkillNames(params.skills ?? []);
-    const existing = this.deps.store.getSession(params.name);
-    if (existing != null) {
-      if (existing.agent !== params.agent) {
-        throw new PuppenclawError(
-          "SESSION_CONFLICT",
-          `Session ${params.name} already exists for agent ${existing.agent}.`
-        );
+      const directory = resolvePath(params.directory);
+      const now = nowIso();
+      const requestedSkills = validateSkillNames(params.skills ?? []);
+      const existing = this.deps.store.getSession(params.name);
+      if (existing != null) {
+        if (existing.agent !== params.agent) {
+          throw new PuppenclawError(
+            "SESSION_CONFLICT",
+            `Session ${params.name} already exists for agent ${existing.agent}.`
+          );
+        }
+        if (resolvePath(existing.directory) !== directory) {
+          throw new PuppenclawError(
+            "SESSION_CONFLICT",
+            `Session ${params.name} already points at ${existing.directory}.`
+          );
+        }
       }
-      if (resolvePath(existing.directory) !== directory) {
-        throw new PuppenclawError(
-          "SESSION_CONFLICT",
-          `Session ${params.name} already points at ${existing.directory}.`
-        );
+      if (existing == null || !isConnectedSession(existing)) {
+        await this.ensureConnectedCapacity(params.name);
       }
-    }
-    if (existing == null || !isConnectedSession(existing)) {
-      await this.ensureConnectedCapacity(params.name);
-    }
 
-    const installedSkills = await this.installSessionSkills(directory, requestedSkills);
-    const installedSkillNames = installedSkills.map((skill) => skill.name);
-    const baseSession = existing ?? this.createSession({
-      name: params.name,
-      agent: params.agent,
-      directory,
-      permissionMode: params.permissionMode ?? this.deps.config.permissionMode,
-      ...(params.effort != null ? { effort: params.effort } : {}),
-      ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {}),
-      ...(params.model != null ? { model: params.model } : {}),
-      ...(params.modelProviderId != null ? { modelProviderId: params.modelProviderId } : {}),
-      ...(params.modelProvider != null ? { modelProvider: params.modelProvider } : {}),
-      ...(installedSkillNames.length > 0 ? { skills: installedSkillNames } : {}),
-      createdAt: now
-    });
-    const requestedSession =
-      existing != null && params.effort != null
-        ? { ...baseSession, effort: params.effort }
-        : baseSession;
-    const reasoning = this.resolveSessionReasoning(requestedSession);
-    const session = reasoning.session;
-    const sessionSkills = dedupeSkillNames([
-      ...(session.skills ?? []),
-      ...installedSkillNames
-    ]);
+      const installedSkills = await this.installSessionSkills(directory, requestedSkills);
+      const installedSkillNames = installedSkills.map((skill) => skill.name);
+      const baseSession =
+        existing ??
+        this.createSession({
+          name: params.name,
+          agent: params.agent,
+          directory,
+          permissionMode: params.permissionMode ?? this.deps.config.permissionMode,
+          ...(params.effort != null ? { effort: params.effort } : {}),
+          ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {}),
+          ...(params.model != null ? { model: params.model } : {}),
+          ...(params.modelProviderId != null ? { modelProviderId: params.modelProviderId } : {}),
+          ...(params.modelProvider != null ? { modelProvider: params.modelProvider } : {}),
+          ...(installedSkillNames.length > 0 ? { skills: installedSkillNames } : {}),
+          createdAt: now
+        });
+      const requestedSession =
+        existing != null && params.effort != null
+          ? { ...baseSession, effort: params.effort }
+          : baseSession;
+      const reasoning = this.resolveSessionReasoning(requestedSession);
+      const session = reasoning.session;
+      const sessionSkills = dedupeSkillNames([...(session.skills ?? []), ...installedSkillNames]);
 
-    const warnings = dedupeWarnings([
-      ...session.warnings,
-      ...(reasoning.warning != null ? [reasoning.warning] : []),
-      ...this.resolveCapabilityWarnings({
-        agent: params.agent,
-        ...(params.model != null ? { model: params.model } : {}),
-        ...(params.effort != null ? { effort: params.effort } : {}),
-        ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {})
-      })
-    ]);
+      const warnings = dedupeWarnings([
+        ...session.warnings,
+        ...(reasoning.warning != null ? [reasoning.warning] : []),
+        ...this.resolveCapabilityWarnings({
+          agent: params.agent,
+          ...(params.model != null ? { model: params.model } : {}),
+          ...(params.effort != null ? { effort: params.effort } : {}),
+          ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {})
+        })
+      ]);
 
-    if (!this.usesOneShotRuntime(session)) {
-      await this.ensureRuntimeSession({
-        name: params.name,
-        agent: params.agent,
-        directory,
-        ...(params.model ?? session.model ? { model: params.model ?? session.model } : {}),
-        ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
-        ...(params.modelProvider ?? session.modelProvider
-          ? { modelProvider: params.modelProvider ?? session.modelProvider }
-          : {})
-      });
-    }
+      const provisionalSession: SessionInfo = {
+        ...session,
+        state: "running",
+        lastActivity: now,
+        warnings,
+        ...(sessionSkills.length > 0 ? { skills: sessionSkills } : {}),
+        handle: {
+          runtimeSessionName: params.name,
+          cwd: directory,
+          agent: params.agent,
+          mode: "persistent"
+        }
+      };
+      // Persist the identity before starting external runtime work. A cleanup
+      // request racing an ambiguous start response can then fence this runtime.
+      await this.deps.store.upsertSession(provisionalSession);
 
-    const context = await loadContextFiles(directory, params.contextFiles);
-    const promptText = [
-      this.buildPlanningPromptPrefix({
-        agent: params.agent,
-        ...(params.planningProfile ?? session.planningProfile
-          ? { planningProfile: params.planningProfile ?? session.planningProfile }
-          : {})
-      }),
-      params.task.trim(),
-      context.promptText
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-    const runtimePromptText =
-      session.state === "suspended"
-        ? this.buildRehydrationPrompt(session, promptText)
-        : promptText;
-    const effectivePromptText = this.usesOneShotRuntime(session)
-      ? this.buildOneShotContinuationPrompt(session, runtimePromptText)
-      : runtimePromptText;
-    const effectivePermissionMode = this.effectivePermissionMode(session);
-    const turn = await this.runTurn({
-      session,
-      promptText: effectivePromptText,
-      permissionMode: effectivePermissionMode
-    });
-    const stoppedDuringTurn = this.stopRequests.delete(params.name);
+      try {
+        if (!this.usesOneShotRuntime(session)) {
+          await this.ensureRuntimeSession({
+            name: params.name,
+            agent: params.agent,
+            directory,
+            ...((params.model ?? session.model) ? { model: params.model ?? session.model } : {}),
+            ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
+            ...((params.modelProvider ?? session.modelProvider)
+              ? { modelProvider: params.modelProvider ?? session.modelProvider }
+              : {})
+          });
+        }
 
-    const nextSession: SessionInfo = {
-      ...session,
-      permissionMode: effectivePermissionMode,
-      state: stoppedDuringTurn ? "stopped" : turn.state,
-      lastActivity: nowIso(),
-      warnings: dedupeWarnings([...warnings, ...turn.warnings]),
-      ...(sessionSkills.length > 0 ? { skills: sessionSkills } : {}),
-      transcript: mergeTranscript(
-        session.transcript,
-        [...makeUserTranscript(promptText), ...turn.transcript]
-      ),
-      ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
-      ...(turn.state === "failed"
-        ? { lastError: turn.output || session.lastError || "ACP turn failed." }
-        : {}),
-      ...(turn.tokenUsage != null
-        ? { tokenUsage: turn.tokenUsage }
-        : session.tokenUsage != null
-          ? { tokenUsage: session.tokenUsage }
-          : {}),
-      handle: {
-        runtimeSessionName: params.name,
-        cwd: directory,
-        agent: params.agent,
-        mode: "persistent"
-      },
-      ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {})
-    };
+        const context = await loadContextFiles(directory, params.contextFiles);
+        const promptText = [
+          this.buildPlanningPromptPrefix({
+            agent: params.agent,
+            ...((params.planningProfile ?? session.planningProfile)
+              ? { planningProfile: params.planningProfile ?? session.planningProfile }
+              : {})
+          }),
+          params.task.trim(),
+          context.promptText
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+        const runtimePromptText =
+          session.state === "suspended"
+            ? this.buildRehydrationPrompt(session, promptText)
+            : promptText;
+        const effectivePromptText = this.usesOneShotRuntime(session)
+          ? this.buildOneShotContinuationPrompt(session, runtimePromptText)
+          : runtimePromptText;
+        const effectivePermissionMode = this.effectivePermissionMode(session);
+        const turn = await this.runTurn({
+          session,
+          promptText: effectivePromptText,
+          permissionMode: effectivePermissionMode
+        });
+        const stoppedDuringTurn = this.stopRequests.delete(params.name);
 
-    await this.deps.store.upsertSession(nextSession);
-    this.recordTurnUsage(nextSession, turn);
-    return textToolResult(`Started session ${params.name}.`, {
-      session: nextSession,
-      output: turn.output,
-      outputRole: outputRoleForTurn(turn),
-      contextFiles: context.files,
-      skills: installedSkills
-    });
+        const nextSession: SessionInfo = {
+          ...session,
+          permissionMode: effectivePermissionMode,
+          state: stoppedDuringTurn ? "stopped" : turn.state,
+          lastActivity: nowIso(),
+          warnings: dedupeWarnings([...warnings, ...turn.warnings]),
+          ...(sessionSkills.length > 0 ? { skills: sessionSkills } : {}),
+          transcript: mergeTranscript(session.transcript, [
+            ...makeUserTranscript(promptText),
+            ...turn.transcript
+          ]),
+          ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
+          ...(turn.state === "failed"
+            ? { lastError: turn.output || session.lastError || "ACP turn failed." }
+            : {}),
+          ...(turn.tokenUsage != null
+            ? { tokenUsage: turn.tokenUsage }
+            : session.tokenUsage != null
+              ? { tokenUsage: session.tokenUsage }
+              : {}),
+          handle: {
+            runtimeSessionName: params.name,
+            cwd: directory,
+            agent: params.agent,
+            mode: "persistent"
+          },
+          ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {})
+        };
+
+        await this.deps.store.upsertSession(nextSession);
+        this.recordTurnUsage(nextSession, turn);
+        return textToolResult(`Started session ${params.name}.`, {
+          session: nextSession,
+          output: turn.output,
+          outputRole: outputRoleForTurn(turn),
+          contextFiles: context.files,
+          skills: installedSkills
+        });
+      } catch (error) {
+        if (this.deps.store.getActiveQuiescenceEpoch(params.name) == null) {
+          await this.deps.store.upsertSession({
+            ...provisionalSession,
+            state: "failed",
+            lastActivity: nowIso(),
+            lastError: ensureError(error).message
+          });
+        }
+        throw error;
+      }
     });
   }
 
   async send(params: SendParams): Promise<ToolResult> {
     return await this.withSessionTurnLock(params.name, async () => {
-    const session = this.requireSession(params.name);
-    const requestedSession =
-      params.effort == null ? session : { ...session, effort: params.effort };
-    const reasoning = this.resolveSessionReasoning(requestedSession);
-    const effectiveSession = reasoning.session;
-    if (!isConnectedSession(session)) {
-      await this.ensureConnectedCapacity(params.name);
-    }
-    if (!this.usesOneShotRuntime(effectiveSession)) {
-      await this.ensureRuntimeSession({
-        name: effectiveSession.name,
-        agent: effectiveSession.agent,
-        directory: effectiveSession.directory,
-        ...(effectiveSession.model != null ? { model: effectiveSession.model } : {}),
-        ...(effectiveSession.runtimeEffort != null
-          ? { effort: effectiveSession.runtimeEffort }
-          : {}),
-        ...(effectiveSession.modelProvider != null
-          ? { modelProvider: effectiveSession.modelProvider }
-          : {})
+      const session = this.requireSession(params.name);
+      const requestedSession =
+        params.effort == null ? session : { ...session, effort: params.effort };
+      const reasoning = this.resolveSessionReasoning(requestedSession);
+      const effectiveSession = reasoning.session;
+      if (!isConnectedSession(session)) {
+        await this.ensureConnectedCapacity(params.name);
+      }
+      if (!this.usesOneShotRuntime(effectiveSession)) {
+        await this.ensureRuntimeSession({
+          name: effectiveSession.name,
+          agent: effectiveSession.agent,
+          directory: effectiveSession.directory,
+          ...(effectiveSession.model != null ? { model: effectiveSession.model } : {}),
+          ...(effectiveSession.runtimeEffort != null
+            ? { effort: effectiveSession.runtimeEffort }
+            : {}),
+          ...(effectiveSession.modelProvider != null
+            ? { modelProvider: effectiveSession.modelProvider }
+            : {})
+        });
+      }
+      const context = await loadContextFiles(session.directory, params.contextFiles);
+      const prefix =
+        effectiveSession.effort == null && params.ultrathink === true
+          ? effectiveSession.reasoningProfile === "claude"
+            ? "ultrathink\n\n"
+            : "Use a high-effort reasoning pass for this reply.\n\n"
+          : "";
+      const promptText = [prefix + params.message.trim(), context.promptText]
+        .filter(Boolean)
+        .join("\n\n");
+      const runtimePromptText =
+        session.state === "suspended"
+          ? this.buildRehydrationPrompt(session, promptText)
+          : promptText;
+      const effectivePromptText = this.usesOneShotRuntime(effectiveSession)
+        ? this.buildOneShotContinuationPrompt(effectiveSession, runtimePromptText)
+        : runtimePromptText;
+      const effectivePermissionMode =
+        params.permissionMode ?? this.effectivePermissionMode(session);
+      const turn = await this.runTurn({
+        session: effectiveSession,
+        promptText: effectivePromptText,
+        permissionMode: effectivePermissionMode
       });
-    }
-    const context = await loadContextFiles(session.directory, params.contextFiles);
-    const prefix =
-      effectiveSession.effort == null && params.ultrathink === true
-        ? effectiveSession.reasoningProfile === "claude"
-          ? "ultrathink\n\n"
-          : "Use a high-effort reasoning pass for this reply.\n\n"
-        : "";
-    const promptText = [prefix + params.message.trim(), context.promptText].filter(Boolean).join("\n\n");
-    const runtimePromptText =
-      session.state === "suspended"
-        ? this.buildRehydrationPrompt(session, promptText)
-        : promptText;
-    const effectivePromptText = this.usesOneShotRuntime(effectiveSession)
-      ? this.buildOneShotContinuationPrompt(effectiveSession, runtimePromptText)
-      : runtimePromptText;
-    const effectivePermissionMode =
-      params.permissionMode ?? this.effectivePermissionMode(session);
-    const turn = await this.runTurn({
-      session: effectiveSession,
-      promptText: effectivePromptText,
-      permissionMode: effectivePermissionMode
-    });
-    const stoppedDuringTurn = this.stopRequests.delete(params.name);
+      const stoppedDuringTurn = this.stopRequests.delete(params.name);
 
-    const nextSession: SessionInfo = {
-      ...effectiveSession,
-      permissionMode:
-        params.permissionMode == null ? effectivePermissionMode : session.permissionMode,
-      state: stoppedDuringTurn ? "stopped" : turn.state,
-      lastActivity: nowIso(),
-      warnings: dedupeWarnings([
-        ...session.warnings,
-        ...(reasoning.warning != null ? [reasoning.warning] : []),
-        ...turn.warnings
-      ]),
-      transcript: mergeTranscript(session.transcript, [
-        ...makeUserTranscript(promptText),
-        ...turn.transcript
-      ]),
-      ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
-      ...(turn.state === "failed"
-        ? { lastError: turn.output || session.lastError || "ACP turn failed." }
-        : {}),
-      ...(turn.tokenUsage != null
-        ? { tokenUsage: turn.tokenUsage }
-        : session.tokenUsage != null
-          ? { tokenUsage: session.tokenUsage }
+      const nextSession: SessionInfo = {
+        ...effectiveSession,
+        permissionMode:
+          params.permissionMode == null ? effectivePermissionMode : session.permissionMode,
+        state: stoppedDuringTurn ? "stopped" : turn.state,
+        lastActivity: nowIso(),
+        warnings: dedupeWarnings([
+          ...session.warnings,
+          ...(reasoning.warning != null ? [reasoning.warning] : []),
+          ...turn.warnings
+        ]),
+        transcript: mergeTranscript(session.transcript, [
+          ...makeUserTranscript(promptText),
+          ...turn.transcript
+        ]),
+        ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
+        ...(turn.state === "failed"
+          ? { lastError: turn.output || session.lastError || "ACP turn failed." }
           : {}),
-      ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {})
-    };
+        ...(turn.tokenUsage != null
+          ? { tokenUsage: turn.tokenUsage }
+          : session.tokenUsage != null
+            ? { tokenUsage: session.tokenUsage }
+            : {}),
+        ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {})
+      };
 
-    await this.deps.store.upsertSession(nextSession);
-    this.recordTurnUsage(nextSession, turn);
-    return textToolResult(`Updated session ${params.name}.`, {
-      session: nextSession,
-      output: turn.output,
-      outputRole: outputRoleForTurn(turn),
-      contextFiles: context.files
-    });
+      await this.deps.store.upsertSession(nextSession);
+      this.recordTurnUsage(nextSession, turn);
+      return textToolResult(`Updated session ${params.name}.`, {
+        session: nextSession,
+        output: turn.output,
+        outputRole: outputRoleForTurn(turn),
+        contextFiles: context.files
+      });
     });
   }
 
   async stop(params: StopParams): Promise<ToolResult> {
+    this.deps.store.assertSessionMutable(params.name);
     const session = this.requireSession(params.name);
     const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
     this.stopRequests.add(params.name);
@@ -1282,6 +1308,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async resume(params: ResumeParams): Promise<ToolResult> {
+    this.deps.store.assertSessionMutable(params.name);
     const storedSession = this.requireSession(params.name);
     const reasoning = this.resolveSessionReasoning(storedSession);
     const session = reasoning.session;
@@ -1313,6 +1340,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async suspend(params: SuspendParams): Promise<ToolResult> {
+    this.deps.store.assertSessionMutable(params.name);
     const session = this.requireSession(params.name);
     if (this.isTurnActive(session)) {
       throw new PuppenclawError(
@@ -1332,6 +1360,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async focus(params: FocusParams): Promise<ToolResult> {
+    this.deps.store.assertSessionMutable(params.name);
     const session = this.requireSession(params.name);
     const ttlMs = params.ttlMs ?? DEFAULT_FOCUS_LEASE_MS;
     const nextSession: SessionInfo = {
@@ -1345,6 +1374,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async unfocus(params: UnfocusParams): Promise<ToolResult> {
+    this.deps.store.assertSessionMutable(params.name);
     const session = this.requireSession(params.name);
     const nextSession = withoutFocusLease(session);
     await this.deps.store.upsertSession(nextSession);
@@ -1354,6 +1384,8 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async fork(params: ForkParams): Promise<ToolResult> {
+    this.deps.store.assertSessionMutable(params.source);
+    this.deps.store.assertSessionMutable(params.target);
     const source = this.requireSession(params.source);
     if (this.deps.store.getSession(params.target) != null) {
       throw new PuppenclawError(
@@ -1437,8 +1469,7 @@ export class AcpxSessionManager implements ISessionManager {
       .reverse()
       .find(
         (entry) =>
-          (entry.role === "assistant" || entry.role === "status") &&
-          entry.text.trim().length > 0
+          (entry.role === "assistant" || entry.role === "status") && entry.text.trim().length > 0
       );
     const activeHasText = active != null && active.text.trim().length > 0;
     const useActive =
@@ -1448,8 +1479,8 @@ export class AcpxSessionManager implements ISessionManager {
           Date.parse(active.updatedAt) >= Date.parse(latestTranscriptOutput.createdAt) - 5_000 ||
           session.state === "failed"));
     const text = useActive
-      ? active?.text ?? ""
-      : latestTranscriptOutput?.text ?? active?.text ?? "";
+      ? (active?.text ?? "")
+      : (latestTranscriptOutput?.text ?? active?.text ?? "");
     return jsonToolResult(
       {
         session: this.decorateVisibleSession(session),
@@ -1462,10 +1493,10 @@ export class AcpxSessionManager implements ISessionManager {
               : latestTranscriptOutput != null
                 ? "transcript"
                 : "none",
-          startedAt: useActive ? active?.startedAt ?? null : null,
+          startedAt: useActive ? (active?.startedAt ?? null) : null,
           updatedAt: useActive
-            ? active?.updatedAt ?? null
-            : latestTranscriptOutput?.createdAt ?? null,
+            ? (active?.updatedAt ?? null)
+            : (latestTranscriptOutput?.createdAt ?? null),
           complete: runningActive?.complete ?? session.state !== "running"
         }
       },
@@ -1546,40 +1577,77 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async purge(params: StopParams): Promise<ToolResult> {
-    const session = this.requireSession(params.name);
-    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
-    this.stopRequests.add(params.name);
-    this.terminateActiveTurnProcess(params.name, "SIGTERM");
-    await this.runControlCommand({
-      args: this.buildVerbArgs(session.agent, session.directory, [
-        "cancel",
-        "--session",
-        session.name
-      ]),
-      cwd: session.directory,
-      ...(runtimeEnv != null ? { env: runtimeEnv } : {})
-    }).catch(() => {
-      // best-effort cancel
+    return await this.withLifecycleLock(params.name, async () => {
+      const session = this.deps.store.getSession(params.name);
+      const existingReservation = this.deps.store.getQuiescence(params.name);
+      if (session == null) {
+        if (existingReservation != null && existingReservation.purpose === "purge") {
+          await this.deps.store.releaseQuiescence(params.name, existingReservation.epoch);
+          this.stopRequests.delete(params.name);
+          return textToolResult(`Session ${params.name} was already purged.`, {
+            sessionName: params.name,
+            purged: true,
+            alreadyAbsent: true,
+            quiescenceEpoch: existingReservation.epoch
+          });
+        }
+        throw new PuppenclawError("NO_SESSION", `Unknown session ${params.name}.`);
+      }
+      const reservation = await this.deps.store.reserveQuiescence(params.name, "purge");
+      const epoch = reservation.epoch;
+      await this.closeQuiescedRuntime(session, epoch);
+      await this.deps.store.removeSession(params.name);
+      this.deps.outputRouter.clear(params.name);
+      this.activeTurnOutputs.delete(params.name);
+      this.activeTurnProcesses.delete(params.name);
+      this.stopRequests.delete(params.name);
+      if (reservation.purpose === "purge") {
+        await this.deps.store.releaseQuiescence(params.name, epoch);
+      }
+      return textToolResult(`Purged session ${params.name}.`, {
+        sessionName: params.name,
+        purged: true,
+        quiescenceEpoch: epoch
+      });
     });
-    await this.runControlCommand({
-      args: this.buildVerbArgs(session.agent, session.directory, [
-        "sessions",
-        "close",
-        session.name
-      ]),
-      cwd: session.directory,
-      ...(runtimeEnv != null ? { env: runtimeEnv } : {})
-    }).catch(() => {
-      // best-effort close
+  }
+
+  async quiesce(params: QuiesceParams): Promise<ToolResult> {
+    return await this.withLifecycleLock(params.name, async () => {
+      const session = this.deps.store.getSession(params.name);
+      const activeReservation = this.deps.store.getQuiescence(params.name);
+      if (session == null && activeReservation == null) {
+        throw new PuppenclawError("NO_SESSION", `Unknown session ${params.name}.`);
+      }
+      const reservation = await this.deps.store.reserveQuiescence(params.name, "external");
+      const epoch = reservation.epoch;
+      if (session != null) {
+        await this.closeQuiescedRuntime(session, epoch);
+      }
+      return textToolResult(`Quiesced session ${params.name}.`, {
+        ...(session != null ? { session: this.decorateVisibleSession(session) } : {}),
+        reservation: {
+          name: params.name,
+          epoch
+        },
+        quiescenceEpoch: epoch,
+        runtimeClosed: true
+      });
     });
-    await this.deps.store.removeSession(params.name);
-    this.deps.outputRouter.clear(params.name);
-    this.activeTurnOutputs.delete(params.name);
-    this.activeTurnProcesses.delete(params.name);
-    this.stopRequests.delete(params.name);
-    return textToolResult(`Purged session ${params.name}.`, {
-      sessionName: params.name,
-      purged: true
+  }
+
+  async releaseQuiescence(params: QuiescenceReleaseParams): Promise<ToolResult> {
+    return await this.withLifecycleLock(params.name, async () => {
+      await this.deps.store.releaseQuiescence(params.name, params.epoch);
+      this.stopRequests.delete(params.name);
+      return textToolResult(`Released quiescence for session ${params.name}.`, {
+        reservation: {
+          name: params.name,
+          epoch: params.epoch
+        },
+        quiescenceEpoch: params.epoch,
+        released: true
+      });
     });
   }
 
@@ -1601,27 +1669,16 @@ export class AcpxSessionManager implements ISessionManager {
       if (!Number.isFinite(ageMs) || ageMs < ttlMs) {
         continue;
       }
-      const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
-      await this.runControlCommand({
-        args: this.buildVerbArgs(session.agent, session.directory, [
-          "sessions",
-          "close",
-          session.name
-        ]),
-        cwd: session.directory,
-        ...(runtimeEnv != null ? { env: runtimeEnv } : {})
-      }).catch(() => {
-        // best effort
+      await this.purge({ name: session.name }).catch((error) => {
+        this.deps.logger.warn(
+          `Unable to purge expired session ${session.name}: ${ensureError(error).message}`
+        );
       });
-      await this.deps.store.removeSession(session.name);
-      this.deps.outputRouter.clear(session.name);
-      this.activeTurnOutputs.delete(session.name);
-      this.activeTurnProcesses.delete(session.name);
-      this.stopRequests.delete(session.name);
     }
   }
 
   private async withSessionTurnLock<T>(name: string, run: () => Promise<T>): Promise<T> {
+    this.deps.store.assertSessionMutable(name);
     if (this.activeTurns.has(name)) {
       throw new PuppenclawError(
         "TURN_ALREADY_RUNNING",
@@ -1635,6 +1692,106 @@ export class AcpxSessionManager implements ISessionManager {
     } finally {
       this.activeTurns.delete(name);
     }
+  }
+
+  private async withLifecycleLock<T>(name: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleTails.get(name) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(run);
+    const tail = operation.then(
+      () => undefined,
+      () => undefined
+    );
+    this.lifecycleTails.set(name, tail);
+    try {
+      return await operation;
+    } finally {
+      if (this.lifecycleTails.get(name) === tail) {
+        this.lifecycleTails.delete(name);
+      }
+    }
+  }
+
+  private async closeQuiescedRuntime(session: SessionInfo, epoch: number): Promise<void> {
+    this.stopRequests.add(session.name);
+    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+    this.terminateActiveTurnProcess(session.name, "SIGTERM");
+    await this.runControlCommand({
+      args: this.buildVerbArgs(session.agent, session.directory, [
+        "cancel",
+        "--session",
+        session.name
+      ]),
+      cwd: session.directory,
+      timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS,
+      ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+    }).catch((error) => {
+      this.deps.logger.debug(
+        `Unable to cancel quiesced session ${session.name}: ${ensureError(error).message}`
+      );
+    });
+
+    const drained = await this.waitForActiveTurnDrain(session.name);
+    if (!drained) {
+      throw new PuppenclawError(
+        "QUIESCENCE_UNAVAILABLE",
+        `Session ${session.name} did not drain for quiescence epoch ${epoch}.`,
+        { name: session.name, quiescenceEpoch: epoch }
+      );
+    }
+
+    if (this.usesOneShotRuntime(session)) {
+      return;
+    }
+
+    await this.runControlCommand({
+      args: this.buildVerbArgs(session.agent, session.directory, [
+        "sessions",
+        "close",
+        session.name
+      ]),
+      cwd: session.directory,
+      allowNoSession: true,
+      timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS,
+      ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+    }).catch((error) => {
+      this.deps.logger.debug(
+        `Unable to close quiesced session ${session.name}: ${ensureError(error).message}`
+      );
+    });
+
+    const deadline = Date.now() + QUIESCENCE_CONTROL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const status = await this.getRuntimeStatus({
+        name: session.name,
+        agent: session.agent,
+        directory: session.directory,
+        timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS,
+        ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+      }).catch(() => ({ exists: true }));
+      if (!status.exists) {
+        return;
+      }
+      await sleep(QUIESCENCE_POLL_MS);
+    }
+    throw new PuppenclawError(
+      "QUIESCENCE_UNAVAILABLE",
+      `ACP runtime closure could not be proved for session ${session.name}.`,
+      { name: session.name, quiescenceEpoch: epoch }
+    );
+  }
+
+  private async waitForActiveTurnDrain(name: string): Promise<boolean> {
+    const deadline = Date.now() + QUIESCENCE_DRAIN_TIMEOUT_MS;
+    const escalationAt = Date.now() + Math.min(1_000, QUIESCENCE_DRAIN_TIMEOUT_MS / 2);
+    while (Date.now() < deadline) {
+      if (!this.activeTurns.has(name) && !this.activeTurnProcesses.has(name)) {
+        return true;
+      }
+      const signal = Date.now() >= escalationAt ? "SIGKILL" : "SIGTERM";
+      this.terminateActiveTurnProcess(name, signal);
+      await sleep(QUIESCENCE_POLL_MS);
+    }
+    return !this.activeTurns.has(name) && !this.activeTurnProcesses.has(name);
   }
 
   private isTurnActive(session: SessionInfo): boolean {
@@ -1686,10 +1843,7 @@ export class AcpxSessionManager implements ISessionManager {
     );
   }
 
-  private async suspendTrackedSession(
-    session: SessionInfo,
-    reason: string
-  ): Promise<SessionInfo> {
+  private async suspendTrackedSession(session: SessionInfo, reason: string): Promise<SessionInfo> {
     const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
     await this.runControlCommand({
       args: this.buildVerbArgs(session.agent, session.directory, [
@@ -1911,9 +2065,7 @@ export class AcpxSessionManager implements ISessionManager {
       ...(modelProvider.label != null
         ? { PUPPENCLAW_MODEL_PROVIDER_LABEL: modelProvider.label }
         : {}),
-      ...(modelProvider.kind != null
-        ? { PUPPENCLAW_MODEL_PROVIDER_KIND: modelProvider.kind }
-        : {}),
+      ...(modelProvider.kind != null ? { PUPPENCLAW_MODEL_PROVIDER_KIND: modelProvider.kind } : {}),
       ...(modelProvider.baseUrl != null
         ? { PUPPENCLAW_MODEL_PROVIDER_BASE_URL: modelProvider.baseUrl }
         : {}),
@@ -1936,10 +2088,7 @@ export class AcpxSessionManager implements ISessionManager {
     return session.agent === "codex" && session.modelProvider != null;
   }
 
-  private buildOneShotContinuationPrompt(
-    session: SessionInfo,
-    promptText: string
-  ): string {
+  private buildOneShotContinuationPrompt(session: SessionInfo, promptText: string): string {
     if (session.transcript.length === 0) {
       return promptText;
     }
@@ -2155,6 +2304,7 @@ export class AcpxSessionManager implements ISessionManager {
     agent: AgentKind;
     directory: string;
     modelProvider?: ModelProviderConfig;
+    timeoutMs?: number;
   }): Promise<RuntimeStatus> {
     const runtimeEnv = this.modelProviderRuntimeEnv(params.modelProvider);
     const result = await this.runControlCommand({
@@ -2165,7 +2315,8 @@ export class AcpxSessionManager implements ISessionManager {
       ]),
       cwd: params.directory,
       ...(runtimeEnv != null ? { env: runtimeEnv } : {}),
-      allowNoSession: true
+      allowNoSession: true,
+      ...(params.timeoutMs != null ? { timeoutMs: params.timeoutMs } : {})
     });
     const events = parseJsonLines(result.stdout);
     const error = events.map((event) => toErrorRecord(event)).find(Boolean) ?? null;
@@ -2178,7 +2329,9 @@ export class AcpxSessionManager implements ISessionManager {
     }
     return {
       exists: detail != null,
-      ...(detail != null ? { status: asOptionalString(detail.status) ?? "unknown", raw: detail } : {})
+      ...(detail != null
+        ? { status: asOptionalString(detail.status) ?? "unknown", raw: detail }
+        : {})
     };
   }
 
@@ -2252,16 +2405,16 @@ export class AcpxSessionManager implements ISessionManager {
     retryAfterReconnect?: boolean;
     baselineMessageCount?: number;
   }): Promise<TurnResult> {
+    this.deps.store.assertSessionMutable(params.session.name);
     if (this.usesOneShotRuntime(params.session)) {
       return await this.runCodexOneShotTurn(params);
     }
 
     const oneShotRuntime = this.usesOneShotRuntime(params.session);
-    const baselineMessageCount =
-      oneShotRuntime
-        ? undefined
-        : params.baselineMessageCount ??
-          (await this.getRuntimeMessageCount(params.session).catch(() => undefined));
+    const baselineMessageCount = oneShotRuntime
+      ? undefined
+      : (params.baselineMessageCount ??
+        (await this.getRuntimeMessageCount(params.session).catch(() => undefined)));
     const promptStartedAtMs = Date.now();
     this.startActiveTurnOutput(params.session.name);
     const args = this.buildVerbArgs(
@@ -2418,7 +2571,9 @@ export class AcpxSessionManager implements ISessionManager {
     );
     const turnStopReason = doneEvent?.stopReason;
     const turnDurationMs = Date.now() - promptStartedAtMs;
-    const errorEvent = events.find((event): event is Extract<PromptEvent, { type: "error" }> => event.type === "error");
+    const errorEvent = events.find(
+      (event): event is Extract<PromptEvent, { type: "error" }> => event.type === "error"
+    );
     const reconnectEvent = events.find(
       (event): event is Extract<PromptEvent, { type: "status" }> =>
         event.type === "status" && /needs reconnect/iu.test(event.text)
@@ -2471,10 +2626,7 @@ export class AcpxSessionManager implements ISessionManager {
           ...(baselineMessageCount != null ? { baselineMessageCount } : {})
         });
       }
-      await this.deps.outputRouter.onError(
-        params.session.name,
-        new Error(reconnectText)
-      );
+      await this.deps.outputRouter.onError(params.session.name, new Error(reconnectText));
       this.completeActiveTurnOutput(params.session.name);
       return {
         output: reconnectText,
@@ -2493,10 +2645,7 @@ export class AcpxSessionManager implements ISessionManager {
       this.deps.logger.warn(
         `ACPX session ${params.session.name} returned error event: ${errorEvent.message}`
       );
-      await this.deps.outputRouter.onError(
-        params.session.name,
-        new Error(errorEvent.message)
-      );
+      await this.deps.outputRouter.onError(params.session.name, new Error(errorEvent.message));
       this.completeActiveTurnOutput(params.session.name);
       return {
         output: errorEvent.message,
@@ -2575,26 +2724,15 @@ export class AcpxSessionManager implements ISessionManager {
     const codexCommand = this.deps.config.codexCommand?.trim();
     const directCommandArgs =
       codexCommand != null
-        ? [
-            "--cwd",
-            params.session.directory,
-            "--",
-            ...providerLauncherParts,
-            ...codexArgs
-          ]
+        ? ["--cwd", params.session.directory, "--", ...providerLauncherParts, ...codexArgs]
         : codexArgs;
-    const spawnCommand = resolveSpawnCommand(
-      codexCommand ?? providerLauncher,
-      directCommandArgs
-    );
+    const spawnCommand = resolveSpawnCommand(codexCommand ?? providerLauncher, directCommandArgs);
     const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider);
     const env = {
       ...process.env,
       ...(runtimeEnv ?? {}),
       PUPPENCLAW_REAL_CODEX_AGENT_COMMAND:
-        process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND ??
-        process.env.CODEX_EXECUTABLE ??
-        "codex"
+        process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND ?? process.env.CODEX_EXECUTABLE ?? "codex"
     };
 
     this.startActiveTurnOutput(params.session.name);
@@ -2718,10 +2856,9 @@ export class AcpxSessionManager implements ISessionManager {
       this.deps.logger.warn(
         `Codex session ${params.session.name} exited with code ${exitCode ?? "unknown"}: ${message}`
       );
-      const failureOutput = [
-        liveOutput,
-        `\n[error] ${message}\n`
-      ].filter((part) => part.trim().length > 0).join("\n");
+      const failureOutput = [liveOutput, `\n[error] ${message}\n`]
+        .filter((part) => part.trim().length > 0)
+        .join("\n");
       this.setActiveTurnOutput(params.session.name, failureOutput);
       await this.deps.outputRouter.onError(params.session.name, new Error(message));
       this.completeActiveTurnOutput(params.session.name);
@@ -2859,9 +2996,7 @@ export class AcpxSessionManager implements ISessionManager {
       return null;
     }
     killProcessTree(active.child, signal, (error) => {
-      this.deps.logger.warn(
-        `Failed to signal active turn for ${sessionName}: ${error.message}`
-      );
+      this.deps.logger.warn(`Failed to signal active turn for ${sessionName}: ${error.message}`);
     });
     return active.child;
   }
@@ -2901,24 +3036,46 @@ export class AcpxSessionManager implements ISessionManager {
     cwd: string;
     env?: NodeJS.ProcessEnv;
     allowNoSession?: boolean;
+    timeoutMs?: number;
   }): Promise<ControlCommandResult> {
     return await new Promise<ControlCommandResult>((resolve, reject) => {
-      const spawnCommand = resolveSpawnCommand(
-        this.deps.config.acpxCommand ?? "acpx",
-        params.args
-      );
+      const spawnCommand = resolveSpawnCommand(this.deps.config.acpxCommand ?? "acpx", params.args);
       const child = spawnCommand.shell
         ? spawn(spawnCommand.command, {
             cwd: params.cwd,
             stdio: ["ignore", "pipe", "pipe"],
             shell: true,
+            detached: process.platform !== "win32",
             env: params.env != null ? { ...process.env, ...params.env } : process.env
           })
         : spawn(spawnCommand.command, spawnCommand.args, {
             cwd: params.cwd,
             stdio: ["ignore", "pipe", "pipe"],
+            detached: process.platform !== "win32",
             env: params.env != null ? { ...process.env, ...params.env } : process.env
           });
+      let settled = false;
+      const timeout =
+        params.timeoutMs == null
+          ? null
+          : setTimeout(() => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              killProcessTreeWithEscalation(child, 250, (error) => {
+                this.deps.logger.warn(
+                  `Failed to stop timed-out ACP control command: ${error.message}`
+                );
+              });
+              reject(
+                new PuppenclawError(
+                  "ACP_CONTROL_TIMEOUT",
+                  `ACPX control command timed out after ${params.timeoutMs}ms.`
+                )
+              );
+            }, params.timeoutMs);
+      timeout?.unref();
       let stdout = "";
       let stderr = "";
       child.stdout.setEncoding("utf8");
@@ -2930,6 +3087,13 @@ export class AcpxSessionManager implements ISessionManager {
         stderr += chunk;
       });
       child.once("error", (error: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timeout != null) {
+          clearTimeout(timeout);
+        }
         reject(
           new PuppenclawError(
             "ACP_CONTROL_FAILED",
@@ -2938,18 +3102,23 @@ export class AcpxSessionManager implements ISessionManager {
         );
       });
       child.once("close", (exitCode: number | null) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timeout != null) {
+          clearTimeout(timeout);
+        }
         const events = parseJsonLines(stdout);
         const errorEvent = events.map((event) => toErrorRecord(event)).find(Boolean) ?? null;
         if (errorEvent != null && !(params.allowNoSession && errorEvent.code === "NO_SESSION")) {
-          reject(
-            new PuppenclawError(
-              errorEvent.code ?? "ACP_CONTROL_FAILED",
-              errorEvent.message
-            )
-          );
+          reject(new PuppenclawError(errorEvent.code ?? "ACP_CONTROL_FAILED", errorEvent.message));
           return;
         }
-        if ((exitCode ?? 0) !== 0 && !(params.allowNoSession && errorEvent?.code === "NO_SESSION")) {
+        if (
+          (exitCode ?? 0) !== 0 &&
+          !(params.allowNoSession && errorEvent?.code === "NO_SESSION")
+        ) {
           reject(
             new PuppenclawError(
               "ACP_CONTROL_FAILED",

@@ -9,6 +9,7 @@ import { OrchestratorStore } from "../orchestrator/store.js";
 import type { PluginLogger } from "../shared/logger.js";
 import { OutputRouter, type OutputRouteEvent } from "../shared/output-router.js";
 import { REASONING_CAPABILITIES } from "../shared/reasoning.js";
+import { PuppenclawError } from "../shared/errors.js";
 import { SessionStore } from "../shared/store.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import {
@@ -24,6 +25,8 @@ import {
   forkParamsZod,
   logsParamsZod,
   projectCreateParamsZod,
+  quiescenceReleaseParamsZod,
+  quiesceParamsZod,
   reassessmentReportParamsZod,
   reassessmentStartParamsZod,
   reassessmentStatusParamsZod,
@@ -56,6 +59,19 @@ export async function createDaemonServer(params: {
   };
   const app = Fastify({
     logger: false
+  });
+
+  app.setErrorHandler((error, _request, reply) => {
+    if (!(error instanceof PuppenclawError)) {
+      return reply.send(error);
+    }
+    const details = daemonLifecycleErrorDetails(error);
+    return reply.code(daemonStatusForError(error.code)).send({
+      ok: false,
+      code: error.code,
+      error: error.message,
+      ...(details != null ? { details } : {})
+    });
   });
 
   // SECURITY: When config.daemonAuthToken is a non-empty string, every route
@@ -124,6 +140,14 @@ export async function createDaemonServer(params: {
     sessionSendStream: true,
     sessionOutput: true,
     sessionPurge: true,
+    sessionQuiesce: true,
+    sessionQuiesceRelease: true,
+    sessionQuiescence: {
+      version: 1,
+      durable: true,
+      releaseRequired: true,
+      mutationFencing: true
+    },
     sessionSuspend: true,
     sessionFocus: true,
     sessionFork: true,
@@ -183,7 +207,9 @@ export async function createDaemonServer(params: {
     )
   );
 
-  app.post("/session/start", async (request) => ok(await manager.start(startParamsZod.parse(request.body))));
+  app.post("/session/start", async (request) =>
+    ok(await manager.start(startParamsZod.parse(request.body)))
+  );
 
   app.post("/session/start/stream", async (request, reply) => {
     const parsed = startParamsZod.parse(request.body);
@@ -274,6 +300,27 @@ export async function createDaemonServer(params: {
     ok(
       await manager.purge(
         stopParamsZod.parse({
+          name: (request.params as { name: string }).name
+        })
+      )
+    )
+  );
+
+  app.post("/session/:name/quiesce", async (request) =>
+    ok(
+      await manager.quiesce(
+        quiesceParamsZod.parse({
+          name: (request.params as { name: string }).name
+        })
+      )
+    )
+  );
+
+  app.post("/session/:name/quiesce/release", async (request) =>
+    ok(
+      await manager.releaseQuiescence(
+        quiescenceReleaseParamsZod.parse({
+          ...(request.body as Record<string, unknown>),
           name: (request.params as { name: string }).name
         })
       )
@@ -439,6 +486,41 @@ export async function createDaemonServer(params: {
   return { app };
 }
 
+function daemonStatusForError(code: string): number {
+  switch (code) {
+    case "NO_SESSION":
+      return 404;
+    case "SESSION_QUIESCED":
+    case "STALE_QUIESCENCE_EPOCH":
+    case "TURN_ALREADY_RUNNING":
+      return 409;
+    case "QUIESCENCE_UNAVAILABLE":
+    case "ACP_CONTROL_TIMEOUT":
+      return 503;
+    default:
+      return 500;
+  }
+}
+
+function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unknown> | null {
+  if (
+    !["SESSION_QUIESCED", "STALE_QUIESCENCE_EPOCH", "QUIESCENCE_UNAVAILABLE"].includes(
+      error.code
+    ) ||
+    error.details == null
+  ) {
+    return null;
+  }
+  const details: Record<string, unknown> = {};
+  for (const key of ["name", "quiescenceEpoch", "requestedEpoch", "activeEpoch", "lastEpoch"]) {
+    const value = error.details[key];
+    if (typeof value === "string" || typeof value === "number" || value === null) {
+      details[key] = value;
+    }
+  }
+  return details;
+}
+
 async function streamToolResult(params: {
   reply: FastifyReply;
   sessionName: string;
@@ -464,7 +546,9 @@ async function streamToolResult(params: {
   }, 15_000);
   heartbeat.unref?.();
 
-  const write = (event: OutputRouteEvent | { kind: "result"; result: ToolResult } | { kind: "done" }): void => {
+  const write = (
+    event: OutputRouteEvent | { kind: "result"; result: ToolResult } | { kind: "done" }
+  ): void => {
     if (closed || params.reply.raw.writableEnded) {
       return;
     }

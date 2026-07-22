@@ -60,14 +60,7 @@ export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
 export const permissionModeZod = z.enum(["approve-reads", "approve-all", "deny-all"]);
 export const effortLevelZod = z.enum(REASONING_MODE_VALUES);
-export const projectEffortLevelZod = z.enum([
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-  "ultra"
-]);
+export const projectEffortLevelZod = z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]);
 export const planningProfileZod = z.enum(["off", "quick", "deep"]);
 export const responseFormatZod = z.enum(["text", "json"]);
 export const exposureModeZod = z.enum(["read-only", "execute"]);
@@ -76,9 +69,7 @@ export const modelProviderConfigZod = z
   .object({
     id: skillNameString,
     label: nonEmptyString.optional(),
-    kind: z
-      .enum(["claude-code", "codex-openai", "codex-openai-compatible"])
-      .optional(),
+    kind: z.enum(["claude-code", "codex-openai", "codex-openai-compatible"]).optional(),
     model: nonEmptyString,
     reasoningProfile: z.enum(["claude", "codex", "glm-5.2"]).optional(),
     baseUrl: nonEmptyString.optional(),
@@ -222,7 +213,12 @@ export const pluginConfigZod = z
     defaultAgent: agentKindZod.default(DEFAULT_AGENT),
     maxSessions: z.number().int().min(1).max(100).default(DEFAULT_MAX_SESSIONS),
     permissionMode: permissionModeZod.default(DEFAULT_PERMISSION_MODE),
-    sessionTtlMinutes: z.number().int().min(1).max(24 * 60).default(DEFAULT_SESSION_TTL_MINUTES),
+    sessionTtlMinutes: z
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 60)
+      .default(DEFAULT_SESSION_TTL_MINUTES),
     streamOutput: z.boolean().default(DEFAULT_STREAM_OUTPUT),
     acpxCommand: nonEmptyString.optional(),
     codexCommand: nonEmptyString.optional(),
@@ -248,17 +244,19 @@ export const workerManifestZod = z
     format: responseFormatZod.optional(),
     labels: z.array(nonEmptyString).default([]),
     projectRoots: z.array(nonEmptyString).default([]),
-    supportedSteps: z.array(orchestrationStepKindZod).default([
-      "judge",
-      "research",
-      "plan",
-      "code",
-      "experiment",
-      "eval",
-      "review",
-      "publish",
-      "handoff"
-    ]),
+    supportedSteps: z
+      .array(orchestrationStepKindZod)
+      .default([
+        "judge",
+        "research",
+        "plan",
+        "code",
+        "experiment",
+        "eval",
+        "review",
+        "publish",
+        "handoff"
+      ]),
     executors: z.array(orchestrationExecutorZod).default(["acp"]),
     defaultAgent: agentKindZod.optional(),
     maxConcurrentRuns: z.number().int().min(1).max(64).default(1),
@@ -307,7 +305,12 @@ export const campaignStepParamsZod = z
     sessionScope: z.enum(["campaign", "step"]).optional(),
     workingDirectory: nonEmptyString.optional(),
     env: z.record(z.string(), z.string()).default({}),
-    timeoutMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1000).optional(),
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(24 * 60 * 60 * 1000)
+      .optional(),
     retryLimit: z.number().int().min(0).max(8).default(0)
   })
   .strict()
@@ -438,7 +441,9 @@ export const logsParamsZod = z
   })
   .strict()
   .superRefine((value, ctx) => {
-    const populated = [value.sessionName, value.campaignId, value.runId].filter((entry) => entry != null);
+    const populated = [value.sessionName, value.campaignId, value.runId].filter(
+      (entry) => entry != null
+    );
     if (populated.length !== 1) {
       ctx.addIssue({
         code: "custom",
@@ -479,14 +484,25 @@ export const sendParamsZod = z
   })
   .strict();
 
-export const pluginSendParamsZod = sendParamsZod
-  .omit({ permissionMode: true })
-  .strict();
+export const pluginSendParamsZod = sendParamsZod.omit({ permissionMode: true }).strict();
 
 export const stopParamsZod = z
   .object({
     name: nonEmptyString,
     format: responseFormatZod.optional()
+  })
+  .strict();
+
+export const quiesceParamsZod = z
+  .object({
+    name: nonEmptyString
+  })
+  .strict();
+
+export const quiescenceReleaseParamsZod = z
+  .object({
+    name: nonEmptyString,
+    epoch: z.number().int().positive().safe()
   })
   .strict();
 
@@ -507,7 +523,12 @@ export const suspendParamsZod = z
 export const focusParamsZod = z
   .object({
     name: nonEmptyString,
-    ttlMs: z.number().int().min(5_000).max(5 * 60_000).optional(),
+    ttlMs: z
+      .number()
+      .int()
+      .min(5_000)
+      .max(5 * 60_000)
+      .optional(),
     format: responseFormatZod.optional()
   })
   .strict();
@@ -770,8 +791,7 @@ export const pluginManifestConfigSchema = {
   }
 } as const;
 
-const reasoningModeType = () =>
-  Type.Union(REASONING_MODE_VALUES.map((mode) => Type.Literal(mode)));
+const reasoningModeType = () => Type.Union(REASONING_MODE_VALUES.map((mode) => Type.Literal(mode)));
 
 const projectReasoningModeType = () =>
   Type.Union(projectEffortLevelZod.options.map((mode) => Type.Literal(mode)));
@@ -808,11 +828,7 @@ export const toolStartSchema = Type.Object({
       ),
       model: Type.String({ minLength: 1 }),
       reasoningProfile: Type.Optional(
-        Type.Union([
-          Type.Literal("claude"),
-          Type.Literal("codex"),
-          Type.Literal("glm-5.2")
-        ])
+        Type.Union([Type.Literal("claude"), Type.Literal("codex"), Type.Literal("glm-5.2")])
       ),
       baseUrl: Type.Optional(Type.String({ minLength: 1 })),
       authTokenEnv: Type.Optional(Type.String({ minLength: 1 })),
@@ -885,9 +901,7 @@ export const toolProjectCreateSchema = Type.Object({
   rootDir: Type.String({ minLength: 1 }),
   description: Type.Optional(Type.String()),
   defaultAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
-  fusionPreferredAgent: Type.Optional(
-    Type.Union([Type.Literal("claude"), Type.Literal("codex")])
-  ),
+  fusionPreferredAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
   planningProfile: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])
   ),
@@ -925,9 +939,7 @@ export const toolWorkerRegisterSchema = Type.Object({
       ])
     )
   ),
-  executors: Type.Optional(
-    Type.Array(Type.Union([Type.Literal("acp"), Type.Literal("command")]))
-  ),
+  executors: Type.Optional(Type.Array(Type.Union([Type.Literal("acp"), Type.Literal("command")]))),
   defaultAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
   maxConcurrentRuns: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
   adminOnlyRawSessions: Type.Optional(Type.Boolean())
@@ -986,9 +998,7 @@ export const toolCampaignRunSchema = Type.Object({
     ])
   ),
   task: Type.Optional(Type.String({ minLength: 1 })),
-  fusionPreferredAgent: Type.Optional(
-    Type.Union([Type.Literal("claude"), Type.Literal("codex")])
-  ),
+  fusionPreferredAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
   useExternalArbiter: Type.Optional(Type.Boolean()),
   fusionBaseRef: Type.Optional(Type.String({ minLength: 1 })),
   evaluationCommand: Type.Optional(Type.String()),
@@ -1035,11 +1045,7 @@ export const toolReassessmentStartSchema = Type.Object({
   targetAgent: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")])),
   providers: Type.Optional(
     Type.Array(
-      Type.Union([
-        Type.Literal("puppenclaw"),
-        Type.Literal("codex"),
-        Type.Literal("claude")
-      ])
+      Type.Union([Type.Literal("puppenclaw"), Type.Literal("codex"), Type.Literal("claude")])
     )
   ),
   validationCommand: Type.Optional(Type.String()),

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import process from "node:process";
 
@@ -87,7 +87,9 @@ function settingFile(name, key) {
 
 function readSession(name) {
   try {
-    const [status = "alive", sessionAgent = agent] = readFileSync(sessionFile(name), "utf8").split(/\r?\n/u);
+    const [status = "alive", sessionAgent = agent] = readFileSync(sessionFile(name), "utf8").split(
+      /\r?\n/u
+    );
     return { status, agent: sessionAgent };
   } catch {
     return null;
@@ -137,6 +139,12 @@ if (command[0] === "sessions" && command[1] === "new") {
 }
 
 if (command[0] === "sessions" && command[1] === "close" && command[2] != null) {
+  const closeFailureMarker = join(stateDir, `${basename(command[2])}.close-failed`);
+  if (command[2].includes("retry-close") && !existsSync(closeFailureMarker)) {
+    writeFileSync(closeFailureMarker, "failed\n", "utf8");
+    emitError("SIM_CLOSE_FAIL", "Simulated first close failure");
+    process.exit(1);
+  }
   rmSync(sessionFile(command[2]), { force: true });
   emitJson('{"status":"closed"}');
   process.exit(0);
@@ -186,6 +194,10 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
       '{"jsonrpc":"2.0","id":null,"error":{"code":-32002,"message":"No acpx session found","data":{"acpxCode":"NO_SESSION","origin":"cli","sessionId":"unknown"}}}'
     );
     process.exit(4);
+  }
+  if (normalizedInput.includes("SLOW_TURN")) {
+    writeFileSync(join(stateDir, `${basename(name)}.slow`), "started\n", "utf8");
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
   }
   if (normalizedInput.includes("USAGE_CODEX_VARIANT")) {
     emitJson(

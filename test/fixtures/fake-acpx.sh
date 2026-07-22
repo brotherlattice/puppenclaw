@@ -144,6 +144,11 @@ if [[ "${command[0]:-}" == "sessions" && "${command[1]:-}" == "new" ]]; then
 fi
 
 if [[ "${command[0]:-}" == "sessions" && "${command[1]:-}" == "close" && -n "${command[2]:-}" ]]; then
+  if [[ "${command[2]}" == *"retry-close"* && ! -f "$state_dir/$(basename "${command[2]}").close-failed" ]]; then
+    : > "$state_dir/$(basename "${command[2]}").close-failed"
+    emit_error "SIM_CLOSE_FAIL" "Simulated first close failure"
+    exit 1
+  fi
   rm -f "$(session_file "${command[2]}")"
   emit_json '{"status":"closed"}'
   exit 0
@@ -178,6 +183,10 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
   if ! session_exists "$name"; then
     emit_json "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32002,\"message\":\"No acpx session found\",\"data\":{\"acpxCode\":\"NO_SESSION\",\"origin\":\"cli\",\"sessionId\":\"unknown\"}}}"
     exit 4
+  fi
+  if [[ "$normalized_input" == *"SLOW_TURN"* ]]; then
+    : > "$state_dir/$(basename "$name").slow"
+    sleep 60
   fi
   if [[ "$normalized_input" == *"USAGE_CODEX_VARIANT"* ]]; then
     emit_json "{\"type\":\"usage_update\",\"used\":${#normalized_input},\"size\":4096,\"usage\":{\"prompt_tokens\":${#normalized_input},\"completion_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":5}}}"

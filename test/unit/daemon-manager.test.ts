@@ -32,6 +32,9 @@ describe("DaemonSessionManager", () => {
         sessionSendStream?: boolean;
         sessionOutput?: boolean;
         sessionPurge?: boolean;
+        sessionQuiesce?: boolean;
+        sessionQuiesceRelease?: boolean;
+        sessionQuiescence?: unknown;
         sessionSkills?: boolean;
         reasoning?: unknown;
         maxSessions?: { min?: number; max?: number; current?: number };
@@ -42,6 +45,14 @@ describe("DaemonSessionManager", () => {
       expect(payload.sessionSendStream).toBe(true);
       expect(payload.sessionOutput).toBe(true);
       expect(payload.sessionPurge).toBe(true);
+      expect(payload.sessionQuiesce).toBe(true);
+      expect(payload.sessionQuiesceRelease).toBe(true);
+      expect(payload.sessionQuiescence).toEqual({
+        version: 1,
+        durable: true,
+        releaseRequired: true,
+        mutationFencing: true
+      });
       expect(payload.sessionSkills).toBe(true);
       expect(payload.reasoning).toEqual(REASONING_CAPABILITIES);
       expect(payload.maxSessions).toEqual({
@@ -80,9 +91,7 @@ describe("DaemonSessionManager", () => {
         method,
         url: `${requestUrl.pathname}${requestUrl.search}`,
         ...(payload != null ? { payload } : {}),
-        ...(init?.headers != null
-          ? { headers: init.headers as Record<string, string> }
-          : {})
+        ...(init?.headers != null ? { headers: init.headers as Record<string, string> } : {})
       } as never)) as {
         body: string;
         statusCode: number;
@@ -155,8 +164,31 @@ describe("DaemonSessionManager", () => {
       expect(outputDetails.output.source).toBe("active-turn");
       expect(outputDetails.output.complete).toBe(true);
 
+      const quiesced = await manager.quiesce({ name: "daemon-demo" });
+      const quiescedDetails = quiesced.details as {
+        quiescenceEpoch: number;
+        runtimeClosed: boolean;
+      };
+      expect(quiescedDetails).toMatchObject({
+        quiescenceEpoch: 1,
+        runtimeClosed: true
+      });
+      await expect(
+        manager.send({
+          name: "daemon-demo",
+          message: "This turn is fenced.",
+          contextFiles: []
+        })
+      ).rejects.toMatchObject({ code: "SESSION_QUIESCED" });
+
       const purge = await manager.purge({ name: "daemon-demo" });
       expect((purge.details as { purged: boolean }).purged).toBe(true);
+      await expect(
+        manager.releaseQuiescence({ name: "daemon-demo", epoch: 1 })
+      ).resolves.toMatchObject({ details: { released: true, quiescenceEpoch: 1 } });
+      await expect(manager.purge({ name: "daemon-demo" })).rejects.toMatchObject({
+        code: "NO_SESSION"
+      });
     } finally {
       globalThis.fetch = originalFetch;
       await app.close();
