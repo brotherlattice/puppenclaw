@@ -59,6 +59,7 @@ const skillNameString = nonEmptyString.regex(/^[a-zA-Z0-9._-]+$/u);
 export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
 export const permissionModeZod = z.enum(["approve-reads", "approve-all", "deny-all"]);
+export const interactionModeZod = z.enum(["plan", "execute"]);
 export const effortLevelZod = z.enum(REASONING_MODE_VALUES);
 export const projectEffortLevelZod = z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]);
 export const planningProfileZod = z.enum(["off", "quick", "deep"]);
@@ -461,6 +462,7 @@ export const startParamsZod = z
     task: nonEmptyString,
     format: responseFormatZod.optional(),
     permissionMode: permissionModeZod.optional(),
+    interactionMode: interactionModeZod.optional(),
     effort: effortLevelZod.optional(),
     planningProfile: planningProfileZod.optional(),
     model: nonEmptyString.optional(),
@@ -469,6 +471,10 @@ export const startParamsZod = z
     contextFiles: z.array(nonEmptyString).default([]),
     skills: z.array(skillNameString).default([])
   })
+  .strict();
+
+export const pluginStartParamsZod = startParamsZod
+  .omit({ permissionMode: true, interactionMode: true })
   .strict();
 
 export const sendParamsZod = z
@@ -480,11 +486,14 @@ export const sendParamsZod = z
     ultrathink: z.boolean().optional(),
     effort: effortLevelZod.optional(),
     permissionMode: permissionModeZod.optional(),
+    interactionMode: interactionModeZod.optional(),
     contextFiles: z.array(nonEmptyString).default([])
   })
   .strict();
 
-export const pluginSendParamsZod = sendParamsZod.omit({ permissionMode: true }).strict();
+export const pluginSendParamsZod = sendParamsZod
+  .omit({ permissionMode: true, interactionMode: true })
+  .strict();
 
 export const stopParamsZod = z
   .object({
@@ -802,13 +811,6 @@ export const toolStartSchema = Type.Object({
   directory: Type.String({ minLength: 1 }),
   task: Type.String({ minLength: 1 }),
   format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("json")])),
-  permissionMode: Type.Optional(
-    Type.Union([
-      Type.Literal("approve-reads"),
-      Type.Literal("approve-all"),
-      Type.Literal("deny-all")
-    ])
-  ),
   effort: Type.Optional(reasoningModeType()),
   planningProfile: Type.Optional(
     Type.Union([Type.Literal("off"), Type.Literal("quick"), Type.Literal("deep")])

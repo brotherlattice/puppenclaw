@@ -20,6 +20,7 @@ import type {
   orchestrationExecutorZod,
   orchestrationStepKindZod,
   permissionModeZod,
+  interactionModeZod,
   planningProfileZod,
   pluginConfigZod,
   projectCreateParamsZod,
@@ -55,6 +56,7 @@ import type {
 export type AgentKind = z.infer<typeof agentKindZod>;
 export type BackendMode = z.infer<typeof backendZod>;
 export type PermissionMode = z.infer<typeof permissionModeZod>;
+export type InteractionMode = z.infer<typeof interactionModeZod>;
 export type EffortLevel = z.infer<typeof effortLevelZod>;
 export type PlanningProfile = z.infer<typeof planningProfileZod>;
 export type ResponseFormat = z.infer<typeof responseFormatZod>;
@@ -115,6 +117,26 @@ export type ToolResult<TDetails = Record<string, unknown>> = {
 };
 
 export type TurnOutputRole = "assistant" | "status";
+
+export type NativePlanEntry = {
+  content: string;
+  status?: string;
+  priority?: string;
+};
+
+export type TurnSignals = {
+  nativeMode?: string;
+  plan?: {
+    source: "acp" | "claude-tool";
+    entries?: NativePlanEntry[];
+  };
+  inputRequest?: {
+    source: "claude-tool";
+    toolName: "AskUserQuestion";
+    text?: string;
+  };
+  stopReason?: string;
+};
 
 export type SessionState =
   | "idle"
@@ -371,6 +393,16 @@ export type PromptEvent =
       status?: string;
       tag?: string;
       toolCallId?: string;
+      nativeToolName?: "ExitPlanMode" | "AskUserQuestion";
+      inputRequestText?: string;
+    }
+  | {
+      type: "plan";
+      entries: NativePlanEntry[];
+    }
+  | {
+      type: "mode";
+      mode: string;
     }
   | {
       type: "status";
@@ -383,6 +415,7 @@ export type PromptEvent =
   | {
       type: "done";
       stopReason?: string;
+      usage?: NormalizedUsage;
     }
   | {
       type: "error";

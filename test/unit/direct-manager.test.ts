@@ -114,7 +114,7 @@ emit({
   item: {
     type: "function_call",
     name: "exec_command",
-    arguments: "{\\"cmd\\":\\"date\\"}"
+    arguments: "{\\"cmd\\":\\"date\\",\\"authorization\\":\\"Bearer should-not-leak\\"}"
   }
 });
 emit({
@@ -870,9 +870,18 @@ describe("AcpxSessionManager", () => {
     const codexCommand = await resolveFakeCodexJsonCommand(workspaceDir);
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
     const chunks: string[] = [];
+    const structuredEvents: Array<{ kind: string; value?: string; text?: string }> = [];
     outputRouter.attach("codex-json-demo", async (event) => {
       if (event.kind === "chunk") {
         chunks.push(event.text);
+      } else if (event.kind === "activity") {
+        structuredEvents.push({
+          kind: event.kind,
+          ...(event.activity.title != null ? { value: event.activity.title } : {}),
+          ...(event.activity.text != null ? { text: event.activity.text } : {})
+        });
+      } else if (event.kind === "final") {
+        structuredEvents.push({ kind: event.kind, value: event.text });
       }
     });
     const manager = new AcpxSessionManager({
@@ -960,6 +969,14 @@ describe("AcpxSessionManager", () => {
 
     expect(chunks.join("")).toContain("command output line");
     expect(chunks.join("")).toContain("[tool] mcp__paper_search_mcp__search_pubmed");
+    expect(chunks.join("")).not.toContain("[final]");
+    expect(structuredEvents).toContainEqual({
+      kind: "activity",
+      value: "exec_command",
+      text: expect.stringContaining("Bearer [redacted]") as string
+    });
+    expect(JSON.stringify(structuredEvents)).not.toContain("should-not-leak");
+    expect(structuredEvents).toContainEqual({ kind: "final", value: "Final file answer." });
     expect(details.output).toBe("Final file answer.");
   });
 
@@ -1058,9 +1075,236 @@ describe("AcpxSessionManager", () => {
     });
     const sendDetails = result.details as {
       session: SessionInfo;
+      turnSignals: {
+        inputRequest: { source: string; toolName: string; text: string };
+      };
     };
     expect(sendDetails.session.state).toBe("waiting_input");
-    expect(sendDetails.session.pendingQuestion).toBe("Need input from the user?");
+    expect(sendDetails.session.pendingQuestion).toBe("Which source should I use?");
+    expect(sendDetails.turnSignals.inputRequest).toEqual({
+      source: "claude-tool",
+      toolName: "AskUserQuestion",
+      text: "Which source should I use?"
+    });
+  });
+
+  it("switches advertised Claude modes per turn, restores the baseline, and exposes native plan signals", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-native-plan-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const planned = await manager.start({
+      agent: "claude",
+      name: "native-plan-demo",
+      directory: workspaceDir,
+      task: "REPORT_NATIVE_MODE",
+      interactionMode: "plan",
+      contextFiles: []
+    });
+    const plannedDetails = planned.details as {
+      output: string;
+      turnSignals: { nativeMode: string };
+    };
+    expect(plannedDetails.output).toBe("Native mode: plan");
+    expect(plannedDetails.turnSignals.nativeMode).toBe("plan");
+    expect(
+      await readFile(
+        join(workspaceDir, ".fake-acpx-state", "native-plan-demo.mode.setting"),
+        "utf8"
+      )
+    ).toBe("default\n");
+
+    const signalled = await manager.send({
+      name: "native-plan-demo",
+      message: "EXIT_PLAN_MODE",
+      interactionMode: "plan",
+      contextFiles: []
+    });
+    const signalledDetails = signalled.details as {
+      session: SessionInfo;
+      turnSignals: {
+        nativeMode: string;
+        plan: {
+          source: string;
+          entries?: Array<{ content: string; status?: string; priority?: string }>;
+        };
+      };
+    };
+    expect(signalledDetails.session.state).toBe("idle");
+    expect(signalledDetails.turnSignals.nativeMode).toBe("plan");
+    expect(signalledDetails.turnSignals.plan).toEqual({
+      source: "claude-tool",
+      entries: [
+        {
+          content: "Search primary sources",
+          status: "pending",
+          priority: "high"
+        }
+      ]
+    });
+
+    const modeSetting = join(
+      workspaceDir,
+      ".fake-acpx-state",
+      "native-plan-demo.mode.setting"
+    );
+    await writeFile(modeSetting, "plan\n", "utf8");
+    const executed = await manager.send({
+      name: "native-plan-demo",
+      message: "REPORT_NATIVE_MODE",
+      interactionMode: "execute",
+      permissionMode: "approve-all",
+      contextFiles: []
+    });
+    const executedDetails = executed.details as {
+      output: string;
+      turnSignals: { nativeMode: string };
+    };
+    expect(executedDetails.output).toBe("Native mode: default");
+    expect(executedDetails.turnSignals.nativeMode).toBe("default");
+    expect(await readFile(modeSetting, "utf8")).toBe("plan\n");
+  });
+
+  it("trusts exact Claude tool metadata rather than localized or spoofed titles", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-native-tool-metadata-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    await manager.start({
+      agent: "claude",
+      name: "metadata-demo",
+      directory: workspaceDir,
+      task: "Prime the session.",
+      contextFiles: []
+    });
+    const result = await manager.send({
+      name: "metadata-demo",
+      message: "SPOOF_PLAN_TITLE",
+      contextFiles: []
+    });
+    const details = result.details as { turnSignals?: { plan?: unknown } };
+    expect(details.turnSignals?.plan).toBeUndefined();
+  });
+
+  it("restores the Claude native mode after a failed turn outcome", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-native-mode-failed-turn-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const result = await manager.start({
+      agent: "claude",
+      name: "native-mode-failed-turn",
+      directory: workspaceDir,
+      task: "FAIL_TURN",
+      interactionMode: "plan",
+      contextFiles: []
+    });
+    const details = result.details as { session: SessionInfo };
+    expect(details.session.state).toBe("failed");
+    expect(
+      await readFile(
+        join(workspaceDir, ".fake-acpx-state", "native-mode-failed-turn.mode.setting"),
+        "utf8"
+      )
+    ).toBe("default\n");
+  });
+
+  it("fails before a turn when an advertised native mode transition is rejected", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-native-mode-failure-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    await expect(
+      manager.start({
+        agent: "claude",
+        name: "mode-switch-fail",
+        directory: workspaceDir,
+        task: "Do not run this prompt.",
+        interactionMode: "plan",
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({ code: "ACP_MODE_SWITCH_FAILED" });
+  });
+
+  it("falls back to prompt and permission enforcement when the ACP runtime advertises no modes", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-native-mode-fallback-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const result = await manager.start({
+      agent: "claude",
+      name: "no-modes-demo",
+      directory: workspaceDir,
+      task: "REPORT_NATIVE_MODE",
+      interactionMode: "plan",
+      permissionMode: "approve-reads",
+      contextFiles: []
+    });
+    const details = result.details as {
+      output: string;
+      session: SessionInfo;
+      turnSignals?: { nativeMode?: string };
+    };
+    expect(details.output).toBe("Native mode: default");
+    expect(details.turnSignals?.nativeMode).toBeUndefined();
+    expect(details.session.warnings).toContainEqual(
+      expect.stringContaining("did not advertise session modes")
+    );
   });
 
   it("classifies ACP error events as status output", async () => {

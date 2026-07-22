@@ -111,12 +111,47 @@ if (command[0] === "status" && command[1] === "--session" && command[2] != null)
     emitJson('{"action":"status_snapshot","status":"no-session","summary":"no active session"}');
     process.exit(0);
   }
+  if (name.includes("no-modes")) {
+    emitJson(
+      `{"status":"${jsonEscape(session.status)}","acpxRecordId":"rec-${jsonEscape(
+        name
+      )}","agent":"${jsonEscape(agent || session.agent)}"}`
+    );
+    process.exit(0);
+  }
+  let mode = "default";
+  try {
+    mode = readFileSync(settingFile(name, "mode"), "utf8").trim() || "default";
+  } catch {}
   emitJson(
     `{"status":"${jsonEscape(session.status)}","acpxRecordId":"rec-${jsonEscape(
       name
     )}","acpxSessionId":"backend-${jsonEscape(name)}","agentSessionId":"agent-${jsonEscape(
-      name
-    )}","agent":"${jsonEscape(agent || session.agent)}"}`
+    name
+    )}","agent":"${jsonEscape(agent || session.agent)}","modeState":{"currentModeId":"${jsonEscape(mode)}","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"}]}}`
+  );
+  process.exit(0);
+}
+
+if (
+  command[0] === "set-mode" &&
+  command[1] != null &&
+  command[2] === "--session" &&
+  command[3] != null
+) {
+  const mode = command[1];
+  const name = command[3];
+  if (readSession(name) == null) {
+    emitError("NO_SESSION", "No acpx session found");
+    process.exit(4);
+  }
+  if (name.includes("mode-switch-fail")) {
+    emitError("SIM_MODE_FAIL", "Simulated mode transition failure");
+    process.exit(1);
+  }
+  writeFileSync(settingFile(name, "mode"), `${mode}\n`, "utf8");
+  emitJson(
+    `{"status":"set","session":"${jsonEscape(name)}","mode":"${jsonEscape(mode)}"}`
   );
   process.exit(0);
 }
@@ -147,6 +182,31 @@ if (command[0] === "sessions" && command[1] === "close" && command[2] != null) {
   }
   rmSync(sessionFile(command[2]), { force: true });
   emitJson('{"status":"closed"}');
+  process.exit(0);
+}
+
+if (command[0] === "sessions" && command[1] === "show" && command[2] != null) {
+  const name = command[2];
+  if (readSession(name) == null) {
+    emitError("NO_SESSION", "No acpx session found");
+    process.exit(4);
+  }
+  if (name.includes("no-modes")) {
+    emitJson('{"messages":[],"acpx":{}}');
+    process.exit(0);
+  }
+  let mode = "default";
+  try {
+    mode = readFileSync(settingFile(name, "mode"), "utf8").trim() || "default";
+  } catch {}
+  emitJson(
+    `{"messages":[],"acpx":{"current_mode_id":"${jsonEscape(mode)}","config_options":[{"type":"select","id":"mode","currentValue":"${jsonEscape(mode)}","options":[{"value":"default","name":"Default"},{"value":"plan","name":"Plan"}]}]}}`
+  );
+  process.exit(0);
+}
+
+if (command[0] === "sessions" && command[1] === "history") {
+  emitJson('{"entries":[]}');
   process.exit(0);
 }
 
@@ -247,9 +307,29 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
     reply =
       "## Executive judgment\nPatched one obvious old-model mistake.\n## Imported sessions reviewed\n- Reviewed imported fixtures.\n## Findings by importance\n- functionality: missing reassessment-fix.txt was an obvious prior omission.\n## Patches made\n- Added reassessment-fix.txt.\n## Findings intentionally not patched\n- No refactor-only findings patched.\n## Validation instructions and residual risk\n- Run the configured validation command.";
   } else if (normalizedInput.includes("ASK_USER")) {
+    emitJson(
+      '{"sessionUpdate":"tool_call","toolCallId":"ask-user-1","title":"Localized input title","rawInput":{"questions":[{"question":"Which source should I use?"}]},"_meta":{"claudeCode":{"toolName":"AskUserQuestion"}}}'
+    );
     reply = "Need input from the user?";
+  } else if (normalizedInput.includes("EXIT_PLAN_MODE")) {
+    emitJson(
+      '{"sessionUpdate":"plan","entries":[{"content":"Search primary sources","status":"pending","priority":"high"}]}'
+    );
+    emitJson(
+      '{"sessionUpdate":"tool_call","toolCallId":"exit-plan-1","title":"Localized plan title","_meta":{"claudeCode":{"toolName":"ExitPlanMode"}}}'
+    );
+    reply = "The plan is ready. Should I proceed?";
+  } else if (normalizedInput.includes("SPOOF_PLAN_TITLE")) {
+    emitJson('{"sessionUpdate":"tool_call","toolCallId":"spoof-plan-1","title":"ExitPlanMode"}');
+    reply = "This is an ordinary answer.";
   } else if (normalizedInput.includes("REPORT_PERMISSION_MODE")) {
     reply = `Permission mode: ${permissionMode}`;
+  } else if (normalizedInput.includes("REPORT_NATIVE_MODE")) {
+    let nativeMode = "default";
+    try {
+      nativeMode = readFileSync(settingFile(name, "mode"), "utf8").trim() || "default";
+    } catch {}
+    reply = `Native mode: ${nativeMode}`;
   } else {
     reply = `Handled: ${normalizedInput}`;
   }
@@ -258,7 +338,7 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
       `{"type":"agent_message_chunk","content":{"type":"text","text":"${jsonEscape(chunk)}"}}`
     );
   }
-  emitJson('{"type":"done"}');
+  emitJson('{"type":"done","stopReason":"end_turn"}');
   process.exit(0);
 }
 

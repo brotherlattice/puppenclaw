@@ -82,4 +82,41 @@ describe("OutputRouter", () => {
     expect(first).toEqual(["one\n", "two\n", "three\n"]);
     expect(second).toEqual(["one\n", "two\n"]);
   });
+
+  it("routes structured activity and clean final text separately from legacy chunks", async () => {
+    const events: OutputRouteEvent[] = [];
+    const router = new OutputRouter({
+      info() {},
+      warn() {},
+      error() {},
+      debug() {}
+    });
+    router.attach("demo", (event) => {
+      events.push(event);
+    });
+
+    await router.onActivity("demo", {
+      type: "tool_call",
+      title: "exec_command",
+      toolCallId: "call-1"
+    });
+    await router.onFinal("demo", "Final answer.");
+
+    expect(events).toEqual([
+      {
+        kind: "activity",
+        sessionName: "demo",
+        activity: {
+          type: "tool_call",
+          title: "exec_command",
+          toolCallId: "call-1"
+        }
+      },
+      {
+        kind: "final",
+        sessionName: "demo",
+        text: "Final answer."
+      }
+    ]);
+  });
 });

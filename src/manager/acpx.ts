@@ -24,7 +24,9 @@ import type {
   EffortLevel,
   FocusParams,
   ForkParams,
+  InteractionMode,
   ModelProviderConfig,
+  NativePlanEntry,
   NormalizedUsage,
   ParsedPluginConfig,
   PermissionMode,
@@ -43,6 +45,7 @@ import type {
   ToolResult,
   TokenUsage,
   TurnOutputRole,
+  TurnSignals,
   UnfocusParams
 } from "../shared/types.js";
 import { loadContextFiles, nowIso, summarizePromptEvents } from "../shared/utils.js";
@@ -62,6 +65,12 @@ type RuntimeStatus = {
   raw?: JsonRecord | null;
 };
 
+type NativeModePreparation = {
+  activeMode?: string;
+  restoreMode?: string;
+  warning?: string;
+};
+
 type TurnResult = {
   output: string;
   question?: string;
@@ -72,6 +81,7 @@ type TurnResult = {
   warnings: string[];
   transcript: SessionTranscriptEntry[];
   state: SessionInfo["state"];
+  signals?: TurnSignals;
 };
 
 function outputRoleForTurn(turn: TurnResult): TurnOutputRole {
@@ -215,6 +225,165 @@ function isRuntimeStatusReady(status: RuntimeStatus): boolean {
   return !/(no active session|needs reconnect|reconnect|starting|initializing|pending|dead)/iu.test(
     combined
   );
+}
+
+type RuntimeModeState = {
+  currentMode: string;
+  availableModes?: string[];
+};
+
+function modeIdFromValue(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return asOptionalString(value);
+  }
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  return asOptionalString(value.id) ?? asOptionalString(value.modeId);
+}
+
+function extractRuntimeModeState(value: unknown, depth = 0): RuntimeModeState | null {
+  if (depth > 5 || !isRecord(value)) {
+    return null;
+  }
+  const currentMode =
+    modeIdFromValue(value.currentModeId) ??
+    modeIdFromValue(value.currentMode) ??
+    modeIdFromValue(value.mode) ??
+    modeIdFromValue(value.current_mode_id) ??
+    modeIdFromValue(value.desired_mode_id);
+  const availableValues =
+    (Array.isArray(value.availableModes) ? value.availableModes : undefined) ??
+    (Array.isArray(value.modes) ? value.modes : undefined);
+  if (currentMode != null && availableValues != null) {
+    const availableModes = dedupeStrings(
+      availableValues.map(modeIdFromValue).filter((mode): mode is string => mode != null)
+    );
+    if (availableModes.length > 0) {
+      return { currentMode, availableModes };
+    }
+  }
+  const configOptions =
+    (Array.isArray(value.configOptions) ? value.configOptions : undefined) ??
+    (Array.isArray(value.config_options) ? value.config_options : undefined);
+  if (configOptions != null) {
+    const modeOption = configOptions.find(
+      (option) => isRecord(option) && asTrimmedString(option.id) === "mode"
+    );
+    if (isRecord(modeOption)) {
+      const optionValues = Array.isArray(modeOption.options)
+        ? modeOption.options.map((option) => {
+            if (typeof option === "string") {
+              return asOptionalString(option);
+            }
+            return isRecord(option)
+              ? (asOptionalString(option.value) ?? asOptionalString(option.id))
+              : undefined;
+          })
+        : [];
+      const availableModes = dedupeStrings(
+        optionValues.filter((mode): mode is string => mode != null)
+      );
+      const configuredCurrent =
+        currentMode ??
+        asOptionalString(modeOption.currentValue) ??
+        asOptionalString(modeOption.current_value);
+      if (configuredCurrent != null && availableModes.length > 0) {
+        return { currentMode: configuredCurrent, availableModes };
+      }
+    }
+  }
+  for (const key of [
+    "modeState",
+    "sessionModeState",
+    "acpx",
+    "session",
+    "runtime",
+    "details",
+    "capabilities",
+    "options",
+    "configOptions"
+  ]) {
+    const nested = extractRuntimeModeState(value[key], depth + 1);
+    if (nested != null) {
+      return nested;
+    }
+  }
+  return currentMode != null ? { currentMode } : null;
+}
+
+function interactionPromptPrefix(mode: InteractionMode | undefined): string | undefined {
+  if (mode === "plan") {
+    return [
+      "This is a read-only planning turn.",
+      "Develop or revise the plan and surface genuine decision boundaries, but do not execute the plan or modify the workspace."
+    ].join(" ");
+  }
+  if (mode === "execute") {
+    return "This is the single approved execution turn. Carry out the approved work within the granted permissions and report the actual outcome.";
+  }
+  return undefined;
+}
+
+function mergeTurnSignals(...signals: Array<TurnSignals | undefined>): TurnSignals | undefined {
+  const merged: TurnSignals = {};
+  for (const signal of signals) {
+    if (signal?.nativeMode != null) {
+      merged.nativeMode = signal.nativeMode;
+    }
+    if (signal?.plan != null) {
+      merged.plan = signal.plan;
+    }
+    if (signal?.inputRequest != null) {
+      merged.inputRequest = signal.inputRequest;
+    }
+    if (signal?.stopReason != null) {
+      merged.stopReason = signal.stopReason;
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function signalsFromPromptEvents(events: readonly PromptEvent[]): TurnSignals | undefined {
+  let signals: TurnSignals | undefined;
+  for (const event of events) {
+    switch (event.type) {
+      case "mode":
+        signals = mergeTurnSignals(signals, { nativeMode: event.mode });
+        break;
+      case "plan":
+        signals = mergeTurnSignals(signals, {
+          plan: { source: "acp", entries: event.entries }
+        });
+        break;
+      case "tool_call":
+        if (event.nativeToolName === "ExitPlanMode") {
+          signals = mergeTurnSignals(signals, {
+            plan: {
+              source: "claude-tool",
+              ...(signals?.plan?.entries != null ? { entries: signals.plan.entries } : {})
+            }
+          });
+        } else if (event.nativeToolName === "AskUserQuestion") {
+          signals = mergeTurnSignals(signals, {
+            inputRequest: {
+              source: "claude-tool",
+              toolName: "AskUserQuestion",
+              ...(event.inputRequestText != null ? { text: event.inputRequestText } : {})
+            }
+          });
+        }
+        break;
+      case "done":
+        if (event.stopReason != null) {
+          signals = mergeTurnSignals(signals, { stopReason: event.stopReason });
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return signals;
 }
 
 function buildPermissionArgs(mode: PermissionMode): string[] {
@@ -372,6 +541,47 @@ function extractCodexLiveOutput(event: JsonRecord): string | undefined {
   return undefined;
 }
 
+function extractCodexActivity(event: JsonRecord):
+  | {
+      type: "tool_call" | "tool_output";
+      text?: string;
+      title?: string;
+    }
+  | null {
+  const type = asTrimmedString(event.type).toLowerCase();
+  const item =
+    (isRecord(event.item) ? event.item : undefined) ??
+    (isRecord(event.output_item) ? event.output_item : undefined) ??
+    (isRecord(event.content) ? event.content : undefined);
+  const subject = item ?? event;
+  const subjectType = asTrimmedString(subject.type).toLowerCase();
+  const toolName = extractToolCallName(event, subject);
+  if (toolName != null || isToolCallEvent(type, subjectType)) {
+    const args = extractToolCallArguments(event, subject);
+    return {
+      type: "tool_call",
+      title: toolName ?? "tool",
+      ...(args != null
+        ? { text: sanitizeActiveTurnText(truncateOneLine(args, 280)) }
+        : {})
+    };
+  }
+  if (isToolOutputEvent(type, subjectType)) {
+    const output =
+      asOptionalString(subject.output) ??
+      asOptionalString(subject.result) ??
+      asOptionalString(event.output) ??
+      extractVisibleContentText(subject.content).join("");
+    return {
+      type: "tool_output",
+      ...(output != null
+        ? { text: sanitizeActiveTurnText(tailText(output, MAX_CODEX_EVENT_TEXT_CHARS)) }
+        : {})
+    };
+  }
+  return null;
+}
+
 function extractToolCallName(...roots: unknown[]): string | undefined {
   for (const root of roots) {
     const direct = extractToolCallNameFromRecord(root);
@@ -517,8 +727,14 @@ function sanitizeActiveTurnText(text: string): string {
       /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/giu,
       "[redacted private key]"
     )
-    .replace(/(authorization:\s*bearer\s+)[^\s"']+/giu, "$1[redacted]")
-    .replace(/\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*["']?[^"'\s]+/giu, "$1=[redacted]");
+    .replace(
+      /(["']?authorization["']?\s*:\s*["']?\s*bearer\s+)[^\s"',}]+/giu,
+      "$1[redacted]"
+    )
+    .replace(
+      /(["']?\b(?:api[_-]?key|token|secret|password)\b["']?\s*[:=]\s*["']?)[^"',}\s]+/giu,
+      "$1[redacted]"
+    );
 }
 
 function truncateOneLine(text: string, maxChars: number): string {
@@ -646,6 +862,68 @@ function resolveStructuredPayload(parsed: JsonRecord): {
   };
 }
 
+function extractClaudeNativeToolName(
+  payload: JsonRecord
+): "ExitPlanMode" | "AskUserQuestion" | undefined {
+  const metadata = isRecord(payload._meta) ? payload._meta : undefined;
+  const claudeCode = isRecord(metadata?.claudeCode) ? metadata.claudeCode : undefined;
+  const toolName = asOptionalString(claudeCode?.toolName);
+  return toolName === "ExitPlanMode" || toolName === "AskUserQuestion" ? toolName : undefined;
+}
+
+function extractQuestionText(value: unknown, depth = 0): string | undefined {
+  if (depth > 5) {
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const question = extractQuestionText(entry, depth + 1);
+      if (question != null) {
+        return question;
+      }
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const question = asOptionalString(value.question);
+  if (question != null) {
+    return question.slice(0, 2_000);
+  }
+  for (const key of ["questions", "input", "rawInput"]) {
+    const nested = extractQuestionText(value[key], depth + 1);
+    if (nested != null) {
+      return nested;
+    }
+  }
+  return undefined;
+}
+
+function parsePlanEntries(payload: JsonRecord): NativePlanEntry[] {
+  if (!Array.isArray(payload.entries)) {
+    return [];
+  }
+  return payload.entries.flatMap((entry): NativePlanEntry[] => {
+    if (!isRecord(entry)) {
+      return [];
+    }
+    const content = asOptionalString(entry.content);
+    if (content == null) {
+      return [];
+    }
+    const status = asOptionalString(entry.status);
+    const priority = asOptionalString(entry.priority);
+    return [
+      {
+        content,
+        ...(status != null ? { status } : {}),
+        ...(priority != null ? { priority } : {})
+      }
+    ];
+  });
+}
+
 function parsePromptEventLine(line: string): PromptEvent | null {
   const trimmed = line.trim();
   if (!trimmed) {
@@ -661,10 +939,21 @@ function parsePromptEventLine(line: string): PromptEvent | null {
     // there). The session/update "usage_update" only carries the context-window
     // used/size — so without this the persistent path records no real tokens.
     // Surface it as a usage-bearing status event → recordNormalizedUsage.
-    if (isRecord(parsed.result) && isRecord(parsed.result.usage)) {
-      const usage = normalizeUsage(parsed.result.usage);
-      if (hasNonzeroUsage(usage)) {
-        return { type: "status", text: "usage recorded", usage };
+    if (isRecord(parsed.result)) {
+      const stopReason = asOptionalString(parsed.result.stopReason);
+      if (stopReason != null) {
+        const usage = normalizeUsage(parsed.result.usage);
+        return {
+          type: "done",
+          stopReason,
+          ...(hasNonzeroUsage(usage) ? { usage } : {})
+        };
+      }
+      if (isRecord(parsed.result.usage)) {
+        const usage = normalizeUsage(parsed.result.usage);
+        if (hasNonzeroUsage(usage)) {
+          return { type: "status", text: "usage recorded", usage };
+        }
       }
     }
     const structured = resolveStructuredPayload(parsed);
@@ -688,14 +977,30 @@ function parsePromptEventLine(line: string): PromptEvent | null {
         const title = asOptionalString(structured.payload.title) ?? "tool call";
         const status = asOptionalString(structured.payload.status);
         const toolCallId = asOptionalString(structured.payload.toolCallId);
+        const nativeToolName = extractClaudeNativeToolName(structured.payload);
+        const inputRequestText =
+          nativeToolName === "AskUserQuestion"
+            ? extractQuestionText(structured.payload.rawInput)
+            : undefined;
         return {
           type: "tool_call",
           text: status != null ? `${title} (${status})` : title,
           title,
           ...(status != null ? { status } : {}),
           ...(structured.tag != null ? { tag: structured.tag } : {}),
-          ...(toolCallId != null ? { toolCallId } : {})
+          ...(toolCallId != null ? { toolCallId } : {}),
+          ...(nativeToolName != null ? { nativeToolName } : {}),
+          ...(inputRequestText != null ? { inputRequestText } : {})
         };
+      }
+      case "plan":
+        return {
+          type: "plan",
+          entries: parsePlanEntries(structured.payload)
+        };
+      case "current_mode_update": {
+        const mode = asOptionalString(structured.payload.currentModeId);
+        return mode == null ? null : { type: "mode", mode };
       }
       case "usage_update": {
         const used = asOptionalFiniteNumber(structured.payload.used);
@@ -817,9 +1122,6 @@ function resolveQuestionFromOutput(output: string): string | undefined {
     .filter(Boolean);
   const candidate = paragraphs.at(-1) ?? trimmed;
   if (/^(question|need input|user input)\s*[:\-]/iu.test(candidate)) {
-    return candidate;
-  }
-  if (candidate.endsWith("?") && candidate.length <= 600) {
     return candidate;
   }
   return undefined;
@@ -1098,6 +1400,7 @@ export class AcpxSessionManager implements ISessionManager {
 
         const context = await loadContextFiles(directory, params.contextFiles);
         const promptText = [
+          interactionPromptPrefix(params.interactionMode),
           this.buildPlanningPromptPrefix({
             agent: params.agent,
             ...((params.planningProfile ?? session.planningProfile)
@@ -1120,7 +1423,8 @@ export class AcpxSessionManager implements ISessionManager {
         const turn = await this.runTurn({
           session,
           promptText: effectivePromptText,
-          permissionMode: effectivePermissionMode
+          permissionMode: effectivePermissionMode,
+          ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
         });
         const stoppedDuringTurn = this.stopRequests.delete(params.name);
 
@@ -1159,6 +1463,7 @@ export class AcpxSessionManager implements ISessionManager {
           session: nextSession,
           output: turn.output,
           outputRole: outputRoleForTurn(turn),
+          ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
           contextFiles: context.files,
           skills: installedSkills
         });
@@ -1207,7 +1512,11 @@ export class AcpxSessionManager implements ISessionManager {
             ? "ultrathink\n\n"
             : "Use a high-effort reasoning pass for this reply.\n\n"
           : "";
-      const promptText = [prefix + params.message.trim(), context.promptText]
+      const promptText = [
+        interactionPromptPrefix(params.interactionMode),
+        prefix + params.message.trim(),
+        context.promptText
+      ]
         .filter(Boolean)
         .join("\n\n");
       const runtimePromptText =
@@ -1222,7 +1531,8 @@ export class AcpxSessionManager implements ISessionManager {
       const turn = await this.runTurn({
         session: effectiveSession,
         promptText: effectivePromptText,
-        permissionMode: effectivePermissionMode
+        permissionMode: effectivePermissionMode,
+        ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
       });
       const stoppedDuringTurn = this.stopRequests.delete(params.name);
 
@@ -1259,6 +1569,7 @@ export class AcpxSessionManager implements ISessionManager {
         session: nextSession,
         output: turn.output,
         outputRole: outputRoleForTurn(turn),
+        ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
         contextFiles: context.files
       });
     });
@@ -2398,10 +2709,166 @@ export class AcpxSessionManager implements ISessionManager {
     return undefined;
   }
 
+  private async prepareNativeInteractionMode(params: {
+    session: SessionInfo;
+    interactionMode?: InteractionMode;
+  }): Promise<NativeModePreparation> {
+    if (
+      params.interactionMode == null ||
+      params.session.agent !== "claude" ||
+      this.usesOneShotRuntime(params.session)
+    ) {
+      return {};
+    }
+
+    const sessionRecord = await this.getRuntimeSessionRecord(params.session).catch(() => null);
+    const modeStateFromRecord = extractRuntimeModeState(sessionRecord);
+    const modeState =
+      modeStateFromRecord ??
+      extractRuntimeModeState(
+        (
+          await this.getRuntimeStatus({
+            name: params.session.name,
+            agent: params.session.agent,
+            directory: params.session.directory,
+            ...(params.session.modelProvider != null
+              ? { modelProvider: params.session.modelProvider }
+              : {})
+          })
+        ).raw
+      );
+    if (modeState == null) {
+      return {
+        warning: `ACP runtime did not advertise session modes; ${params.interactionMode} intent is enforced through the prompt and permission boundary.`
+      };
+    }
+
+    const targetMode =
+      params.interactionMode === "plan"
+        ? modeState.availableModes == null || modeState.availableModes.includes("plan")
+          ? "plan"
+          : undefined
+        : modeState.currentMode === "plan"
+          ? (modeState.availableModes?.find((mode) => mode === "default") ??
+            modeState.availableModes?.find((mode) => mode === "code") ??
+            modeState.availableModes?.find((mode) => mode !== "plan") ??
+            (modeState.availableModes == null ? "default" : undefined))
+          : modeState.currentMode;
+    if (targetMode == null) {
+      return {
+        activeMode: modeState.currentMode,
+        warning: `ACP runtime does not advertise a mode compatible with ${params.interactionMode}; intent is enforced through the prompt and permission boundary.`
+      };
+    }
+    if (targetMode === modeState.currentMode) {
+      return { activeMode: modeState.currentMode };
+    }
+
+    const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider);
+    try {
+      await this.runControlCommand({
+        args: this.buildVerbArgs(params.session.agent, params.session.directory, [
+          "set-mode",
+          targetMode,
+          "--session",
+          params.session.name
+        ]),
+        cwd: params.session.directory,
+        ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+      });
+    } catch (error) {
+      const advertised = modeState.availableModes?.includes(targetMode) === true;
+      if (!advertised && params.interactionMode === "plan") {
+        return {
+          activeMode: modeState.currentMode,
+          warning: `ACP runtime did not advertise plan mode and rejected a capability probe; plan intent is enforced through the prompt and permission boundary.`
+        };
+      }
+      throw new PuppenclawError(
+        "ACP_MODE_SWITCH_FAILED",
+        `ACP runtime advertised mode "${targetMode}" but rejected the transition for session ${params.session.name}: ${ensureError(error).message}`,
+        {
+          name: params.session.name,
+          requestedMode: targetMode,
+          previousMode: modeState.currentMode
+        }
+      );
+    }
+    return {
+      activeMode: targetMode,
+      restoreMode: modeState.currentMode
+    };
+  }
+
+  private async restoreNativeInteractionMode(
+    session: SessionInfo,
+    preparation: NativeModePreparation
+  ): Promise<void> {
+    if (preparation.restoreMode == null || preparation.restoreMode === preparation.activeMode) {
+      return;
+    }
+    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+    await this.runControlCommand({
+      args: this.buildVerbArgs(session.agent, session.directory, [
+        "set-mode",
+        preparation.restoreMode,
+        "--session",
+        session.name
+      ]),
+      cwd: session.directory,
+      ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+    });
+  }
+
   private async runTurn(params: {
     session: SessionInfo;
     promptText: string;
     permissionMode: PermissionMode;
+    interactionMode?: InteractionMode;
+    retryAfterReconnect?: boolean;
+    baselineMessageCount?: number;
+  }): Promise<TurnResult> {
+    const nativeMode = await this.prepareNativeInteractionMode(params);
+    let turn: TurnResult;
+    try {
+      turn = await this.runRuntimeTurn(params);
+    } catch (error) {
+      await this.restoreNativeInteractionMode(params.session, nativeMode).catch((restoreError) => {
+        this.deps.logger.warn(
+          `Unable to restore ACP mode for ${params.session.name}: ${ensureError(restoreError).message}`
+        );
+      });
+      throw error;
+    }
+
+    const restoreWarning = await this.restoreNativeInteractionMode(params.session, nativeMode).then(
+      () => undefined,
+      (error) => {
+        const message = `Unable to restore ACP mode for ${params.session.name}: ${ensureError(error).message}`;
+        this.deps.logger.warn(message);
+        return message;
+      }
+    );
+    const signals = mergeTurnSignals(
+      nativeMode.activeMode != null ? { nativeMode: nativeMode.activeMode } : undefined,
+      turn.signals
+    );
+    return {
+      ...turn,
+      warnings: dedupeWarnings([
+        ...turn.warnings,
+        ...(nativeMode.warning != null ? [nativeMode.warning] : []),
+        ...(restoreWarning != null ? [restoreWarning] : [])
+      ]),
+      ...(signals != null ? { signals } : {})
+    };
+  }
+
+  private async runRuntimeTurn(params: {
+    session: SessionInfo;
+    promptText: string;
+    permissionMode: PermissionMode;
+    interactionMode?: InteractionMode;
     retryAfterReconnect?: boolean;
     baselineMessageCount?: number;
   }): Promise<TurnResult> {
@@ -2485,6 +2952,32 @@ export class AcpxSessionManager implements ISessionManager {
           this.appendActiveTurnOutput(params.session.name, event.text);
           dispatchTasks.push(this.deps.outputRouter.onChunk(params.session.name, event.text));
         }
+        if (event.type === "tool_call") {
+          dispatchTasks.push(
+            this.deps.outputRouter.onActivity(params.session.name, {
+              type: "tool_call",
+              title: event.title,
+              ...(event.status != null ? { status: event.status } : {}),
+              ...(event.toolCallId != null ? { toolCallId: event.toolCallId } : {})
+            })
+          );
+        }
+        if (event.type === "plan") {
+          dispatchTasks.push(
+            this.deps.outputRouter.onActivity(params.session.name, {
+              type: "status",
+              text: "Agent plan updated."
+            })
+          );
+        }
+        if (event.type === "mode") {
+          dispatchTasks.push(
+            this.deps.outputRouter.onActivity(params.session.name, {
+              type: "status",
+              text: `Agent mode changed to ${event.mode}.`
+            })
+          );
+        }
         if (event.type === "status") {
           if (event.used != null || event.size != null) {
             latestTokenUsage = {
@@ -2496,6 +2989,9 @@ export class AcpxSessionManager implements ISessionManager {
           if (event.usage != null && hasNonzeroUsage(event.usage)) {
             recordNormalizedUsage(event.usage);
           }
+        }
+        if (event.type === "done" && event.usage != null && hasNonzeroUsage(event.usage)) {
+          recordNormalizedUsage(event.usage);
         }
         return;
       }
@@ -2566,10 +3062,11 @@ export class AcpxSessionManager implements ISessionManager {
     await Promise.all(dispatchTasks);
 
     const output = outputChunks.join("").trim() || summarizePromptEvents(events).trim();
-    const doneEvent = events.find(
+    const doneEvent = events.findLast(
       (event): event is Extract<PromptEvent, { type: "done" }> => event.type === "done"
     );
     const turnStopReason = doneEvent?.stopReason;
+    const promptSignals = signalsFromPromptEvents(events);
     const turnDurationMs = Date.now() - promptStartedAtMs;
     const errorEvent = events.find(
       (event): event is Extract<PromptEvent, { type: "error" }> => event.type === "error"
@@ -2601,6 +3098,7 @@ export class AcpxSessionManager implements ISessionManager {
         const result = await this.finishSuccessfulTurn({
           sessionName: params.session.name,
           output: recoveredOutput,
+          ...(promptSignals != null ? { signals: promptSignals } : {}),
           ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {}),
           ...(latestNormalizedUsage != null ? { usage: latestNormalizedUsage } : {}),
           ...(turnStopReason != null ? { stopReason: turnStopReason } : {}),
@@ -2618,10 +3116,11 @@ export class AcpxSessionManager implements ISessionManager {
             ? { modelProvider: params.session.modelProvider }
             : {})
         });
-        return await this.runTurn({
+        return await this.runRuntimeTurn({
           session: params.session,
           promptText: params.promptText,
           permissionMode: params.permissionMode,
+          ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {}),
           retryAfterReconnect: true,
           ...(baselineMessageCount != null ? { baselineMessageCount } : {})
         });
@@ -2684,6 +3183,7 @@ export class AcpxSessionManager implements ISessionManager {
     const result = await this.finishSuccessfulTurn({
       sessionName: params.session.name,
       output,
+      ...(promptSignals != null ? { signals: promptSignals } : {}),
       ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {}),
       ...(latestNormalizedUsage != null ? { usage: latestNormalizedUsage } : {}),
       ...(turnStopReason != null ? { stopReason: turnStopReason } : {}),
@@ -2771,6 +3271,10 @@ export class AcpxSessionManager implements ISessionManager {
         const parsed = JSON.parse(line) as unknown;
         if (!isRecord(parsed)) {
           return;
+        }
+        const activity = extractCodexActivity(parsed);
+        if (activity != null) {
+          dispatchTasks.push(this.deps.outputRouter.onActivity(params.session.name, activity));
         }
         const visibleText = extractCodexLiveOutput(parsed);
         if (visibleText != null && visibleText.length > 0) {
@@ -2885,7 +3389,7 @@ export class AcpxSessionManager implements ISessionManager {
         finalOutput.length > 0 &&
         !activeText.includes(finalOutput.slice(0, Math.min(finalOutput.length, 240)))
       ) {
-        const finalChunk = `\n\n[final]\n${sanitizeActiveTurnText(finalOutput)}`;
+        const finalChunk = `\n\n${sanitizeActiveTurnText(finalOutput)}`;
         this.appendActiveTurnOutput(params.session.name, finalChunk);
         await this.deps.outputRouter.onChunk(params.session.name, finalChunk);
       }
@@ -3004,12 +3508,24 @@ export class AcpxSessionManager implements ISessionManager {
   private async finishSuccessfulTurn(params: {
     sessionName: string;
     output: string;
+    signals?: TurnSignals;
     tokenUsage?: TokenUsage;
     usage?: NormalizedUsage;
     stopReason?: string;
     durationMs?: number;
   }): Promise<TurnResult> {
-    const question = resolveQuestionFromOutput(params.output);
+    const signals = mergeTurnSignals(
+      params.signals,
+      params.stopReason != null ? { stopReason: params.stopReason } : undefined
+    );
+    const question =
+      signals?.inputRequest?.text ??
+      (signals?.inputRequest != null
+        ? "Agent requested user input."
+        : signals?.plan == null
+          ? resolveQuestionFromOutput(params.output)
+          : undefined);
+    await this.deps.outputRouter.onFinal(params.sessionName, params.output);
     if (question != null) {
       await this.deps.outputRouter.onQuestion(params.sessionName, question);
     }
@@ -3025,6 +3541,7 @@ export class AcpxSessionManager implements ISessionManager {
       ...(params.usage != null ? { usage: params.usage } : {}),
       ...(params.stopReason != null ? { stopReason: params.stopReason } : {}),
       ...(params.durationMs != null ? { durationMs: params.durationMs } : {}),
+      ...(signals != null ? { signals } : {}),
       warnings: [],
       transcript: makeAssistantTranscript(params.output),
       state: question != null ? "waiting_input" : "idle"

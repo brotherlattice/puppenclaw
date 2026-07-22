@@ -17,13 +17,13 @@ import {
   forkParamsZod,
   logsParamsZod,
   pluginSendParamsZod,
+  pluginStartParamsZod,
   projectCreateParamsZod,
   reassessmentReportParamsZod,
   reassessmentStartParamsZod,
   reassessmentStatusParamsZod,
   resumeParamsZod,
   siteStatusParamsZod,
-  startParamsZod,
   statusParamsZod,
   stopParamsZod,
   suspendParamsZod,
@@ -238,7 +238,7 @@ function createTools(toolCtx: OpenClawPluginToolContext): AnyAgentTool[] {
       parameters: toolStartSchema,
       execute: async (_toolCallId: string, rawParams: unknown) => {
         const manager = await getPuppenclawManager();
-        const params = startParamsZod.parse(rawParams);
+        const params = pluginStartParamsZod.parse(rawParams);
         const result = await manager.start(params);
         await annotateToolSessionSource(toolCtx, params.name);
         return {

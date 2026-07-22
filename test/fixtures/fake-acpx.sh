@@ -124,7 +124,31 @@ if [[ "${command[0]:-}" == "status" && "${command[1]:-}" == "--session" && -n "$
     exit 0
   fi
   status="$(read_session_status "$name")"
-  emit_json "{\"status\":\"$(json_escape "${status:-alive}")\",\"acpxRecordId\":\"rec-$(json_escape "$name")\",\"acpxSessionId\":\"backend-$(json_escape "$name")\",\"agentSessionId\":\"agent-$(json_escape "$name")\",\"agent\":\"$(json_escape "${agent:-$(read_session_agent "$name")}")\"}"
+  if [[ "$name" == *"no-modes"* ]]; then
+    emit_json "{\"status\":\"$(json_escape "${status:-alive}")\",\"acpxRecordId\":\"rec-$(json_escape "$name")\",\"agent\":\"$(json_escape "${agent:-$(read_session_agent "$name")}")\"}"
+    exit 0
+  fi
+  mode="default"
+  if [[ -f "$(setting_file "$name" mode)" ]]; then
+    mode="$(sed -n '1p' "$(setting_file "$name" mode)")"
+  fi
+  emit_json "{\"status\":\"$(json_escape "${status:-alive}")\",\"acpxRecordId\":\"rec-$(json_escape "$name")\",\"acpxSessionId\":\"backend-$(json_escape "$name")\",\"agentSessionId\":\"agent-$(json_escape "$name")\",\"agent\":\"$(json_escape "${agent:-$(read_session_agent "$name")}")\",\"modeState\":{\"currentModeId\":\"$(json_escape "$mode")\",\"availableModes\":[{\"id\":\"default\",\"name\":\"Default\"},{\"id\":\"plan\",\"name\":\"Plan\"}]}}"
+  exit 0
+fi
+
+if [[ "${command[0]:-}" == "set-mode" && -n "${command[1]:-}" && "${command[2]:-}" == "--session" && -n "${command[3]:-}" ]]; then
+  mode="${command[1]}"
+  name="${command[3]}"
+  if ! session_exists "$name"; then
+    emit_error "NO_SESSION" "No acpx session found"
+    exit 4
+  fi
+  if [[ "$name" == *"mode-switch-fail"* ]]; then
+    emit_error "SIM_MODE_FAIL" "Simulated mode transition failure"
+    exit 1
+  fi
+  printf '%s\n' "$mode" > "$(setting_file "$name" mode)"
+  emit_json "{\"status\":\"set\",\"session\":\"$(json_escape "$name")\",\"mode\":\"$(json_escape "$mode")\"}"
   exit 0
 fi
 
@@ -151,6 +175,29 @@ if [[ "${command[0]:-}" == "sessions" && "${command[1]:-}" == "close" && -n "${c
   fi
   rm -f "$(session_file "${command[2]}")"
   emit_json '{"status":"closed"}'
+  exit 0
+fi
+
+if [[ "${command[0]:-}" == "sessions" && "${command[1]:-}" == "show" && -n "${command[2]:-}" ]]; then
+  name="${command[2]}"
+  if ! session_exists "$name"; then
+    emit_error "NO_SESSION" "No acpx session found"
+    exit 4
+  fi
+  if [[ "$name" == *"no-modes"* ]]; then
+    emit_json '{"messages":[],"acpx":{}}'
+    exit 0
+  fi
+  mode="default"
+  if [[ -f "$(setting_file "$name" mode)" ]]; then
+    mode="$(sed -n '1p' "$(setting_file "$name" mode)")"
+  fi
+  emit_json "{\"messages\":[],\"acpx\":{\"current_mode_id\":\"$(json_escape "$mode")\",\"config_options\":[{\"type\":\"select\",\"id\":\"mode\",\"currentValue\":\"$(json_escape "$mode")\",\"options\":[{\"value\":\"default\",\"name\":\"Default\"},{\"value\":\"plan\",\"name\":\"Plan\"}]}]}}"
+  exit 0
+fi
+
+if [[ "${command[0]:-}" == "sessions" && "${command[1]:-}" == "history" ]]; then
+  emit_json '{"entries":[]}'
   exit 0
 fi
 
@@ -224,16 +271,30 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
     printf '%s\n' 'conservative reassessment fix' > "$cwd/reassessment-fix.txt"
     reply=$'## Executive judgment\nPatched one obvious old-model mistake.\n## Imported sessions reviewed\n- Reviewed imported fixtures.\n## Findings by importance\n- functionality: missing reassessment-fix.txt was an obvious prior omission.\n## Patches made\n- Added reassessment-fix.txt.\n## Findings intentionally not patched\n- No refactor-only findings patched.\n## Validation instructions and residual risk\n- Run the configured validation command.'
   elif [[ "$normalized_input" == *"ASK_USER"* ]]; then
+    emit_json '{"sessionUpdate":"tool_call","toolCallId":"ask-user-1","title":"Localized input title","rawInput":{"questions":[{"question":"Which source should I use?"}]},"_meta":{"claudeCode":{"toolName":"AskUserQuestion"}}}'
     reply="Need input from the user?"
+  elif [[ "$normalized_input" == *"EXIT_PLAN_MODE"* ]]; then
+    emit_json '{"sessionUpdate":"plan","entries":[{"content":"Search primary sources","status":"pending","priority":"high"}]}'
+    emit_json '{"sessionUpdate":"tool_call","toolCallId":"exit-plan-1","title":"Localized plan title","_meta":{"claudeCode":{"toolName":"ExitPlanMode"}}}'
+    reply="The plan is ready. Should I proceed?"
+  elif [[ "$normalized_input" == *"SPOOF_PLAN_TITLE"* ]]; then
+    emit_json '{"sessionUpdate":"tool_call","toolCallId":"spoof-plan-1","title":"ExitPlanMode"}'
+    reply="This is an ordinary answer."
   elif [[ "$normalized_input" == *"REPORT_PERMISSION_MODE"* ]]; then
     reply="Permission mode: $permission_mode"
+  elif [[ "$normalized_input" == *"REPORT_NATIVE_MODE"* ]]; then
+    native_mode="default"
+    if [[ -f "$(setting_file "$name" mode)" ]]; then
+      native_mode="$(sed -n '1p' "$(setting_file "$name" mode)")"
+    fi
+    reply="Native mode: $native_mode"
   else
     reply="Handled: $normalized_input"
   fi
   while IFS= read -r chunk; do
     emit_json "{\"type\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"$(json_escape "$chunk")\"}}"
   done < <(split_text "$reply" 14)
-  emit_json '{"type":"done"}'
+  emit_json '{"type":"done","stopReason":"end_turn"}'
   exit 0
 fi
 

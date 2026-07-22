@@ -20,13 +20,13 @@ import {
   forkParamsZod,
   logsParamsZod,
   pluginSendParamsZod,
+  pluginStartParamsZod,
   projectCreateParamsZod,
   reassessmentReportParamsZod,
   reassessmentStartParamsZod,
   reassessmentStatusParamsZod,
   resumeParamsZod,
   siteStatusParamsZod,
-  startParamsZod,
   statusParamsZod,
   stopParamsZod,
   suspendParamsZod,
@@ -180,6 +180,8 @@ class CommandStreamCollector {
         this.chunks.push(`\n[error]\n${event.text}\n`);
         break;
       case "complete":
+      case "activity":
+      case "final":
         break;
     }
   }
@@ -690,7 +692,7 @@ export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
             return { text: renderCommandResult(result, requestedFormat) };
           }
           case "start": {
-            const params = startParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
+            const params = pluginStartParamsZod.parse(parseJsonPayload(parsed.payloadText, {}));
             requestedFormat = params.format;
             const binding = remote
               ? (

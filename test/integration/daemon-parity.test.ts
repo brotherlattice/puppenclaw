@@ -151,6 +151,31 @@ describe("daemon/local parity", () => {
       expect(localFailureDetails.outputRole).toBe("status");
       expect(remoteFailureDetails.outputRole).toBe(localFailureDetails.outputRole);
 
+      const localPlan = await localManager.start({
+        agent: "claude",
+        name: "parity-plan",
+        directory: localDir,
+        task: "EXIT_PLAN_MODE",
+        interactionMode: "plan",
+        contextFiles: []
+      });
+      const remotePlan = await daemonManager.start({
+        agent: "claude",
+        name: "parity-plan",
+        directory: daemonDir,
+        task: "EXIT_PLAN_MODE",
+        interactionMode: "plan",
+        contextFiles: []
+      });
+      const localPlanDetails = localPlan.details as {
+        output: string;
+        turnSignals: Record<string, unknown>;
+      };
+      const remotePlanDetails = remotePlan.details as typeof localPlanDetails;
+      expect(localPlanDetails.output).toBe("The plan is ready. Should I proceed?");
+      expect(remotePlanDetails.output).toBe(localPlanDetails.output);
+      expect(remotePlanDetails.turnSignals).toEqual(localPlanDetails.turnSignals);
+
       // Per-session usage parity: local cost() vs daemon GET /session/:name/cost.
       const localCost = await localManager.cost({ name: "parity" });
       const remoteCost = await daemonManager.cost({ name: "parity" });
@@ -175,9 +200,10 @@ describe("daemon/local parity", () => {
       for (const details of [localRollupDetails, remoteRollupDetails]) {
         expect(Array.isArray(details.rollup)).toBe(true);
         expect(details.rollup.length).toBeGreaterThanOrEqual(1);
-        expect(details.rollup[0]?.provider).toBe("openai");
-        expect(details.rollup[0]?.model).toBe("codex-default");
-        expect(details.rollup[0]?.usage.output).toBeGreaterThan(0);
+        const codexRollup = details.rollup.find(
+          (entry) => entry.provider === "openai" && entry.model === "codex-default"
+        );
+        expect(codexRollup?.usage.output).toBeGreaterThan(0);
         expect(details.totals.turns).toBeGreaterThanOrEqual(1);
         expect(details.totals.usage.total).toBeGreaterThan(0);
         expect(details.since).toBeNull();

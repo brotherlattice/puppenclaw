@@ -8,6 +8,22 @@ export type OutputRouteEvent =
       text: string;
     }
   | {
+      kind: "activity";
+      sessionName: string;
+      activity: {
+        type: "tool_call" | "tool_output" | "status";
+        text?: string;
+        title?: string;
+        status?: string;
+        toolCallId?: string;
+      };
+    }
+  | {
+      kind: "final";
+      sessionName: string;
+      text: string;
+    }
+  | {
       kind: "complete";
       sessionName: string;
       text: string;
@@ -91,6 +107,30 @@ export class OutputRouter {
       kind: "complete",
       sessionName,
       text: summary.trim()
+    });
+  }
+
+  async onActivity(
+    sessionName: string,
+    activity: Extract<OutputRouteEvent, { kind: "activity" }>["activity"]
+  ): Promise<void> {
+    await this.dispatch(sessionName, {
+      kind: "activity",
+      sessionName,
+      activity
+    });
+  }
+
+  async onFinal(sessionName: string, text: string): Promise<void> {
+    await this.flushBufferedChunks(sessionName, true);
+    const finalText = text.trim();
+    if (!finalText) {
+      return;
+    }
+    await this.dispatch(sessionName, {
+      kind: "final",
+      sessionName,
+      text: finalText
     });
   }
 

@@ -4,6 +4,7 @@ import {
   buildPluginManifest,
   pluginConfigZod,
   pluginSendParamsZod,
+  pluginStartParamsZod,
   projectCreateParamsZod,
   reassessmentStartParamsZod,
   REMOTE_CONTROL_VERBS,
@@ -74,6 +75,44 @@ describe("plugin manifest and config schema", () => {
       toolSendSchema as unknown as { properties: Record<string, unknown> }
     ).properties;
     expect(toolProperties).not.toHaveProperty("permissionMode");
+    expect(
+      sendParamsZod.parse({
+        name: "demo",
+        message: "Prepare a plan.",
+        interactionMode: "plan"
+      }).interactionMode
+    ).toBe("plan");
+    expect(
+      pluginSendParamsZod.safeParse({
+        name: "demo",
+        message: "Try to choose an internal mode.",
+        interactionMode: "execute"
+      }).success
+    ).toBe(false);
+    expect(
+      pluginStartParamsZod.safeParse({
+        agent: "claude",
+        name: "demo",
+        directory: "/tmp/demo",
+        task: "Try to choose an internal mode.",
+        interactionMode: "plan"
+      }).success
+    ).toBe(false);
+    expect(toolProperties).not.toHaveProperty("interactionMode");
+    const startToolProperties = (
+      toolStartSchema as unknown as { properties: Record<string, unknown> }
+    ).properties;
+    expect(startToolProperties).not.toHaveProperty("interactionMode");
+    expect(startToolProperties).not.toHaveProperty("permissionMode");
+    expect(
+      pluginStartParamsZod.safeParse({
+        agent: "claude",
+        name: "demo",
+        directory: "/tmp/demo",
+        task: "Try to choose a permission baseline.",
+        permissionMode: "approve-all"
+      }).success
+    ).toBe(false);
   });
 
   it.each(["xhigh", "max", "ultra"] as const)(
