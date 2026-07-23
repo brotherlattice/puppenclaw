@@ -14,6 +14,9 @@ import { SessionStore } from "../shared/store.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import { ComputeRuntime } from "../compute/runtime.js";
 import { computeJobSpecZod } from "../compute/types.js";
+import { ResourceMonitor } from "../resources/monitor.js";
+import { resourcesHistoryParamsZod } from "../resources/types.js";
+import { jsonToolResult } from "../shared/tool-results.js";
 import {
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -108,6 +111,16 @@ export async function createDaemonServer(params: {
     dataDir: params.dataDir,
     config: params.config
   });
+  const resourceMonitor = await ResourceMonitor.open({
+    dataDir: params.dataDir,
+    config: params.config,
+    logger,
+    sessionStore: store,
+    computeJobs: {
+      listActive: (sessionName?: string) => computeRuntime.listActiveJobs(sessionName)
+    }
+  });
+  resourceMonitor.start();
   const outputRouter = new OutputRouter(logger);
   const manager = new AcpxSessionManager({
     config: {
@@ -212,6 +225,7 @@ export async function createDaemonServer(params: {
   });
 
   app.addHook("onClose", async () => {
+    resourceMonitor.close();
     computeRuntime.close();
     orchestratorStore.close();
     usageLedger.close();
@@ -250,6 +264,46 @@ export async function createDaemonServer(params: {
       )
     )
   );
+
+  app.get("/session/:name/processes", async (request) =>
+    ok(
+      jsonToolResult(
+        await resourceMonitor.sessionProcesses((request.params as { name: string }).name),
+        "Session processes"
+      )
+    )
+  );
+
+  app.get("/resources", async () =>
+    ok(jsonToolResult(await resourceMonitor.snapshot(), "Resource usage"))
+  );
+
+  app.get("/resources/history", async (request, reply) => {
+    const query = request.query as {
+      since?: string;
+      until?: string;
+      bucketSeconds?: string;
+      session?: string;
+    };
+    try {
+      const parsed = resourcesHistoryParamsZod.parse({
+        ...(query.since != null ? { since: query.since } : {}),
+        ...(query.until != null ? { until: query.until } : {}),
+        ...(query.bucketSeconds != null ? { bucketSeconds: Number(query.bucketSeconds) } : {}),
+        ...(query.session != null ? { session: query.session } : {})
+      });
+      return ok(jsonToolResult(resourceMonitor.history(parsed), "Resource usage history"));
+    } catch (error) {
+      if (error instanceof PuppenclawError) {
+        throw error;
+      }
+      return reply.code(400).send({
+        ok: false,
+        code: "INVALID_ARGUMENT",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
 
   app.get("/usage", async (request) =>
     ok(

@@ -20,6 +20,8 @@ export const SESSION_STORE_VERSION = 1 as const;
 export const DEFAULT_STREAM_OUTPUT = true;
 export const DEFAULT_MAX_CAMPAIGNS = 32;
 export const DEFAULT_ARTIFACT_RETENTION_HOURS = 24 * 14;
+export const DEFAULT_RESOURCE_SAMPLING_INTERVAL_MS = 30_000;
+export const DEFAULT_RESOURCE_RETENTION_DAYS = 7;
 export const REMOTE_CONTROL_VERBS = [
   "project",
   "worker",
@@ -221,6 +223,18 @@ export const pluginConfigZod = z
       .max(24 * 60)
       .default(DEFAULT_SESSION_TTL_MINUTES),
     streamOutput: z.boolean().default(DEFAULT_STREAM_OUTPUT),
+    resourceSamplingIntervalMs: z
+      .number()
+      .int()
+      .min(5_000)
+      .max(600_000)
+      .default(DEFAULT_RESOURCE_SAMPLING_INTERVAL_MS),
+    resourceRetentionDays: z
+      .number()
+      .int()
+      .min(1)
+      .max(90)
+      .default(DEFAULT_RESOURCE_RETENTION_DAYS),
     acpxCommand: nonEmptyString.optional(),
     codexCommand: nonEmptyString.optional(),
     skillRoots: z.array(nonEmptyString).default([]),
@@ -646,6 +660,18 @@ export const pluginManifestConfigSchema = {
     streamOutput: {
       type: "boolean",
       description: "Capture streamed output chunks while turns run."
+    },
+    resourceSamplingIntervalMs: {
+      type: "integer",
+      minimum: 5000,
+      maximum: 600000,
+      description: "Interval in milliseconds between daemon /proc resource usage samples."
+    },
+    resourceRetentionDays: {
+      type: "integer",
+      minimum: 1,
+      maximum: 90,
+      description: "Days of resource usage history kept in resources.sqlite before pruning."
     },
     acpxCommand: {
       type: "string",
