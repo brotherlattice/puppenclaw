@@ -195,7 +195,7 @@ export class DaemonOrchestratorClient implements IOrchestrator {
       const err = ensureError(error);
       throw new PuppenclawError(
         "DAEMON_UNREACHABLE",
-        `Puppenclaw daemon is unreachable at ${this.deps.config.daemonUrl}: ${err.message}`
+        `Orchestrator daemon is unreachable at ${this.deps.config.daemonUrl}: ${err.message}`
       );
     }
   }
@@ -226,7 +226,7 @@ export class DaemonOrchestratorClient implements IOrchestrator {
       return payload as ToolResult;
     } catch (error) {
       const err = ensureError(error);
-      this.deps.logger.warn(`Puppenclaw orchestrator request failed: ${err.message}`);
+      this.deps.logger.warn(`Orchestrator API request failed: ${err.message}`);
       throw err;
     }
   }

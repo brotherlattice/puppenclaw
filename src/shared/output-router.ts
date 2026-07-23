@@ -210,7 +210,7 @@ export class OutputRouter {
         await subscription.dispatcher(event);
       } catch (error) {
         const err = ensureError(error);
-        this.logger.warn(`Puppenclaw output dispatch failed for ${sessionName}: ${err.message}`);
+        this.logger.warn(`Orchestrator output dispatch failed for ${sessionName}: ${err.message}`);
       }
     }
   }

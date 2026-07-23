@@ -93,7 +93,7 @@ async function main(): Promise<void> {
   });
   const entryDir = dirname(fileURLToPath(import.meta.url));
   console.log(
-    `Puppenclaw daemon listening on ${baseUrl} (entry: ${join(entryDir, "main.js")})`
+    `Orchestrator daemon listening on ${baseUrl} (entry: ${join(entryDir, "main.js")})`
   );
 }
 

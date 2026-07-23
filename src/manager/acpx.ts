@@ -1379,7 +1379,7 @@ export class AcpxSessionManager implements ISessionManager {
       });
     } catch (error) {
       this.deps.logger.warn(
-        `Puppenclaw usage ledger append failed for ${session.name}: ${ensureError(error).message}`
+        `Orchestrator usage ledger append failed for ${session.name}: ${ensureError(error).message}`
       );
     }
   }
@@ -1871,7 +1871,7 @@ export class AcpxSessionManager implements ISessionManager {
       {
         skills: await this.listAvailableSkills()
       },
-      "Available Puppenclaw skills"
+      "Available Orchestrator skills"
     );
   }
 
@@ -1890,7 +1890,7 @@ export class AcpxSessionManager implements ISessionManager {
         {
           sessions
         },
-        "Tracked Puppenclaw sessions"
+        "Tracked Orchestrator sessions"
       );
     }
     const stored = this.requireSession(params.name);
@@ -1998,7 +1998,7 @@ export class AcpxSessionManager implements ISessionManager {
       turns: totals?.turns ?? 0,
       history,
       pricing: null,
-      note: "Puppenclaw records token counters when the ACP runtime emits them. It does not infer currency pricing."
+      note: "Orchestrator records token counters when the ACP runtime emits them. It does not infer currency pricing."
     });
   }
 
@@ -2006,7 +2006,7 @@ export class AcpxSessionManager implements ISessionManager {
     const ledger = this.deps.ledger;
     const scope = params.since != null ? `since ${params.since}` : "all recorded sessions";
     const note =
-      "Puppenclaw records token counters when the ACP runtime emits them. It does not infer currency pricing.";
+      "Orchestrator records token counters when the ACP runtime emits them. It does not infer currency pricing.";
     if (ledger == null) {
       return textToolResult(
         `Usage rollup (${scope}): no usage ledger is configured, so no token counters are recorded.`,
@@ -2497,7 +2497,7 @@ export class AcpxSessionManager implements ISessionManager {
     if (evictionCandidate == null) {
       throw new PuppenclawError(
         "MAX_SESSIONS_REACHED",
-        `Puppenclaw is already tracking ${connectedSessions.length} connected sessions and none can be suspended.`
+        `Orchestrator is already tracking ${connectedSessions.length} connected sessions and none can be suspended.`
       );
     }
 
@@ -2542,7 +2542,7 @@ export class AcpxSessionManager implements ISessionManager {
       return newPrompt;
     }
     return [
-      `This Puppenclaw session ${session.name} was disconnected from the ACP runtime to free a worker slot.`,
+      `This Orchestrator session ${session.name} was disconnected from the ACP runtime to free a worker slot.`,
       "Rehydrate the following transcript as prior context. Do not repeat it to the user unless needed.",
       "The full stored transcript is included. If it cannot fit in the active model context, explicitly report that context-size limit instead of silently ignoring earlier turns.",
       transcriptText,
@@ -2603,7 +2603,7 @@ export class AcpxSessionManager implements ISessionManager {
       if (sourcePath == null) {
         throw new PuppenclawError(
           "SKILL_NOT_FOUND",
-          `Skill "${name}" was not found in configured Puppenclaw skill roots.`
+          `Skill "${name}" was not found in configured Orchestrator skill roots.`
         );
       }
 
@@ -3363,7 +3363,7 @@ export class AcpxSessionManager implements ISessionManager {
     // here; the turn outcome is decided by the exit code / error events.
     child.stdin.on("error", (error: Error) => {
       this.deps.logger.debug(
-        `Puppenclaw prompt stdin error for ${params.session.name}: ${error.message}`
+        `Orchestrator prompt stdin error for ${params.session.name}: ${error.message}`
       );
     });
     child.stdin.setDefaultEncoding("utf8");
@@ -3782,7 +3782,7 @@ export class AcpxSessionManager implements ISessionManager {
     // into an uncaught exception.
     child.stdin.on("error", (error: Error) => {
       this.deps.logger.debug(
-        `Puppenclaw prompt stdin error for ${params.session.name}: ${error.message}`
+        `Orchestrator prompt stdin error for ${params.session.name}: ${error.message}`
       );
     });
     child.stdin.setDefaultEncoding("utf8");

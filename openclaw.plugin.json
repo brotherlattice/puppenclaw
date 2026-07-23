@@ -1,6 +1,6 @@
 {
   "id": "puppenclaw",
-  "name": "Puppenclaw",
+  "name": "Orchestrator",
   "description": "Project-aware orchestration runtime for OpenClaw, with ACP coding agents, scientific campaign workflows, and oc2oc-aware remote control.",
   "skills": [
     "./skills"

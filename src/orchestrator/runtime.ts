@@ -526,7 +526,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       workers: this.deps.store.listWorkers(),
       campaigns: this.deps.store.listCampaigns(params.projectId)
     };
-    return jsonToolResult(payload, "Puppenclaw orchestration status");
+    return jsonToolResult(payload, "Orchestrator campaign status");
   }
 
   async listArtifacts(params: ArtifactListParams = {}): Promise<ToolResult> {
@@ -535,7 +535,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       ...(params.projectId != null ? { projectId: params.projectId } : {}),
       ...(params.campaignId != null ? { campaignId: params.campaignId } : {})
     });
-    return jsonToolResult({ artifacts }, "Puppenclaw artifacts");
+    return jsonToolResult({ artifacts }, "Orchestrator artifacts");
   }
 
   async readArtifact(params: ArtifactReadParams): Promise<ToolResult> {
@@ -586,7 +586,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     if (last != null) {
       result.cursor = `${last.event.createdAt}#${last.sequence}`;
     }
-    return jsonToolResult(result, "Puppenclaw campaign events");
+    return jsonToolResult(result, "Orchestrator campaign events");
   }
 
   async approve(params: CampaignActionParams): Promise<ToolResult> {
@@ -868,7 +868,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       return textToolResult(describeReassessment(record), record);
     }
     const reassessments = this.deps.store.listReassessments(params.projectId);
-    return jsonToolResult({ reassessments }, "Puppenclaw reassessment status");
+    return jsonToolResult({ reassessments }, "Orchestrator reassessment status");
   }
 
   async reassessmentReport(params: ReassessmentReportParams): Promise<ToolResult> {
@@ -924,7 +924,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       removed += 1;
     }
     if (removed > 0) {
-      this.deps.logger.info(`Puppenclaw pruned ${removed} expired artifact(s).`);
+      this.deps.logger.info(`Orchestrator pruned ${removed} expired artifact(s).`);
     }
   }
 
@@ -3565,7 +3565,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     // uncaught exception that crashes the whole daemon.
     child.stdin.on("error", (error: Error) => {
       this.deps.logger.debug(
-        `Puppenclaw command stdin error for ${params.campaignId}: ${error.message}`
+        `Orchestrator command stdin error for ${params.campaignId}: ${error.message}`
       );
     });
     if (params.stdinText != null) {

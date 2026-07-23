@@ -214,7 +214,7 @@ async function withCommandOutputRoute<T extends { content: Array<{ text: string 
 
 function describeBinding(binding: PluginConversationBinding | null): string {
   if (binding == null) {
-    return "No active Puppenclaw binding.";
+    return "No active Orchestrator binding.";
   }
   return `Bound to ${binding.channel}:${binding.conversationId} as ${binding.bindingId}.`;
 }
@@ -242,7 +242,7 @@ function sessionRequiresRemoteAuthorization(ctx: PluginCommandContext): boolean 
 async function requireBinding(ctx: PluginCommandContext): Promise<PluginConversationBinding> {
   const binding = await ctx.getCurrentConversationBinding();
   if (binding == null) {
-    throw new Error("Pure-pipe remote control requires a Puppenclaw conversation binding. Run /puppenclaw bind first.");
+    throw new Error("Pure-pipe remote control requires an Orchestrator conversation binding. Run /puppenclaw bind first.");
   }
   return binding;
 }
@@ -260,14 +260,14 @@ async function requirePurePipeExposure(
 }> {
   const config = getConfiguredPluginConfig();
   if (!config.remoteControl.purePipe.enabled) {
-    throw new Error("Pure-pipe remote control is disabled in Puppenclaw config.");
+    throw new Error("Pure-pipe remote control is disabled in Orchestrator config.");
   }
   const binding = await requireBinding(ctx);
   const store = await getPuppenclawStore();
   const exposure = store.getExposure(binding.bindingId);
   if (exposure == null || !exposure.allowPurePipe) {
     throw new Error(
-      "This remote conversation has not been exposed for deterministic Puppenclaw control."
+      "This remote conversation has not been exposed for deterministic Orchestrator control."
     );
   }
   if (!exposure.allowedVerbs.includes(params.verb)) {
@@ -362,7 +362,7 @@ async function handleBindingCommand(ctx: PluginCommandContext): Promise<{ text: 
     return { text: describeBinding(current) };
   }
   const requested = await ctx.requestConversationBinding({
-    summary: "Allow this conversation to remotely control Puppenclaw sessions.",
+    summary: "Allow this conversation to remotely control Orchestrator sessions.",
     detachHint: "/puppenclaw unbind"
   });
   if (requested.status === "bound") {
@@ -376,7 +376,7 @@ async function handleBindingCommand(ctx: PluginCommandContext): Promise<{ text: 
 
 async function handleExposeCommand(ctx: PluginCommandContext, payloadText: string): Promise<{ text: string }> {
   if (!getConfiguredPluginConfig().remoteControl.purePipe.enabled) {
-    throw new Error("Pure-pipe remote control is disabled in Puppenclaw config.");
+    throw new Error("Pure-pipe remote control is disabled in Orchestrator config.");
   }
   const binding = await requireBinding(ctx);
   const parsed = exposeParamsZod.parse(parseJsonPayload(payloadText, {}));
@@ -416,14 +416,14 @@ async function handleUnbindCommand(ctx: PluginCommandContext): Promise<{ text: s
   }
   const detached = await ctx.detachConversationBinding();
   return {
-    text: detached.removed ? "Detached Puppenclaw binding." : "No Puppenclaw binding was active."
+    text: detached.removed ? "Detached Orchestrator binding." : "No Orchestrator binding was active."
   };
 }
 
 export function registerPuppenclawCommands(api: OpenClawPluginApi): void {
   api.registerCommand({
     name: "puppenclaw",
-    description: "Manage Puppenclaw ACP sessions and remote bindings.",
+    description: "Manage Orchestrator ACP sessions and remote bindings.",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx: PluginCommandContext) => {

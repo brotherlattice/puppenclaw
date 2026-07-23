@@ -5,7 +5,7 @@ import { Type } from "./typebox-lite.ts";
 
 export const PACKAGE_NAME = "@puppenclaw/openclaw-plugin";
 export const PLUGIN_ID = "puppenclaw";
-export const PLUGIN_NAME = "Puppenclaw";
+export const PLUGIN_NAME = "Orchestrator";
 export const PLUGIN_DESCRIPTION =
   "Project-aware orchestration runtime for OpenClaw, with ACP coding agents, scientific campaign workflows, and oc2oc-aware remote control.";
 export const DEFAULT_ACCOUNT_ID = "default";

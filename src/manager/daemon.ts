@@ -204,7 +204,7 @@ export class DaemonSessionManager implements ISessionManager {
       const err = ensureError(error);
       throw new PuppenclawError(
         "DAEMON_UNREACHABLE",
-        `Puppenclaw daemon is unreachable at ${this.deps.config.daemonUrl}: ${err.message}`
+        `Orchestrator daemon is unreachable at ${this.deps.config.daemonUrl}: ${err.message}`
       );
     }
   }
@@ -256,7 +256,7 @@ export class DaemonSessionManager implements ISessionManager {
       return payload as ToolResult;
     } catch (error) {
       const err = ensureError(error);
-      this.deps.logger.warn(`Puppenclaw daemon request failed: ${err.message}`);
+      this.deps.logger.warn(`Orchestrator daemon request failed: ${err.message}`);
       throw err;
     }
   }

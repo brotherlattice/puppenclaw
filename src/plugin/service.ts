@@ -76,7 +76,7 @@ export function createPuppenclawService(): OpenClawPluginService {
             .catch((error) => {
               const logger = state.logger ?? ctx.logger;
               logger.warn(
-                `Puppenclaw GC failed: ${error instanceof Error ? error.message : String(error)}`
+                `Orchestrator GC failed: ${error instanceof Error ? error.message : String(error)}`
               );
             });
         }, 60_000);
@@ -94,7 +94,7 @@ export function createPuppenclawService(): OpenClawPluginService {
 export async function getPuppenclawManager(): Promise<ISessionManager> {
   await ensureInitialized();
   if (state.manager == null) {
-    throw new Error("Puppenclaw manager is unavailable");
+    throw new Error("Orchestrator manager is unavailable");
   }
   return state.manager;
 }
@@ -102,7 +102,7 @@ export async function getPuppenclawManager(): Promise<ISessionManager> {
 export async function getPuppenclawStore(): Promise<SessionStore> {
   await ensureInitialized();
   if (state.store == null) {
-    throw new Error("Puppenclaw store is unavailable");
+    throw new Error("Orchestrator store is unavailable");
   }
   return state.store;
 }
@@ -110,7 +110,7 @@ export async function getPuppenclawStore(): Promise<SessionStore> {
 export async function getPuppenclawOutputRouter(): Promise<OutputRouter> {
   await ensureInitialized();
   if (state.outputRouter == null) {
-    throw new Error("Puppenclaw output router is unavailable");
+    throw new Error("Orchestrator output router is unavailable");
   }
   return state.outputRouter;
 }
@@ -118,7 +118,7 @@ export async function getPuppenclawOutputRouter(): Promise<OutputRouter> {
 export async function getPuppenclawOrchestrator(): Promise<IOrchestrator> {
   await ensureInitialized();
   if (state.orchestrator == null) {
-    throw new Error("Puppenclaw orchestrator is unavailable");
+    throw new Error("Orchestrator campaign runtime is unavailable");
   }
   return state.orchestrator;
 }
@@ -126,7 +126,7 @@ export async function getPuppenclawOrchestrator(): Promise<IOrchestrator> {
 export async function getPuppenclawOrchestratorStore(): Promise<OrchestratorStore> {
   await ensureInitialized();
   if (state.orchestratorStore == null) {
-    throw new Error("Puppenclaw orchestrator store is unavailable");
+    throw new Error("Orchestrator campaign store is unavailable");
   }
   return state.orchestratorStore;
 }
@@ -134,7 +134,7 @@ export async function getPuppenclawOrchestratorStore(): Promise<OrchestratorStor
 export async function getPuppenclawUsageLedger(): Promise<UsageLedgerStore> {
   await ensureInitialized();
   if (state.usageLedger == null) {
-    throw new Error("Puppenclaw usage ledger is unavailable");
+    throw new Error("Orchestrator usage ledger is unavailable");
   }
   return state.usageLedger;
 }
@@ -169,7 +169,7 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
   state.initPromise = (async () => {
     const logger = state.logger ?? ctx?.logger;
     if (logger == null) {
-      throw new Error("Puppenclaw logger is unavailable");
+      throw new Error("Orchestrator logger is unavailable");
     }
     if (state.dataDir == null) {
       const fallbackStateDir =
