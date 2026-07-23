@@ -61,6 +61,9 @@ async function main(): Promise<void> {
   const base: ComputeJobRecord = computeJobRecordZod.parse({
     id: spec.jobId,
     state: "starting",
+    // The heartbeat rewrites the whole record every 5s from this base, so the
+    // session linkage MUST be carried here or it would be nulled immediately.
+    sessionName: spec.sessionName ?? null,
     executor: spec.executor,
     command: spec.command,
     cwd: spec.cwd,

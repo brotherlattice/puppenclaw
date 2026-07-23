@@ -22,7 +22,9 @@ export const computeJobSpecZod = z.object({
   command: z.array(z.string().min(1)).min(1).max(256),
   cwd: z.string().min(1),
   env: z.record(z.string(), z.string()).default({}),
-  resources: computeResourcesZod
+  resources: computeResourcesZod,
+  /** Optional owning chat session so detached jobs can be attributed to it. */
+  sessionName: z.string().trim().min(1).max(200).optional()
 });
 
 export const computeJobStateZod = z.enum([
@@ -39,6 +41,8 @@ export const computeJobStateZod = z.enum([
 export const computeJobRecordZod = z.object({
   id: z.string(),
   state: computeJobStateZod,
+  // Nullable with a default so legacy persisted payloads keep parsing.
+  sessionName: z.string().nullable().default(null),
   executor: computeExecutorZod,
   command: z.array(z.string()),
   cwd: z.string(),

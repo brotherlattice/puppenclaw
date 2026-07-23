@@ -34,6 +34,17 @@ export class ComputeStore {
       CREATE INDEX IF NOT EXISTS idx_compute_jobs_state
         ON compute_jobs(state, submitted_at);
     `);
+    // Guarded ALTER so legacy databases gain the column exactly once.
+    const columns = this.db
+      .prepare("SELECT name FROM pragma_table_info('compute_jobs')")
+      .all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "session_name")) {
+      this.db.exec("ALTER TABLE compute_jobs ADD COLUMN session_name TEXT");
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_compute_jobs_session
+        ON compute_jobs(session_name, state);
+    `);
   }
 
   close(): void {
@@ -58,19 +69,38 @@ export class ComputeStore {
       );
   }
 
+  listActiveBySession(sessionName: string): ComputeJobRecord[] {
+    return this.db
+      .prepare(
+        "SELECT payload FROM compute_jobs WHERE session_name = ? AND state IN ('queued','starting','running') ORDER BY submitted_at"
+      )
+      .all(sessionName)
+      .map((row) =>
+        computeJobRecordZod.parse(JSON.parse((row as { payload: string }).payload))
+      );
+  }
+
   upsert(record: ComputeJobRecord): void {
     const parsed = computeJobRecordZod.parse(record);
     const now = new Date().toISOString();
     this.db
       .prepare(
-        `INSERT INTO compute_jobs (id, state, submitted_at, updated_at, payload)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO compute_jobs (id, state, submitted_at, updated_at, session_name, payload)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            state = excluded.state,
            updated_at = excluded.updated_at,
+           session_name = excluded.session_name,
            payload = excluded.payload`
       )
-      .run(parsed.id, parsed.state, parsed.submittedAt, now, JSON.stringify(parsed));
+      .run(
+        parsed.id,
+        parsed.state,
+        parsed.submittedAt,
+        now,
+        parsed.sessionName,
+        JSON.stringify(parsed)
+      );
   }
 }
 

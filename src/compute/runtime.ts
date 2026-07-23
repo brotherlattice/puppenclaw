@@ -82,6 +82,13 @@ export class ComputeRuntime {
     return { executors: computeExecutorCapabilities({ hasAllowedRoots: this.allowedRoots.length > 0 }) };
   }
 
+  /** Active jobs, optionally restricted to those linked to one session. Used by the resource monitor. */
+  listActiveJobs(sessionName?: string): ComputeJobRecord[] {
+    return sessionName == null
+      ? this.store.listActive()
+      : this.store.listActiveBySession(sessionName);
+  }
+
   async submit(input: unknown): Promise<ComputeJobRecord> {
     const spec = computeJobSpecZod.parse(input);
     const existing = this.store.get(spec.jobId);
@@ -108,6 +115,7 @@ export class ComputeRuntime {
     const initial = computeJobRecordZod.parse({
       id: spec.jobId,
       state: "queued",
+      sessionName: spec.sessionName ?? null,
       executor: spec.executor,
       command: spec.command,
       cwd,
@@ -222,6 +230,9 @@ export class ComputeRuntime {
             fromDisk.data.state === "queued" && record.state === "starting"
               ? "starting"
               : fromDisk.data.state,
+          // Keep the stored linkage when an older on-disk state (written by a
+          // pre-linkage supervisor) parses sessionName back to null.
+          sessionName: fromDisk.data.sessionName ?? record.sessionName,
           supervisorPid: fromDisk.data.supervisorPid ?? record.supervisorPid,
           supervisorStartTicks:
             fromDisk.data.supervisorStartTicks ?? record.supervisorStartTicks
