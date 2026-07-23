@@ -12,6 +12,8 @@ import { REASONING_CAPABILITIES } from "../shared/reasoning.js";
 import { PuppenclawError } from "../shared/errors.js";
 import { SessionStore } from "../shared/store.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
+import { ComputeRuntime } from "../compute/runtime.js";
+import { computeJobSpecZod } from "../compute/types.js";
 import {
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -102,6 +104,10 @@ export async function createDaemonServer(params: {
   const store = await SessionStore.open(params.dataDir);
   const orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
   const usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
+  const computeRuntime = await ComputeRuntime.open({
+    dataDir: params.dataDir,
+    config: params.config
+  });
   const outputRouter = new OutputRouter(logger);
   const manager = new AcpxSessionManager({
     config: {
@@ -174,6 +180,42 @@ export async function createDaemonServer(params: {
     streamOutput: params.config.streamOutput,
     defaultAgent: params.config.defaultAgent
   }));
+
+  app.get("/compute/capacity", async () => computeRuntime.capacity());
+
+  app.post("/compute/jobs", async (request, reply) => {
+    try {
+      return await computeRuntime.submit(computeJobSpecZod.parse(request.body));
+    } catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  app.get("/compute/jobs/:id", async (request, reply) => {
+    const record = await computeRuntime.get((request.params as { id: string }).id);
+    return record ?? reply.code(404).send({ error: "Compute job not found." });
+  });
+
+  app.get("/compute/jobs/:id/logs", async (request, reply) => {
+    const tailBytes = Number((request.query as { tailBytes?: string }).tailBytes ?? 65_536);
+    const logs = await computeRuntime.logs((request.params as { id: string }).id, tailBytes);
+    return logs == null
+      ? reply.code(404).send({ error: "Compute job not found." })
+      : reply.type("text/plain; charset=utf-8").send(logs);
+  });
+
+  app.post("/compute/jobs/:id/cancel", async (request, reply) => {
+    const record = await computeRuntime.cancel((request.params as { id: string }).id);
+    return record ?? reply.code(404).send({ error: "Compute job not found." });
+  });
+
+  app.addHook("onClose", async () => {
+    computeRuntime.close();
+    orchestratorStore.close();
+    usageLedger.close();
+  });
 
   app.get("/sessions", async () => ok(await manager.status(statusParamsZod.parse({}))));
 

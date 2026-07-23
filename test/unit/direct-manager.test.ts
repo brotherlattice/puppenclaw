@@ -1180,6 +1180,7 @@ describe("AcpxSessionManager", () => {
   it("exposes live Codex one-shot JSON output while the turn is running", async () => {
     const workspaceDir = await createTempDir("puppenclaw-codex-json-");
     const codexCommand = await resolveFakeCodexJsonCommand(workspaceDir);
+    const acpxCommand = await resolveFakeAcpxCommand();
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
     const chunks: string[] = [];
     const structuredEvents: Array<{
@@ -1204,6 +1205,7 @@ describe("AcpxSessionManager", () => {
     });
     const manager = new AcpxSessionManager({
       config: makeConfig({
+        acpxCommand,
         agentCommands: {
           codex: codexCommand
         }
@@ -1276,9 +1278,27 @@ describe("AcpxSessionManager", () => {
       }
     }
 
+    const runningStatus = await manager.status({ name: "codex-json-demo" });
+    const runningDetails = runningStatus.details as {
+      session: SessionInfo;
+      turn: {
+        classification: string;
+        lockHeld: boolean;
+        processAlive: boolean | null;
+        pid: number | null;
+      };
+    };
+    expect(runningDetails.session.state).toBe("running");
+    expect(runningDetails.session.activeTurn?.state).toBe("running");
+    expect(runningDetails.turn.classification).toBe("running");
+    expect(runningDetails.turn.lockHeld).toBe(true);
+    expect(runningDetails.turn.processAlive).toBe(true);
+    expect(runningDetails.turn.pid).toEqual(expect.any(Number));
+
     const result = await sendPromise;
     const details = result.details as {
       output: string;
+      session: SessionInfo;
     };
 
     const completedOutput = await manager.output({ name: "codex-json-demo" });
@@ -1323,6 +1343,76 @@ describe("AcpxSessionManager", () => {
     expect(JSON.stringify(structuredEvents)).not.toContain("tool-output-secret");
     expect(structuredEvents).toContainEqual({ kind: "final", value: "Final file answer." });
     expect(details.output).toBe("Final file answer.");
+    expect(details.session.activeTurn?.state).toBe("completed");
+    expect(details.session.activeTurn?.completedAt).toBeTruthy();
+    expect(details.session.activeTurn?.outputChars).toBeGreaterThan(0);
+  });
+
+  it("reports a persisted running turn without its original process as orphaned", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orphaned-turn-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const now = new Date().toISOString();
+    await store.upsertSession({
+      name: "orphaned-demo",
+      agent: "claude",
+      directory: workspaceDir,
+      state: "running",
+      createdAt: now,
+      lastActivity: now,
+      permissionMode: "approve-reads",
+      warnings: [],
+      transcript: [],
+      activeTurn: {
+        id: "lost-turn",
+        state: "running",
+        startedAt: now,
+        updatedAt: now,
+        pid: 2_147_483_647,
+        processStartIdentity: "2147483647:1",
+        outputChars: 0
+      }
+    });
+
+    const status = await manager.status({ name: "orphaned-demo" });
+    const details = status.details as {
+      session: SessionInfo;
+      turn: {
+        classification: string;
+        processAlive: boolean | null;
+        identityMatches: boolean | null;
+        conflict: string | null;
+      };
+    };
+    expect(details.session.state).toBe("failed");
+    expect(details.session.activeTurn?.state).toBe("orphaned");
+    expect(details.turn.classification).toBe("orphaned");
+    expect(details.turn.processAlive).toBe(false);
+    expect(details.turn.identityMatches).toBe(false);
+    expect(details.turn.conflict).toContain("different process");
+
+    const persisted = store.getSession("orphaned-demo");
+    expect(persisted).not.toBeNull();
+    expect(manager["isTurnActive"](persisted as SessionInfo)).toBe(false);
+
+    const listed = await manager.status();
+    const listedDetails = listed.details as {
+      sessions: Array<SessionInfo & { turn: { classification: string } }>;
+    };
+    const orphaned = listedDetails.sessions.find((entry) => entry.name === "orphaned-demo");
+    expect(orphaned?.state).toBe("failed");
+    expect(orphaned?.turn.classification).toBe("orphaned");
   });
 
   it("reports a failed Codex follow-up turn instead of stale prior assistant output", async () => {
@@ -2056,7 +2146,8 @@ process.exit(1);
       text: "leftover output",
       startedAt: staleActivity,
       updatedAt: staleActivity,
-      complete: true
+      complete: true,
+      totalChars: "leftover output".length
     });
 
     await manager.gc();

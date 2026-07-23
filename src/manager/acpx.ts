@@ -19,6 +19,8 @@ import {
 } from "../shared/reasoning.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import type {
+  ActiveTurnLifecycleState,
+  ActiveTurnMetadata,
   AgentKind,
   CostParams,
   EffortLevel,
@@ -94,10 +96,36 @@ type ActiveTurnOutput = {
   startedAt: string;
   updatedAt: string;
   complete: boolean;
+  totalChars: number;
 };
 
 type ActiveTurnProcess = {
   child: ChildProcess;
+  turnId: string;
+};
+
+type ActiveTurnRuntimeStatus = {
+  classification:
+    | "inactive"
+    | "starting"
+    | "running"
+    | "completed"
+    | "failed"
+    | "stopped"
+    | "orphaned";
+  lockHeld: boolean;
+  trackedChild: boolean;
+  processAlive: boolean | null;
+  identityMatches: boolean | null;
+  pid: number | null;
+  processGroupId: number | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  lastOutputAt: string | null;
+  outputChars: number;
+  ageMs: number | null;
+  outputAgeMs: number | null;
+  conflict: string | null;
 };
 
 type SpawnCommand = {
@@ -142,6 +170,36 @@ const MAX_CODEX_EVENT_TEXT_CHARS = 6_000;
 const QUIESCENCE_CONTROL_TIMEOUT_MS = 1_000;
 const QUIESCENCE_DRAIN_TIMEOUT_MS = 4_000;
 const QUIESCENCE_POLL_MS = 25;
+const ACTIVE_TURN_CHECKPOINT_MS = 5_000;
+
+type LinuxProcessIdentity = {
+  processGroupId: number;
+  processStartIdentity: string;
+};
+
+async function readLinuxProcessIdentity(pid: number): Promise<LinuxProcessIdentity | null> {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  const raw = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => null);
+  if (raw == null) {
+    return null;
+  }
+  const commandEnd = raw.lastIndexOf(")");
+  if (commandEnd < 0) {
+    return null;
+  }
+  const fields = raw.slice(commandEnd + 1).trim().split(/\s+/u);
+  const processGroupId = Number.parseInt(fields[2] ?? "", 10);
+  const startTicks = fields[19];
+  if (!Number.isFinite(processGroupId) || startTicks == null) {
+    return null;
+  }
+  return {
+    processGroupId,
+    processStartIdentity: `${pid}:${startTicks}`
+  };
+}
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1285,6 +1343,9 @@ export class AcpxSessionManager implements ISessionManager {
   private readonly activeTurnOutputs = new Map<string, ActiveTurnOutput>();
   private readonly activeTurnProcesses = new Map<string, ActiveTurnProcess>();
   private readonly lifecycleTails = new Map<string, Promise<void>>();
+  private readonly activeTurnIds = new Map<string, string>();
+  private readonly activeTurnCheckpointAt = new Map<string, number>();
+  private readonly activeTurnPersistence = new Map<string, Promise<void>>();
 
   constructor(
     private readonly deps: {
@@ -1436,13 +1497,28 @@ export class AcpxSessionManager implements ISessionManager {
           ? this.buildOneShotContinuationPrompt(session, runtimePromptText)
           : runtimePromptText;
         const effectivePermissionMode = this.effectivePermissionMode(session);
-        const turn = await this.runTurn({
-          session,
-          promptText: effectivePromptText,
-          permissionMode: effectivePermissionMode,
-          ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
-        });
+        let turn: TurnResult;
+        try {
+          turn = await this.runTurn({
+            session,
+            promptText: effectivePromptText,
+            permissionMode: effectivePermissionMode,
+            ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
+          });
+        } catch (error) {
+          await this.finalizeActiveTurnLifecycle(
+            params.name,
+            "failed",
+            ensureError(error).message
+          );
+          throw error;
+        }
         const stoppedDuringTurn = this.stopRequests.delete(params.name);
+        const activeTurn = await this.finalizeActiveTurnLifecycle(
+          params.name,
+          stoppedDuringTurn ? "stopped" : turn.state === "failed" ? "failed" : "completed",
+          turn.state === "failed" ? turn.output : undefined
+        );
 
         const nextSession: SessionInfo = {
           ...session,
@@ -1470,7 +1546,8 @@ export class AcpxSessionManager implements ISessionManager {
             agent: params.agent,
             mode: "persistent"
           },
-          ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {})
+          ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {}),
+          ...(activeTurn != null ? { activeTurn } : {})
         };
 
         await this.deps.store.upsertSession(nextSession);
@@ -1552,13 +1629,28 @@ export class AcpxSessionManager implements ISessionManager {
         : runtimePromptText;
       const effectivePermissionMode =
         params.permissionMode ?? this.effectivePermissionMode(session);
-      const turn = await this.runTurn({
-        session: effectiveSession,
-        promptText: effectivePromptText,
-        permissionMode: effectivePermissionMode,
-        ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
-      });
+      let turn: TurnResult;
+      try {
+        turn = await this.runTurn({
+          session: effectiveSession,
+          promptText: effectivePromptText,
+          permissionMode: effectivePermissionMode,
+          ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
+        });
+      } catch (error) {
+        await this.finalizeActiveTurnLifecycle(
+          params.name,
+          "failed",
+          ensureError(error).message
+        );
+        throw error;
+      }
       const stoppedDuringTurn = this.stopRequests.delete(params.name);
+      const activeTurn = await this.finalizeActiveTurnLifecycle(
+        params.name,
+        stoppedDuringTurn ? "stopped" : turn.state === "failed" ? "failed" : "completed",
+        turn.state === "failed" ? turn.output : undefined
+      );
 
       const nextSession: SessionInfo = {
         ...effectiveSession,
@@ -1584,7 +1676,8 @@ export class AcpxSessionManager implements ISessionManager {
           : session.tokenUsage != null
             ? { tokenUsage: session.tokenUsage }
             : {}),
-        ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {})
+        ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {}),
+        ...(activeTurn != null ? { activeTurn } : {})
       };
 
       await this.deps.store.upsertSession(nextSession);
@@ -1631,7 +1724,17 @@ export class AcpxSessionManager implements ISessionManager {
       ...withoutFocusLease(session),
       state: "stopped",
       lastActivity: nowIso(),
-      lastStopReason: "stopped by user"
+      lastStopReason: "stopped by user",
+      ...(session.activeTurn != null
+        ? {
+            activeTurn: {
+              ...session.activeTurn,
+              state: "stopped",
+              updatedAt: nowIso(),
+              completedAt: nowIso()
+            }
+          }
+        : {})
     };
     await this.deps.store.upsertSession(nextSession);
     if (!hadActiveTurn) {
@@ -1774,17 +1877,31 @@ export class AcpxSessionManager implements ISessionManager {
 
   async status(params: StatusParams = {}): Promise<ToolResult> {
     if (params.name == null) {
+      const sessions = await Promise.all(
+        this.deps.store.listSessions().map(async (session) => {
+          const reconciled = await this.reconcileVisibleSession(session);
+          return {
+            ...reconciled.session,
+            turn: reconciled.turn
+          };
+        })
+      );
       return jsonToolResult(
         {
-          sessions: this.deps.store
-            .listSessions()
-            .map((session) => this.decorateVisibleSession(session))
+          sessions
         },
         "Tracked Puppenclaw sessions"
       );
     }
-    const session = this.decorateVisibleSession(this.requireSession(params.name));
-    const activeQuiescence = this.deps.store.getQuiescence(session.name);
+    const stored = this.requireSession(params.name);
+    const activeQuiescence = this.deps.store.getQuiescence(stored.name);
+    // A fenced session has no live runtime to probe; report the quiesced view
+    // instead of running process-identity reconciliation against it.
+    const reconciled =
+      activeQuiescence != null
+        ? { session: this.decorateVisibleSession(stored), turn: null }
+        : await this.reconcileVisibleSession(stored);
+    const session = reconciled.session;
     const runtimeStatus =
       activeQuiescence != null
         ? { exists: false, status: "quiesced" }
@@ -1797,6 +1914,7 @@ export class AcpxSessionManager implements ISessionManager {
     const details = {
       session,
       runtime: runtimeStatus,
+      ...(reconciled.turn != null ? { turn: reconciled.turn } : {}),
       ...(activeQuiescence != null
         ? { lifecycle: { quiesced: true, epoch: activeQuiescence.epoch } }
         : {})
@@ -1809,6 +1927,7 @@ export class AcpxSessionManager implements ISessionManager {
       throw new PuppenclawError("MISSING_SESSION", "Session name is required.");
     }
     const session = this.requireSession(params.name);
+    const reconciled = await this.reconcileVisibleSession(session);
     const active = this.activeTurnOutputs.get(params.name);
     const runningActive = active != null && !active.complete ? active : undefined;
     const latestTranscriptOutput = [...session.transcript]
@@ -1829,7 +1948,8 @@ export class AcpxSessionManager implements ISessionManager {
       : (latestTranscriptOutput?.text ?? active?.text ?? "");
     return jsonToolResult(
       {
-        session: this.decorateVisibleSession(session),
+        session: reconciled.session,
+        turn: reconciled.turn,
         output: {
           text,
           chars: text.length,
@@ -2213,7 +2333,11 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private isTurnActive(session: SessionInfo): boolean {
-    return this.activeTurns.has(session.name) || session.state === "running";
+    const tracked = this.activeTurnProcesses.get(session.name)?.child;
+    return (
+      this.activeTurns.has(session.name) ||
+      (tracked != null && tracked.exitCode == null && tracked.signalCode == null)
+    );
   }
 
   private decorateVisibleSession(session: SessionInfo): SessionInfo {
@@ -2234,6 +2358,120 @@ export class AcpxSessionManager implements ISessionManager {
     return {
       ...session,
       state: "running"
+    };
+  }
+
+  private async reconcileVisibleSession(session: SessionInfo): Promise<{
+    session: SessionInfo;
+    turn: ActiveTurnRuntimeStatus;
+  }> {
+    const turn = await this.activeTurnRuntimeStatus(session);
+    if (turn.classification === "orphaned") {
+      const warning =
+        "Persisted active turn has no matching live process; the turn is orphaned.";
+      return {
+        session: {
+          ...session,
+          state: "failed",
+          lastError: session.lastError ?? warning,
+          warnings: dedupeWarnings([...session.warnings, warning]),
+          ...(session.activeTurn != null
+            ? {
+                activeTurn: {
+                  ...session.activeTurn,
+                  state: "orphaned"
+                }
+              }
+            : {})
+        },
+        turn
+      };
+    }
+    if (turn.classification === "running" || turn.classification === "starting") {
+      return {
+        session: {
+          ...session,
+          state: "running"
+        },
+        turn
+      };
+    }
+    return { session, turn };
+  }
+
+  private async activeTurnRuntimeStatus(
+    session: SessionInfo
+  ): Promise<ActiveTurnRuntimeStatus> {
+    const activeTurn = session.activeTurn;
+    const lockHeld = this.activeTurns.has(session.name);
+    const tracked = this.activeTurnProcesses.get(session.name);
+    const trackedChild = tracked != null;
+    const pid = tracked?.child.pid ?? activeTurn?.pid ?? null;
+    const observedIdentity = pid != null ? await readLinuxProcessIdentity(pid) : null;
+    const expectedIdentity = activeTurn?.processStartIdentity;
+    const identityMatches =
+      expectedIdentity == null
+        ? observedIdentity == null
+          ? null
+          : true
+        : observedIdentity == null
+          ? false
+          : observedIdentity.processStartIdentity === expectedIdentity;
+    const trackedChildRunning =
+      tracked != null && tracked.child.exitCode == null && tracked.child.signalCode == null;
+    const processAlive =
+      pid == null
+        ? null
+        : process.platform === "linux"
+          ? observedIdentity != null && identityMatches !== false
+          : trackedChild
+            ? trackedChildRunning
+            : null;
+    let classification: ActiveTurnRuntimeStatus["classification"] = "inactive";
+    let conflict: string | null = null;
+    if (activeTurn?.state === "running") {
+      if (processAlive === true || trackedChildRunning) {
+        classification = "running";
+      } else if (pid == null && lockHeld) {
+        classification = "starting";
+      } else {
+        classification = "orphaned";
+        conflict =
+          pid == null
+            ? "turn metadata says running but no process identity was recorded"
+            : identityMatches === false
+              ? "recorded PID is absent or belongs to a different process"
+              : "turn metadata says running but process liveness is unverified";
+      }
+    } else if (activeTurn != null) {
+      classification = activeTurn.state;
+      if (lockHeld || trackedChildRunning) {
+        conflict = `turn metadata says ${activeTurn.state} while an in-memory turn remains active`;
+      }
+    } else if (lockHeld || trackedChildRunning) {
+      classification = pid == null ? "starting" : "running";
+      conflict = "in-memory turn activity has no persisted lifecycle metadata";
+    }
+    const nowMs = Date.now();
+    const startedMs = activeTurn?.startedAt != null ? Date.parse(activeTurn.startedAt) : Number.NaN;
+    const outputMs =
+      activeTurn?.lastOutputAt != null ? Date.parse(activeTurn.lastOutputAt) : Number.NaN;
+    return {
+      classification,
+      lockHeld,
+      trackedChild,
+      processAlive,
+      identityMatches,
+      pid,
+      processGroupId:
+        observedIdentity?.processGroupId ?? activeTurn?.processGroupId ?? null,
+      startedAt: activeTurn?.startedAt ?? null,
+      updatedAt: activeTurn?.updatedAt ?? null,
+      lastOutputAt: activeTurn?.lastOutputAt ?? null,
+      outputChars: activeTurn?.outputChars ?? 0,
+      ageMs: Number.isFinite(startedMs) ? Math.max(0, nowMs - startedMs) : null,
+      outputAgeMs: Number.isFinite(outputMs) ? Math.max(0, nowMs - outputMs) : null,
+      conflict
     };
   }
 
@@ -3089,7 +3327,7 @@ export class AcpxSessionManager implements ISessionManager {
       : (params.baselineMessageCount ??
         (await this.getRuntimeMessageCount(params.session).catch(() => undefined)));
     const promptStartedAtMs = Date.now();
-    this.startActiveTurnOutput(params.session.name);
+    await this.startActiveTurnOutput(params.session);
     const args = this.buildVerbArgs(
       params.session.agent,
       params.session.directory,
@@ -3116,7 +3354,7 @@ export class AcpxSessionManager implements ISessionManager {
           detached: process.platform !== "win32",
           env
         });
-    this.registerActiveTurnProcess(params.session.name, child);
+    await this.registerActiveTurnProcess(params.session.name, child);
 
     // If the child exits or closes stdin before the prompt is fully written
     // (bad auth, oversized prompt, immediate crash), the write surfaces an
@@ -3449,7 +3687,7 @@ export class AcpxSessionManager implements ISessionManager {
         process.env.PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND ?? process.env.CODEX_EXECUTABLE ?? "codex"
     };
 
-    this.startActiveTurnOutput(params.session.name);
+    await this.startActiveTurnOutput(params.session);
     const child = spawnCommand.shell
       ? spawn(spawnCommand.command, {
           cwd: params.session.directory,
@@ -3464,7 +3702,7 @@ export class AcpxSessionManager implements ISessionManager {
           detached: process.platform !== "win32",
           env
         });
-    this.registerActiveTurnProcess(params.session.name, child);
+    await this.registerActiveTurnProcess(params.session.name, child);
 
     let stderr = "";
     let pendingStdout = "";
@@ -3624,14 +3862,32 @@ export class AcpxSessionManager implements ISessionManager {
     return result;
   }
 
-  private startActiveTurnOutput(sessionName: string): void {
+  private async startActiveTurnOutput(session: SessionInfo): Promise<void> {
+    const sessionName = session.name;
     const now = nowIso();
+    const turnId = this.activeTurnIds.get(sessionName) ?? randomUUID();
+    this.activeTurnIds.set(sessionName, turnId);
     this.activeTurnOutputs.set(sessionName, {
       sessionName,
       text: "",
       startedAt: now,
       updatedAt: now,
-      complete: false
+      complete: false,
+      totalChars: 0
+    });
+    this.activeTurnCheckpointAt.set(sessionName, Date.now());
+    const current = this.deps.store.getSession(sessionName) ?? session;
+    await this.deps.store.upsertSession({
+      ...current,
+      state: "running",
+      lastActivity: now,
+      activeTurn: {
+        id: turnId,
+        state: "running",
+        startedAt: current.activeTurn?.id === turnId ? current.activeTurn.startedAt : now,
+        updatedAt: now,
+        outputChars: 0
+      }
     });
   }
 
@@ -3650,8 +3906,10 @@ export class AcpxSessionManager implements ISessionManager {
     this.activeTurnOutputs.set(sessionName, {
       ...current,
       text: boundedText,
-      updatedAt: nowIso()
+      updatedAt: nowIso(),
+      totalChars: current.totalChars + text.length
     });
+    this.checkpointActiveTurnOutput(sessionName);
   }
 
   private setActiveTurnOutput(sessionName: string, text: string): void {
@@ -3669,8 +3927,10 @@ export class AcpxSessionManager implements ISessionManager {
     this.activeTurnOutputs.set(sessionName, {
       ...current,
       text: boundedText,
-      updatedAt: nowIso()
+      updatedAt: nowIso(),
+      totalChars: sanitized.length
     });
+    this.checkpointActiveTurnOutput(sessionName, true);
   }
 
   private completeActiveTurnOutput(sessionName: string): void {
@@ -3685,17 +3945,112 @@ export class AcpxSessionManager implements ISessionManager {
     });
   }
 
-  private registerActiveTurnProcess(sessionName: string, child: ChildProcess): void {
+  private async registerActiveTurnProcess(
+    sessionName: string,
+    child: ChildProcess
+  ): Promise<void> {
+    const turnId = this.activeTurnIds.get(sessionName) ?? randomUUID();
+    this.activeTurnIds.set(sessionName, turnId);
     this.activeTurnProcesses.set(sessionName, {
-      child
+      child,
+      turnId
     });
-    const clear = (): void => {
+    const pid = child.pid;
+    const identity = pid != null ? await readLinuxProcessIdentity(pid) : null;
+    await this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
+      ...activeTurn,
+      ...(pid != null ? { pid } : {}),
+      ...(identity != null ? identity : {}),
+      updatedAt: nowIso()
+    }));
+    const clear = (exitCode: number | null, signal: NodeJS.Signals | null): void => {
       if (this.activeTurnProcesses.get(sessionName)?.child === child) {
         this.activeTurnProcesses.delete(sessionName);
       }
+      void this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
+        ...activeTurn,
+        updatedAt: nowIso(),
+        exitCode,
+        signal
+      }));
     };
     child.once("close", clear);
-    child.once("error", clear);
+    child.once("error", () => clear(child.exitCode, child.signalCode));
+  }
+
+  private checkpointActiveTurnOutput(sessionName: string, force = false): void {
+    const output = this.activeTurnOutputs.get(sessionName);
+    const turnId = this.activeTurnIds.get(sessionName);
+    if (output == null || turnId == null) {
+      return;
+    }
+    const nowMs = Date.now();
+    const previousMs = this.activeTurnCheckpointAt.get(sessionName) ?? 0;
+    if (!force && nowMs - previousMs < ACTIVE_TURN_CHECKPOINT_MS) {
+      return;
+    }
+    this.activeTurnCheckpointAt.set(sessionName, nowMs);
+    void this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
+      ...activeTurn,
+      updatedAt: output.updatedAt,
+      lastOutputAt: output.updatedAt,
+      outputChars: output.totalChars
+    }));
+  }
+
+  private patchActiveTurn(
+    sessionName: string,
+    turnId: string,
+    patch: (activeTurn: ActiveTurnMetadata) => ActiveTurnMetadata
+  ): Promise<void> {
+    const previous = this.activeTurnPersistence.get(sessionName) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        await this.deps.store.patchSession(sessionName, (current) => {
+          if (current?.activeTurn?.id !== turnId) {
+            return current;
+          }
+          return {
+            ...current,
+            activeTurn: patch(current.activeTurn)
+          };
+        });
+      });
+    this.activeTurnPersistence.set(sessionName, next);
+    const clear = (): void => {
+      if (this.activeTurnPersistence.get(sessionName) === next) {
+        this.activeTurnPersistence.delete(sessionName);
+      }
+    };
+    void next.then(clear, clear);
+    return next;
+  }
+
+  private async finalizeActiveTurnLifecycle(
+    sessionName: string,
+    state: ActiveTurnLifecycleState,
+    error?: string
+  ): Promise<ActiveTurnMetadata | undefined> {
+    this.checkpointActiveTurnOutput(sessionName, true);
+    await this.activeTurnPersistence.get(sessionName)?.catch(() => undefined);
+    const turnId = this.activeTurnIds.get(sessionName);
+    if (turnId == null) {
+      return this.deps.store.getSession(sessionName)?.activeTurn;
+    }
+    const completedAt = nowIso();
+    await this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
+      ...activeTurn,
+      state,
+      updatedAt: completedAt,
+      completedAt,
+      ...(error != null && error.trim().length > 0 ? { error } : {})
+    }));
+    await this.activeTurnPersistence.get(sessionName)?.catch(() => undefined);
+    const activeTurn = this.deps.store.getSession(sessionName)?.activeTurn;
+    this.activeTurnIds.delete(sessionName);
+    this.activeTurnCheckpointAt.delete(sessionName);
+    return activeTurn;
   }
 
   /**
