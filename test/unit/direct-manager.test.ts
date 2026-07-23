@@ -927,6 +927,67 @@ describe("AcpxSessionManager", () => {
     expect(store.getSession("codex-ultra-demo")?.effort).toBe("ultra");
   });
 
+  it("skips redundant model and effort control commands on follow-up turns", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-skip-redundant-sets-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const settingPath = (key: string) =>
+      join(workspaceDir, ".fake-acpx-state", `skip-sets-demo.${key}.setting`);
+
+    await manager.start({
+      agent: "claude",
+      name: "skip-sets-demo",
+      directory: workspaceDir,
+      task: "Start with pinned model and effort.",
+      model: "claude-opus-4-8",
+      effort: "max",
+      contextFiles: []
+    });
+    expect(await readFile(settingPath("model"), "utf8")).toBe("claude-opus-4-8\n");
+    expect(await readFile(settingPath("effort"), "utf8")).toBe("max\n");
+
+    await unlink(settingPath("model"));
+    await unlink(settingPath("effort"));
+    await manager.send({
+      name: "skip-sets-demo",
+      message: "Same configuration as before.",
+      contextFiles: []
+    });
+    await expect(readFile(settingPath("model"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+    await expect(readFile(settingPath("effort"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+
+    await manager.send({
+      name: "skip-sets-demo",
+      message: "Drop to xhigh from here.",
+      effort: "xhigh",
+      contextFiles: []
+    });
+    await expect(readFile(settingPath("model"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+    expect(await readFile(settingPath("effort"), "utf8")).toBe("xhigh\n");
+
+    await unlink(settingPath("effort"));
+    await manager.resume({ name: "skip-sets-demo" });
+    expect(await readFile(settingPath("model"), "utf8")).toBe("claude-opus-4-8\n");
+    expect(await readFile(settingPath("effort"), "utf8")).toBe("xhigh\n");
+  });
+
   it("applies Claude reasoning natively across start, follow-up, resume, and fork", async () => {
     const workspaceDir = await createTempDir("puppenclaw-claude-reasoning-");
     const acpxCommand = await resolveFakeAcpxCommand();

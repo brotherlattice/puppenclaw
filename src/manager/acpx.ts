@@ -1346,6 +1346,16 @@ export class AcpxSessionManager implements ISessionManager {
   private readonly activeTurnIds = new Map<string, string>();
   private readonly activeTurnCheckpointAt = new Map<string, number>();
   private readonly activeTurnPersistence = new Map<string, Promise<void>>();
+  /**
+   * Model/effort config options last applied to each live ACP runtime. Each
+   * redundant `set` control command pays a full adapter spawn (~8s); acpx
+   * persists config options per session, so unchanged values can be skipped.
+   * In-memory on purpose: after a daemon restart the first turn re-applies.
+   */
+  private readonly appliedRuntimeConfigBySession = new Map<
+    string,
+    { model?: string; effort?: EffortLevel }
+  >();
 
   constructor(
     private readonly deps: {
@@ -1759,6 +1769,7 @@ export class AcpxSessionManager implements ISessionManager {
           name: session.name,
           agent: session.agent,
           directory: session.directory,
+          forceApply: true,
           ...(session.model != null ? { model: session.model } : {}),
           ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
           ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
@@ -2952,6 +2963,8 @@ export class AcpxSessionManager implements ISessionManager {
     model?: string;
     effort?: EffortLevel;
     modelProvider?: ModelProviderConfig;
+    /** Re-send config options even when they match the last applied values. */
+    forceApply?: boolean;
   }): Promise<void> {
     const runtimeEnv = this.modelProviderRuntimeEnv(params.modelProvider);
     const status = await this.getRuntimeStatus(params);
@@ -2968,8 +2981,14 @@ export class AcpxSessionManager implements ISessionManager {
         cwd: params.directory,
         ...(runtimeEnv != null ? { env: runtimeEnv } : {})
       });
+      this.appliedRuntimeConfigBySession.delete(params.name);
     }
-    if (params.model != null) {
+    const appliedRuntimeConfig =
+      createdRuntime || params.forceApply === true
+        ? undefined
+        : this.appliedRuntimeConfigBySession.get(params.name);
+    if (params.model != null && params.model !== appliedRuntimeConfig?.model) {
+      let modelApplied = false;
       await this.runControlCommand({
         args: this.buildVerbArgs(params.agent, params.directory, [
           "set",
@@ -2980,13 +2999,20 @@ export class AcpxSessionManager implements ISessionManager {
         ]),
         cwd: params.directory,
         ...(runtimeEnv != null ? { env: runtimeEnv } : {})
-      }).catch((error) => {
-        this.deps.logger.warn(
-          `Unable to set ACPX model for session ${params.name}: ${ensureError(error).message}`
-        );
+      })
+        .then(() => {
+          modelApplied = true;
+        })
+        .catch((error) => {
+          this.deps.logger.warn(
+            `Unable to set ACPX model for session ${params.name}: ${ensureError(error).message}`
+          );
+        });
+      this.rememberAppliedRuntimeConfig(params.name, {
+        model: modelApplied ? params.model : null
       });
     }
-    if (params.effort != null) {
+    if (params.effort != null && params.effort !== appliedRuntimeConfig?.effort) {
       const effortConfigId = params.agent === "claude" ? "effort" : "reasoning_effort";
       await this.runControlCommand({
         args: this.buildVerbArgs(params.agent, params.directory, [
@@ -3025,8 +3051,22 @@ export class AcpxSessionManager implements ISessionManager {
         }
         throw error;
       });
+      this.rememberAppliedRuntimeConfig(params.name, { effort: params.effort });
     }
     await this.waitForRuntimeSessionReady(params);
+  }
+
+  private rememberAppliedRuntimeConfig(
+    name: string,
+    patch: { model?: string | null; effort?: EffortLevel | null }
+  ): void {
+    const applied = this.appliedRuntimeConfigBySession.get(name) ?? {};
+    const model = patch.model === undefined ? applied.model : (patch.model ?? undefined);
+    const effort = patch.effort === undefined ? applied.effort : (patch.effort ?? undefined);
+    this.appliedRuntimeConfigBySession.set(name, {
+      ...(model != null ? { model } : {}),
+      ...(effort != null ? { effort } : {})
+    });
   }
 
   private async waitForRuntimeSessionReady(params: {
