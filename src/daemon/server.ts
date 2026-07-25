@@ -597,6 +597,8 @@ export async function createDaemonServer(params: {
 
 function daemonStatusForError(code: string): number {
   switch (code) {
+    case "MODEL_UNAVAILABLE":
+      return 400;
     case "NO_SESSION":
       return 404;
     case "SESSION_QUIESCED":

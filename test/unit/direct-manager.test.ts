@@ -3,6 +3,7 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
+import { UsageLedgerStore } from "../../src/shared/usage-ledger.js";
 import type { SessionInfo } from "../../src/shared/types.js";
 import { createStoreAndRouter, createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
 
@@ -986,6 +987,171 @@ describe("AcpxSessionManager", () => {
     await manager.resume({ name: "skip-sets-demo" });
     expect(await readFile(settingPath("model"), "utf8")).toBe("claude-opus-4-8\n");
     expect(await readFile(settingPath("effort"), "utf8")).toBe("xhigh\n");
+  });
+
+  it("fails the turn with MODEL_UNAVAILABLE and ledgers nothing when the adapter rejects a pinned model", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-model-reject-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const ledger = await UsageLedgerStore.open(
+      await createTempDir("puppenclaw-model-reject-ledger-")
+    );
+    try {
+      const manager = new AcpxSessionManager({
+        config: makeConfig({ acpxCommand }),
+        logger: {
+          info() {},
+          warn() {},
+          error() {},
+          debug() {}
+        },
+        store,
+        outputRouter,
+        ledger
+      });
+      const stateDir = join(workspaceDir, ".fake-acpx-state");
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, "reject-model-set"), "armed\n", "utf8");
+
+      await expect(
+        manager.start({
+          agent: "claude",
+          name: "model-reject-demo",
+          directory: workspaceDir,
+          task: "This turn must not silently run on the default model.",
+          model: "claude-opus-4-8",
+          contextFiles: []
+        })
+      ).rejects.toMatchObject({
+        code: "MODEL_UNAVAILABLE",
+        details: { agent: "claude", requested: "claude-opus-4-8" }
+      });
+
+      // The failed turn never ran, so the ledger records nothing for it.
+      expect(ledger.perSessionTotals("model-reject-demo").turns).toBe(0);
+      expect(ledger.perSessionHistory("model-reject-demo")).toEqual([]);
+      expect(ledger.grandTotals().turns).toBe(0);
+      // The failure is loud on the session record too.
+      expect(store.getSession("model-reject-demo")?.state).toBe("failed");
+      expect(store.getSession("model-reject-demo")?.lastError).toContain("rejected model");
+      // The half-configured runtime created for this start was closed again.
+      await expect(
+        readFile(join(stateDir, "model-reject-demo.session"), "utf8")
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      ledger.close();
+    }
+  });
+
+  it("keeps the redundant-set skip and resume tolerant when the adapter later rejects the model", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-model-reject-late-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const warns: string[] = [];
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn(message: string) {
+          warns.push(message);
+        },
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const stateDir = join(workspaceDir, ".fake-acpx-state");
+    const modelSettingPath = join(stateDir, "late-reject-demo.model.setting");
+
+    // Adapter accepts: explicit model behaves as before.
+    await manager.start({
+      agent: "claude",
+      name: "late-reject-demo",
+      directory: workspaceDir,
+      task: "Start with a pinned model the adapter accepts.",
+      model: "claude-opus-4-8",
+      contextFiles: []
+    });
+    expect(await readFile(modelSettingPath, "utf8")).toBe("claude-opus-4-8\n");
+
+    // Arm rejection AFTER the model was applied. The follow-up turn skips the
+    // redundant set (commit 871eb43), so the armed rejection must not fire: an
+    // intentionally skipped set is not an error.
+    await writeFile(join(stateDir, "reject-model-set"), "armed\n", "utf8");
+    await unlink(modelSettingPath);
+    await manager.send({
+      name: "late-reject-demo",
+      message: "Same model as before; the set must be skipped, not rejected.",
+      contextFiles: []
+    });
+    await expect(readFile(modelSettingPath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+
+    // Resume force-applies config but is a reconnect, not a turn: the
+    // rejection downgrades to a warning and resume still succeeds.
+    await manager.resume({ name: "late-reject-demo" });
+    expect(warns.some((entry) => entry.includes("Unable to set ACPX model"))).toBe(true);
+    expect(store.getSession("late-reject-demo")?.state).toBe("idle");
+
+    // The tolerated resume did not mark the model as applied, so the next
+    // turn re-attempts the set and fails loudly instead of running.
+    await expect(
+      manager.send({
+        name: "late-reject-demo",
+        message: "This turn must fail rather than run on the wrong model.",
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({
+      code: "MODEL_UNAVAILABLE",
+      details: { agent: "claude", requested: "claude-opus-4-8" }
+    });
+  });
+
+  it("attempts no model set and keeps default-model tolerance when nothing is pinned", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-no-model-pin-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const stateDir = join(workspaceDir, ".fake-acpx-state");
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, "reject-model-set"), "armed\n", "utf8");
+
+    // No model requested: nothing to set, nothing to fail, even though the
+    // adapter would reject any model set.
+    await manager.start({
+      agent: "claude",
+      name: "no-model-pin-demo",
+      directory: workspaceDir,
+      task: "Run on the profile default without pinning a model.",
+      contextFiles: []
+    });
+    await expect(
+      readFile(join(stateDir, "no-model-pin-demo.model.setting"), "utf8")
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    // The literal "default" selector keeps today's warn-and-continue path:
+    // running the adapter default IS the requested outcome.
+    await manager.start({
+      agent: "claude",
+      name: "default-model-demo",
+      directory: workspaceDir,
+      task: "Run on the adapter default via the literal selector.",
+      model: "default",
+      contextFiles: []
+    });
+    expect(store.getSession("default-model-demo")?.state).not.toBe("failed");
   });
 
   it("applies Claude reasoning natively across start, follow-up, resume, and fork", async () => {

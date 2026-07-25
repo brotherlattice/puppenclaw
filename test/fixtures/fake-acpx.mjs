@@ -236,6 +236,10 @@ if (
     );
     process.exit(4);
   }
+  if (key === "model" && existsSync(join(stateDir, "reject-model-set"))) {
+    emitError("SIM_MODEL_REJECT", `Simulated model rejection: unknown model ${value}`);
+    process.exit(1);
+  }
   writeFileSync(settingFile(name, key), `${value}\n`, "utf8");
   emitJson(
     `{"status":"set","session":"${jsonEscape(name)}","key":"${jsonEscape(

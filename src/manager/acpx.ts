@@ -1770,6 +1770,11 @@ export class AcpxSessionManager implements ISessionManager {
           agent: session.agent,
           directory: session.directory,
           forceApply: true,
+          // Resume is a reconnect, not a turn: keep it usable even when the
+          // adapter no longer knows the pinned model. The failed set is not
+          // remembered as applied, so the next start/send re-attempts it and
+          // fails with MODEL_UNAVAILABLE before running anything.
+          tolerateModelRejection: true,
           ...(session.model != null ? { model: session.model } : {}),
           ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
           ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
@@ -3009,6 +3014,13 @@ export class AcpxSessionManager implements ISessionManager {
     modelProvider?: ModelProviderConfig;
     /** Re-send config options even when they match the last applied values. */
     forceApply?: boolean;
+    /**
+     * Downgrade a rejected model set to a warning instead of failing. Only for
+     * non-turn reconnect paths (resume): nothing is remembered as applied, so
+     * the next turn re-attempts the set and fails loudly with
+     * MODEL_UNAVAILABLE before anything can run or be ledgered.
+     */
+    tolerateModelRejection?: boolean;
   }): Promise<void> {
     const runtimeEnv = this.modelProviderRuntimeEnv(params.modelProvider);
     const status = await this.getRuntimeStatus(params);
@@ -3032,12 +3044,13 @@ export class AcpxSessionManager implements ISessionManager {
         ? undefined
         : this.appliedRuntimeConfigBySession.get(params.name);
     if (params.model != null && params.model !== appliedRuntimeConfig?.model) {
+      const requestedModel = params.model;
       let modelApplied = false;
       await this.runControlCommand({
         args: this.buildVerbArgs(params.agent, params.directory, [
           "set",
           "model",
-          params.model,
+          requestedModel,
           "--session",
           params.name
         ]),
@@ -3047,13 +3060,44 @@ export class AcpxSessionManager implements ISessionManager {
         .then(() => {
           modelApplied = true;
         })
-        .catch((error) => {
-          this.deps.logger.warn(
-            `Unable to set ACPX model for session ${params.name}: ${ensureError(error).message}`
+        .catch(async (error) => {
+          const cause = ensureError(error).message;
+          // The literal "default" selector keeps the historical tolerant
+          // behavior: running the adapter default IS the requested outcome,
+          // so a rejected set cannot silently bill a different model.
+          if (requestedModel === "default" || params.tolerateModelRejection === true) {
+            this.deps.logger.warn(
+              `Unable to set ACPX model for session ${params.name}: ${cause}`
+            );
+            return;
+          }
+          if (createdRuntime) {
+            await this.runControlCommand({
+              args: this.buildVerbArgs(params.agent, params.directory, [
+                "sessions",
+                "close",
+                params.name
+              ]),
+              cwd: params.directory,
+              ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+            }).catch(() => {
+              // Best-effort cleanup of a runtime that never became usable.
+            });
+          }
+          // Deployment safety: a session that pinned a model must never
+          // silently run — and get ledgered as — a different generation
+          // because a stale adapter rejected the selector. Fail the turn.
+          throw new PuppenclawError(
+            "MODEL_UNAVAILABLE",
+            `ACP runtime rejected model "${requestedModel}" for session ${params.name}: ${cause}`,
+            {
+              agent: params.agent,
+              requested: requestedModel
+            }
           );
         });
       this.rememberAppliedRuntimeConfig(params.name, {
-        model: modelApplied ? params.model : null
+        model: modelApplied ? requestedModel : null
       });
     }
     if (params.effort != null && params.effort !== appliedRuntimeConfig?.effort) {

@@ -218,6 +218,10 @@ if [[ "${command[0]:-}" == "set" && -n "${command[1]:-}" && -n "${command[2]:-}"
     emit_json '{"jsonrpc":"2.0","id":null,"error":{"code":-32002,"message":"No acpx session found","data":{"acpxCode":"NO_SESSION","origin":"cli","sessionId":"unknown"}}}'
     exit 4
   fi
+  if [[ "$key" == "model" && -f "$state_dir/reject-model-set" ]]; then
+    emit_error "SIM_MODEL_REJECT" "Simulated model rejection: unknown model $value"
+    exit 1
+  fi
   printf '%s\n' "$value" > "$(setting_file "$name" "$key")"
   emit_json "{\"status\":\"set\",\"session\":\"$(json_escape "$name")\",\"key\":\"$(json_escape "$key")\",\"value\":\"$(json_escape "$value")\"}"
   exit 0
