@@ -1985,7 +1985,15 @@ export class AcpxSessionManager implements ISessionManager {
     if (params.name == null) {
       return this.usageRollup(params);
     }
-    const session = this.requireSession(params.name);
+    const session = this.deps.store.getSession(params.name);
+    if (session == null) {
+      // Purged/GC'd sessions keep their turns in the durable usage ledger even
+      // though the registry record is gone. Cost is ledger-scoped, not
+      // registry-scoped: serve those turns instead of failing, so one-shot
+      // sessions stay billable after cleanup. Names absent from both the
+      // registry and the ledger still fail with NO_SESSION.
+      return this.ledgerOnlyCost(params.name, params);
+    }
     const totals = this.deps.ledger?.perSessionTotals(session.name) ?? null;
     const history = this.deps.ledger?.perSessionHistory(session.name, params.limit ?? 20) ?? [];
     const provider = deriveUsageProvider(session);
@@ -2009,6 +2017,42 @@ export class AcpxSessionManager implements ISessionManager {
       turns: totals?.turns ?? 0,
       history,
       pricing: null,
+      note: "Orchestrator records token counters when the ACP runtime emits them. It does not infer currency pricing."
+    });
+  }
+
+  /**
+   * Serves per-session cost for a session that is no longer in the registry
+   * straight from the durable usage ledger. The payload mirrors the
+   * live-session shape field for field — per-turn `history` entries keep their
+   * ledger ids, so downstream reconciliation dedupes exactly as before — with
+   * two documented deviations: `lastCall` is always null (the context-window
+   * snapshot lives only on the registry record) and provider/model are taken
+   * from the most recent ledger turn instead of the session record. The
+   * additive `ledgerOnly` marker identifies the fallback.
+   */
+  private ledgerOnlyCost(name: string, params: CostParams): ToolResult {
+    const totals = this.deps.ledger?.perSessionTotals(name);
+    if (totals == null || totals.turns === 0) {
+      throw new PuppenclawError("NO_SESSION", `Unknown session ${name}.`);
+    }
+    const history = this.deps.ledger?.perSessionHistory(name, params.limit ?? 20) ?? [];
+    const latest = history[0];
+    const provider = latest?.provider ?? "unknown";
+    const model = latest?.model ?? "unknown";
+    const summary = `Usage for purged session ${name} (${provider} ${model}): ${totals.turns} turn${
+      totals.turns === 1 ? "" : "s"
+    }, ${formatUsageLine(totals.usage)}. Served from the durable usage ledger.`;
+    return textToolResult(summary, {
+      name,
+      provider,
+      model,
+      lastCall: null,
+      totals,
+      turns: totals.turns,
+      history,
+      pricing: null,
+      ledgerOnly: true,
       note: "Orchestrator records token counters when the ACP runtime emits them. It does not infer currency pricing."
     });
   }

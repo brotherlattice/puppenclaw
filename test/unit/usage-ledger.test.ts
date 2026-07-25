@@ -304,11 +304,38 @@ describe("UsageLedgerStore", () => {
     expect(history[0]?.sessionName).toBe("usage-demo");
     expect(history[0]?.agent).toBe("claude");
 
+    // Registry hit: cost() serves the live-session path without the
+    // ledger-only marker.
+    const liveCost = await manager.cost({ name: "usage-demo" });
+    const liveDetails = liveCost.details as Record<string, unknown>;
+    expect(liveDetails.name).toBe("usage-demo");
+    expect(liveDetails.totals).toEqual(totals);
+    expect(liveDetails.history).toEqual(history);
+    expect(liveDetails.ledgerOnly).toBeUndefined();
+
     await manager.purge({ name: "usage-demo" });
 
     expect(store.getSession("usage-demo")).toBeNull();
     const survivingTotals = ledger.perSessionTotals("usage-demo");
     expect(survivingTotals.turns).toBeGreaterThanOrEqual(1);
     expect(survivingTotals.usage.input).toBeGreaterThan(0);
+
+    // Cost is ledger-scoped: the purged session keeps serving the same
+    // totals, turn list, and provider/model, marked as ledger-only.
+    const purgedCost = await manager.cost({ name: "usage-demo" });
+    const purgedDetails = purgedCost.details as Record<string, unknown>;
+    expect(purgedDetails.ledgerOnly).toBe(true);
+    expect(purgedDetails.name).toBe("usage-demo");
+    expect(purgedDetails.lastCall).toBeNull();
+    expect(purgedDetails.totals).toEqual(liveDetails.totals);
+    expect(purgedDetails.turns).toBe(liveDetails.turns);
+    expect(purgedDetails.history).toEqual(liveDetails.history);
+    expect(purgedDetails.provider).toBe(liveDetails.provider);
+    expect(purgedDetails.model).toBe(liveDetails.model);
+
+    // A name absent from both the registry and the ledger still fails.
+    await expect(manager.cost({ name: "never-started" })).rejects.toMatchObject({
+      code: "NO_SESSION"
+    });
   });
 });
