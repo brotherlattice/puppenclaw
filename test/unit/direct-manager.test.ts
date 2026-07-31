@@ -77,6 +77,7 @@ process.exit(1);
 
 async function resolveFakeCodexJsonCommand(workspaceDir: string): Promise<string> {
   const fakeCodexPath = join(workspaceDir, "fake-codex-json.mjs");
+  const releasePath = join(workspaceDir, ".fake-codex-json-release");
   await writeFile(
     fakeCodexPath,
     `#!/usr/bin/env node
@@ -88,6 +89,7 @@ const outputIndex = args.indexOf("--output-last-message");
 const outputPath = outputIndex >= 0 ? args[outputIndex + 1] : null;
 const cwdIndex = args.indexOf("--cd");
 const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : process.cwd();
+const releasePath = ${JSON.stringify(releasePath)};
 const counterPath = join(cwd, ".fake-codex-json-count");
 const invocation = existsSync(counterPath)
   ? Number.parseInt(readFileSync(counterPath, "utf8"), 10) || 0
@@ -150,6 +152,15 @@ emit({
     content: [{ type: "output_text", text: "Final streamed answer." }]
   }
 });
+if (longRunningTurn) {
+  const releaseDeadline = Date.now() + 10_000;
+  while (!existsSync(releasePath) && Date.now() < releaseDeadline) {
+    await sleep(10);
+  }
+  if (!existsSync(releasePath)) {
+    throw new Error("test did not release the fake Codex turn");
+  }
+}
 if (outputPath != null) {
   writeFileSync(outputPath, "Final file answer.", "utf8");
 }
@@ -1521,6 +1532,7 @@ describe("AcpxSessionManager", () => {
     expect(runningDetails.turn.lockHeld).toBe(true);
     expect(runningDetails.turn.processAlive).toBe(true);
     expect(runningDetails.turn.pid).toEqual(expect.any(Number));
+    await writeFile(join(workspaceDir, ".fake-codex-json-release"), "release\n", "utf8");
 
     const result = await sendPromise;
     const details = result.details as {
