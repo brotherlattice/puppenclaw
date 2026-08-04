@@ -487,7 +487,7 @@ describe("AcpxSessionManager", () => {
     const readOnlyEnv = JSON.parse(
       await readFile(join(workspaceDir, ".fake-codex-permission-env-0.json"), "utf8")
     ) as { turnPolicy: string | null };
-    expect(readOnlyEnv.turnPolicy).toBe("plan-no-tools");
+    expect(readOnlyEnv.turnPolicy).toBe("plan-read-tools");
 
     const approved = await manager.send({
       name: "codex-permission-demo",

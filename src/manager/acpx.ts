@@ -475,6 +475,7 @@ function buildCodexPermissionPrompt(promptText: string, mode: PermissionMode): s
 type CodexTurnPolicy =
   | "default"
   | "plan-no-tools"
+  | "plan-read-tools"
   | "execute-tools"
   | "deny-all-no-tools";
 
@@ -486,7 +487,9 @@ function deriveCodexTurnPolicy(
     return "deny-all-no-tools";
   }
   if (interactionMode === "plan") {
-    return "plan-no-tools";
+    return permissionMode === "approve-reads"
+      ? "plan-read-tools"
+      : "plan-no-tools";
   }
   if (interactionMode === "execute") {
     return "execute-tools";
