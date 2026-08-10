@@ -1,0 +1,83 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Status for running\n{\n  \"session\": {\n    \"name\": \"running\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"running\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Task for running scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Answer for running scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"activeTurn\": {\n      \"id\": \"turn-running-1\",\n      \"state\": \"running\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"pid\": 431602,\n      \"processGroupId\": 431600,\n      \"processStartIdentity\": \"431602:8888888\",\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 42\n    }\n  },\n  \"runtime\": {\n    \"exists\": true,\n    \"status\": \"alive\",\n    \"raw\": {\n      \"status\": \"alive\",\n      \"acpxRecordId\": \"rec-running\",\n      \"acpxSessionId\": \"backend-running\",\n      \"agentSessionId\": \"agent-running\",\n      \"agent\": \"claude\",\n      \"modeState\": {\n        \"currentModeId\": \"default\",\n        \"availableModes\": [\n          {\n            \"id\": \"default\",\n            \"name\": \"Default\"\n          },\n          {\n            \"id\": \"plan\",\n            \"name\": \"Plan\"\n          }\n        ]\n      }\n    }\n  },\n  \"turn\": {\n    \"classification\": \"running\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": true,\n    \"identityMatches\": true,\n    \"pid\": 431602,\n    \"processGroupId\": 431600,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 42,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  }\n}"
+    }
+  ],
+  "details": {
+    "session": {
+      "name": "running",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "running",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Task for running scenario.",
+          "createdAt": "2026-01-01T10:00:05.000Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Answer for running scenario.",
+          "createdAt": "2026-01-01T10:00:20.000Z"
+        }
+      ],
+      "activeTurn": {
+        "id": "turn-running-1",
+        "state": "running",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "pid": 431602,
+        "processGroupId": 431600,
+        "processStartIdentity": "431602:8888888",
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 42
+      }
+    },
+    "runtime": {
+      "exists": true,
+      "status": "alive",
+      "raw": {
+        "status": "alive",
+        "acpxRecordId": "rec-running",
+        "acpxSessionId": "backend-running",
+        "agentSessionId": "agent-running",
+        "agent": "claude",
+        "modeState": {
+          "currentModeId": "default",
+          "availableModes": [
+            {
+              "id": "default",
+              "name": "Default"
+            },
+            {
+              "id": "plan",
+              "name": "Plan"
+            }
+          ]
+        }
+      }
+    },
+    "turn": {
+      "classification": "running",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": true,
+      "identityMatches": true,
+      "pid": 431602,
+      "processGroupId": 431600,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 42,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
+      "conflict": null
+    }
+  }
+}

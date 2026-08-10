@@ -1,0 +1,56 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Output for legacy-no-turn\n{\n  \"session\": {\n    \"name\": \"legacy-no-turn\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"running\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Task for legacy-no-turn scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Answer for legacy-no-turn scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ]\n  },\n  \"turn\": {\n    \"classification\": \"inactive\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": null,\n    \"identityMatches\": null,\n    \"pid\": null,\n    \"processGroupId\": null,\n    \"startedAt\": null,\n    \"updatedAt\": null,\n    \"lastOutputAt\": null,\n    \"outputChars\": 0,\n    \"ageMs\": null,\n    \"outputAgeMs\": null,\n    \"conflict\": null\n  },\n  \"output\": {\n    \"text\": \"Answer for legacy-no-turn scenario.\",\n    \"chars\": 35,\n    \"source\": \"transcript\",\n    \"startedAt\": null,\n    \"updatedAt\": \"2026-01-01T10:00:20.000Z\",\n    \"complete\": false\n  }\n}"
+    }
+  ],
+  "details": {
+    "session": {
+      "name": "legacy-no-turn",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "running",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Task for legacy-no-turn scenario.",
+          "createdAt": "2026-01-01T10:00:05.000Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Answer for legacy-no-turn scenario.",
+          "createdAt": "2026-01-01T10:00:20.000Z"
+        }
+      ]
+    },
+    "turn": {
+      "classification": "inactive",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": null,
+      "identityMatches": null,
+      "pid": null,
+      "processGroupId": null,
+      "startedAt": null,
+      "updatedAt": null,
+      "lastOutputAt": null,
+      "outputChars": 0,
+      "ageMs": null,
+      "outputAgeMs": null,
+      "conflict": null
+    },
+    "output": {
+      "text": "Answer for legacy-no-turn scenario.",
+      "chars": 35,
+      "source": "transcript",
+      "startedAt": null,
+      "updatedAt": "2026-01-01T10:00:20.000Z",
+      "complete": false
+    }
+  }
+}

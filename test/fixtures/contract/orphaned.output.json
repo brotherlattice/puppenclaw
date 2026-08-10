@@ -1,0 +1,71 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Output for orphaned\n{\n  \"session\": {\n    \"name\": \"orphaned\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"failed\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [\n      \"Persisted active turn has no matching live process; the turn is orphaned.\"\n    ],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Task for orphaned scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Answer for orphaned scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"activeTurn\": {\n      \"id\": \"turn-orphaned-1\",\n      \"state\": \"orphaned\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"pid\": 999999999,\n      \"processGroupId\": 999999999,\n      \"processStartIdentity\": \"999999999:1\",\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 7\n    },\n    \"lastError\": \"Persisted active turn has no matching live process; the turn is orphaned.\",\n    \"lastStopReason\": \"Interrupted by daemon restart\"\n  },\n  \"turn\": {\n    \"classification\": \"orphaned\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": false,\n    \"identityMatches\": false,\n    \"pid\": 999999999,\n    \"processGroupId\": 999999999,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 7,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  },\n  \"output\": {\n    \"text\": \"Answer for orphaned scenario.\",\n    \"chars\": 29,\n    \"source\": \"transcript\",\n    \"startedAt\": null,\n    \"updatedAt\": \"2026-01-01T10:00:20.000Z\",\n    \"complete\": true\n  }\n}"
+    }
+  ],
+  "details": {
+    "session": {
+      "name": "orphaned",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "failed",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [
+        "Persisted active turn has no matching live process; the turn is orphaned."
+      ],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Task for orphaned scenario.",
+          "createdAt": "2026-01-01T10:00:05.000Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Answer for orphaned scenario.",
+          "createdAt": "2026-01-01T10:00:20.000Z"
+        }
+      ],
+      "activeTurn": {
+        "id": "turn-orphaned-1",
+        "state": "orphaned",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "pid": 999999999,
+        "processGroupId": 999999999,
+        "processStartIdentity": "999999999:1",
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 7
+      },
+      "lastError": "Persisted active turn has no matching live process; the turn is orphaned.",
+      "lastStopReason": "Interrupted by daemon restart"
+    },
+    "turn": {
+      "classification": "orphaned",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": false,
+      "identityMatches": false,
+      "pid": 999999999,
+      "processGroupId": 999999999,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 7,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
+      "conflict": null
+    },
+    "output": {
+      "text": "Answer for orphaned scenario.",
+      "chars": 29,
+      "source": "transcript",
+      "startedAt": null,
+      "updatedAt": "2026-01-01T10:00:20.000Z",
+      "complete": true
+    }
+  }
+}

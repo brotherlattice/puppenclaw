@@ -1,0 +1,67 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Output for running\n{\n  \"session\": {\n    \"name\": \"running\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"running\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Task for running scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Answer for running scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"activeTurn\": {\n      \"id\": \"turn-running-1\",\n      \"state\": \"running\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"pid\": 431602,\n      \"processGroupId\": 431600,\n      \"processStartIdentity\": \"431602:8888888\",\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 42\n    }\n  },\n  \"turn\": {\n    \"classification\": \"running\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": true,\n    \"identityMatches\": true,\n    \"pid\": 431602,\n    \"processGroupId\": 431600,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 42,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  },\n  \"output\": {\n    \"text\": \"Answer for running scenario.\",\n    \"chars\": 28,\n    \"source\": \"transcript\",\n    \"startedAt\": null,\n    \"updatedAt\": \"2026-01-01T10:00:20.000Z\",\n    \"complete\": false\n  }\n}"
+    }
+  ],
+  "details": {
+    "session": {
+      "name": "running",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "running",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Task for running scenario.",
+          "createdAt": "2026-01-01T10:00:05.000Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Answer for running scenario.",
+          "createdAt": "2026-01-01T10:00:20.000Z"
+        }
+      ],
+      "activeTurn": {
+        "id": "turn-running-1",
+        "state": "running",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "pid": 431602,
+        "processGroupId": 431600,
+        "processStartIdentity": "431602:8888888",
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 42
+      }
+    },
+    "turn": {
+      "classification": "running",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": true,
+      "identityMatches": true,
+      "pid": 431602,
+      "processGroupId": 431600,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 42,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
+      "conflict": null
+    },
+    "output": {
+      "text": "Answer for running scenario.",
+      "chars": 28,
+      "source": "transcript",
+      "startedAt": null,
+      "updatedAt": "2026-01-01T10:00:20.000Z",
+      "complete": false
+    }
+  }
+}

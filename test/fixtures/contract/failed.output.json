@@ -1,0 +1,67 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Output for failed\n{\n  \"session\": {\n    \"name\": \"failed\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"failed\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Task for failed scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Answer for failed scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"lastError\": \"Simulated turn failure\",\n    \"activeTurn\": {\n      \"id\": \"turn-failed-1\",\n      \"state\": \"failed\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"completedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 0,\n      \"exitCode\": 1,\n      \"error\": \"Simulated turn failure\"\n    }\n  },\n  \"turn\": {\n    \"classification\": \"failed\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": null,\n    \"identityMatches\": null,\n    \"pid\": null,\n    \"processGroupId\": null,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": null,\n    \"outputChars\": 0,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": null,\n    \"conflict\": null\n  },\n  \"output\": {\n    \"text\": \"Answer for failed scenario.\",\n    \"chars\": 27,\n    \"source\": \"transcript\",\n    \"startedAt\": null,\n    \"updatedAt\": \"2026-01-01T10:00:20.000Z\",\n    \"complete\": true\n  }\n}"
+    }
+  ],
+  "details": {
+    "session": {
+      "name": "failed",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "failed",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Task for failed scenario.",
+          "createdAt": "2026-01-01T10:00:05.000Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Answer for failed scenario.",
+          "createdAt": "2026-01-01T10:00:20.000Z"
+        }
+      ],
+      "lastError": "Simulated turn failure",
+      "activeTurn": {
+        "id": "turn-failed-1",
+        "state": "failed",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "completedAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 0,
+        "exitCode": 1,
+        "error": "Simulated turn failure"
+      }
+    },
+    "turn": {
+      "classification": "failed",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": null,
+      "identityMatches": null,
+      "pid": null,
+      "processGroupId": null,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": null,
+      "outputChars": 0,
+      "ageMs": 61000,
+      "outputAgeMs": null,
+      "conflict": null
+    },
+    "output": {
+      "text": "Answer for failed scenario.",
+      "chars": 27,
+      "source": "transcript",
+      "startedAt": null,
+      "updatedAt": "2026-01-01T10:00:20.000Z",
+      "complete": true
+    }
+  }
+}
