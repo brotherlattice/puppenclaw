@@ -53,6 +53,52 @@ export async function readJsonFile<T>(path: string, fallback: T): Promise<T> {
   }
 }
 
+/**
+ * Best-effort quarantine: renames `path` to `<path>.corrupt-<timestamp>` so a
+ * damaged or outdated file is preserved for inspection instead of being
+ * overwritten. Returns the quarantine path, or null when the rename failed.
+ */
+export async function quarantineFile(path: string): Promise<string | null> {
+  const quarantinePath = `${path}.corrupt-${nowIso().replaceAll(":", "-")}`;
+  try {
+    await rename(path, quarantinePath);
+    return quarantinePath;
+  } catch (error) {
+    console.error(
+      `Failed to quarantine ${path}: ${ensureError(error).message}`
+    );
+    return null;
+  }
+}
+
+/**
+ * Like readJsonFile, but a file with unparseable JSON (e.g. truncated by a
+ * host crash) is quarantined and replaced by the fallback instead of throwing.
+ */
+export async function readJsonFileResilient<T>(path: string, fallback: T): Promise<T> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    const err = ensureError(error);
+    if ("code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+      return fallback;
+    }
+    throw err;
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch (error) {
+    const quarantinePath = await quarantineFile(path);
+    console.error(
+      quarantinePath != null
+        ? `Corrupt JSON in ${path} (${ensureError(error).message}); quarantined to ${quarantinePath} and continuing with fresh state.`
+        : `Corrupt JSON in ${path} (${ensureError(error).message}); quarantine failed, continuing with fresh state.`
+    );
+    return fallback;
+  }
+}
+
 export async function pathExists(path: string): Promise<boolean> {
   try {
     await access(path, constants.F_OK);

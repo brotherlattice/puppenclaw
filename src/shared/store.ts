@@ -8,7 +8,7 @@ import type {
   SessionQuiescenceReservation,
   StoredState
 } from "./types.js";
-import { nowIso, readJsonFile, writeJsonFileAtomic } from "./utils.js";
+import { nowIso, quarantineFile, readJsonFileResilient, writeJsonFileAtomic } from "./utils.js";
 
 export class SessionStore {
   private mutationTail: Promise<void> = Promise.resolve();
@@ -20,28 +20,32 @@ export class SessionStore {
 
   static async open(rootDir: string): Promise<SessionStore> {
     const statePath = join(rootDir, "state.json");
-    const state = await readJsonFile<StoredState>(statePath, {
+    const state = await readJsonFileResilient<StoredState>(statePath, {
       version: SESSION_STORE_VERSION,
       sessions: {},
       exposures: {},
       quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
     });
-    return new SessionStore(
-      rootDir,
-      state.version === SESSION_STORE_VERSION
-        ? {
-            version: SESSION_STORE_VERSION,
-            sessions: state.sessions ?? {},
-            exposures: state.exposures ?? {},
-            quiescence: normalizeQuiescenceState(state.quiescence)
-          }
-        : {
-            version: SESSION_STORE_VERSION,
-            sessions: {},
-            exposures: {},
-            quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
-          }
-    );
+    if (state.version !== SESSION_STORE_VERSION) {
+      const quarantinePath = await quarantineFile(statePath);
+      console.warn(
+        `Session store ${statePath} has version ${String(state.version)} but version ${SESSION_STORE_VERSION} is required; resetting state${
+          quarantinePath != null ? ` (previous state preserved at ${quarantinePath})` : ""
+        }.`
+      );
+      return new SessionStore(rootDir, {
+        version: SESSION_STORE_VERSION,
+        sessions: {},
+        exposures: {},
+        quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
+      });
+    }
+    return new SessionStore(rootDir, {
+      version: SESSION_STORE_VERSION,
+      sessions: state.sessions ?? {},
+      exposures: state.exposures ?? {},
+      quiescence: normalizeQuiescenceState(state.quiescence)
+    });
   }
 
   get statePath(): string {
