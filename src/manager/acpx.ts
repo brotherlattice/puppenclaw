@@ -2836,13 +2836,17 @@ export class AcpxSessionManager implements ISessionManager {
         "modelProviderId must exactly match modelProvider.id."
       );
     }
-    if (
-      session.agent !== "codex" ||
-      !["codex-openai", "codex-openai-compatible"].includes(requestedProvider.kind ?? "")
-    ) {
+    const supportsCodexRefresh =
+      session.agent === "codex" &&
+      ["codex-openai", "codex-openai-compatible"].includes(
+        requestedProvider.kind ?? ""
+      );
+    const supportsClaudeRefresh =
+      session.agent === "claude" && requestedProvider.kind === "claude-code";
+    if (!supportsCodexRefresh && !supportsClaudeRefresh) {
       throw new PuppenclawError(
         "MODEL_PROVIDER_REFRESH_UNSUPPORTED",
-        "Model-provider refresh is restricted to Codex one-shot providers."
+        "Model-provider refresh requires a matching Codex one-shot or Claude Code provider."
       );
     }
 
@@ -2856,7 +2860,7 @@ export class AcpxSessionManager implements ISessionManager {
       );
     }
 
-    if (session.modelProvider == null) {
+    if (supportsCodexRefresh && session.modelProvider == null) {
       await this.closeLegacyRuntimeForProviderRefresh(session);
     }
 

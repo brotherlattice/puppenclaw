@@ -693,7 +693,140 @@ describe("AcpxSessionManager", () => {
     });
   });
 
-  it("rejects incomplete, mismatched, cross-provider, and non-Codex refreshes", async () => {
+  it("refreshes a same-id Claude Code model and effort without losing transcript", async () => {
+    const workspaceDir = await createTempDir(
+      "puppenclaw-claude-provider-refresh-"
+    );
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const providerId = "claude_code_anthropic";
+    await manager.start({
+      agent: "claude",
+      name: "claude-provider-refresh-demo",
+      directory: workspaceDir,
+      task: "Start on the old Opus alias.",
+      effort: "high",
+      model: "opus",
+      modelProviderId: providerId,
+      modelProvider: {
+        id: providerId,
+        kind: "claude-code",
+        model: "opus"
+      },
+      contextFiles: []
+    });
+
+    const refreshedProvider = {
+      id: providerId,
+      kind: "claude-code" as const,
+      model: "claude-opus-5"
+    };
+    const refreshed = await manager.send({
+      name: "claude-provider-refresh-demo",
+      message: "Continue on pinned Opus 5.",
+      effort: "low",
+      modelProviderId: providerId,
+      modelProvider: refreshedProvider,
+      contextFiles: []
+    });
+    const refreshedSession = (refreshed.details as { session: SessionInfo }).session;
+    expect(refreshedSession).toMatchObject({
+      model: "claude-opus-5",
+      effort: "low",
+      modelProviderId: providerId,
+      modelProvider: refreshedProvider
+    });
+    expect(
+      refreshedSession.transcript.some((entry) => entry.text.includes("old Opus alias"))
+    ).toBe(true);
+    expect(
+      refreshedSession.transcript.some((entry) => entry.text.includes("pinned Opus 5"))
+    ).toBe(true);
+    const settingPath = (key: string) =>
+      join(
+        workspaceDir,
+        ".fake-acpx-state",
+        `claude-provider-refresh-demo.${key}.setting`
+      );
+    expect(await readFile(settingPath("model"), "utf8")).toBe("claude-opus-5\n");
+    expect(await readFile(settingPath("effort"), "utf8")).toBe("low\n");
+    expect(store.getSession("claude-provider-refresh-demo")).toMatchObject({
+      model: "claude-opus-5",
+      effort: "low",
+      modelProviderId: providerId,
+      modelProvider: refreshedProvider
+    });
+  });
+
+  it("binds a legacy Claude session to a provider without replacing its runtime", async () => {
+    const workspaceDir = await createTempDir(
+      "puppenclaw-legacy-claude-refresh-"
+    );
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const name = "legacy-claude-provider-refresh-demo";
+    await manager.start({
+      agent: "claude",
+      name,
+      directory: workspaceDir,
+      task: "Start without provider metadata.",
+      effort: "high",
+      model: "opus",
+      contextFiles: []
+    });
+    const sessionMarker = join(
+      workspaceDir,
+      ".fake-acpx-state",
+      `${name}.session`
+    );
+    const markerBefore = await readFile(sessionMarker, "utf8");
+    const provider = {
+      id: "claude_code_anthropic",
+      kind: "claude-code" as const,
+      model: "claude-opus-5"
+    };
+
+    await manager.send({
+      name,
+      message: "Continue with the bound Opus 5 provider.",
+      effort: "max",
+      modelProviderId: provider.id,
+      modelProvider: provider,
+      contextFiles: []
+    });
+
+    expect(await readFile(sessionMarker, "utf8")).toBe(markerBefore);
+    expect(store.getSession(name)).toMatchObject({
+      model: "claude-opus-5",
+      effort: "max",
+      modelProviderId: provider.id,
+      modelProvider: provider
+    });
+  });
+
+  it("rejects incomplete, mismatched, cross-provider, and incompatible refreshes", async () => {
     const workspaceDir = await createTempDir("puppenclaw-provider-refresh-reject-");
     const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
