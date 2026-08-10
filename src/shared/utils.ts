@@ -1,6 +1,6 @@
 import { createReadStream } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, isAbsolute, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -19,8 +19,25 @@ export async function ensureDir(path: string): Promise<void> {
 export async function writeJsonFileAtomic(path: string, value: unknown): Promise<void> {
   await ensureDir(dirname(path));
   const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const handle = await open(tmpPath, "w");
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await rename(tmpPath, path);
+  try {
+    const dirHandle = await open(dirname(path), "r");
+    try {
+      await dirHandle.sync();
+    } finally {
+      await dirHandle.close();
+    }
+  } catch {
+    // Directory fsync is unsupported on some platforms (notably Windows);
+    // the rename above is still atomic, so degrade silently.
+  }
 }
 
 export async function readJsonFile<T>(path: string, fallback: T): Promise<T> {
