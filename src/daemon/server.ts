@@ -132,6 +132,7 @@ export async function createDaemonServer(params: {
     outputRouter,
     ledger: usageLedger
   });
+  await manager.reconcilePersistedSessions();
   const orchestrator = new OrchestratorRuntime({
     config: {
       ...params.config,

@@ -3,13 +3,19 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { AcpxSessionManager } from "../../src/manager/acpx.js";
 import { SessionStore } from "../../src/shared/store.js";
 import {
   readJsonFile,
   readJsonFileResilient,
   writeJsonFileAtomic
 } from "../../src/shared/utils.js";
-import { createTempDir } from "../helpers.js";
+import {
+  createStoreAndRouter,
+  createTempDir,
+  makeConfig,
+  resolveFakeAcpxCommand
+} from "../helpers.js";
 
 describe("writeJsonFileAtomic", () => {
   it("writes durable content and leaves no temporary files behind", async () => {
@@ -110,5 +116,96 @@ describe("SessionStore.open", () => {
 
     expect(store.listSessions()).toEqual([]);
     expect(await readdir(dir)).toEqual([]);
+  });
+});
+
+describe("startup reconciliation", () => {
+  const silentLogger = {
+    info() {},
+    warn() {},
+    error() {},
+    debug() {}
+  };
+
+  it("marks a persisted running session with a dead turn process as failed", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-durability-startup-sweep-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const timestamp = new Date().toISOString();
+    await store.upsertSession({
+      agent: "claude",
+      name: "dead-turn",
+      directory: workspaceDir,
+      state: "running",
+      createdAt: timestamp,
+      lastActivity: timestamp,
+      permissionMode: "approve-reads",
+      warnings: [],
+      transcript: [],
+      activeTurn: {
+        id: "turn-dead",
+        state: "running",
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        pid: 999_999_999,
+        processStartIdentity: "999999999:0",
+        outputChars: 0
+      }
+    });
+
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: silentLogger,
+      store,
+      outputRouter
+    });
+    await manager.reconcilePersistedSessions();
+
+    const session = store.getSession("dead-turn");
+    expect(session?.state).toBe("failed");
+    expect(session?.activeTurn?.state).toBe("orphaned");
+    expect(session?.lastStopReason).toBe("Interrupted by daemon restart");
+    expect(
+      JSON.parse(await readFile(join(workspaceDir, "state.json"), "utf8"))
+    ).toMatchObject({ sessions: { "dead-turn": { state: "failed" } } });
+  });
+
+  it("keeps sessions without running state or with quiescence fencing untouched", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-durability-startup-skip-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const timestamp = new Date().toISOString();
+    await store.upsertSession({
+      agent: "claude",
+      name: "idle-session",
+      directory: workspaceDir,
+      state: "idle",
+      createdAt: timestamp,
+      lastActivity: timestamp,
+      permissionMode: "approve-reads",
+      warnings: [],
+      transcript: []
+    });
+    await store.upsertSession({
+      agent: "claude",
+      name: "fenced-session",
+      directory: workspaceDir,
+      state: "running",
+      createdAt: timestamp,
+      lastActivity: timestamp,
+      permissionMode: "approve-reads",
+      warnings: [],
+      transcript: []
+    });
+    await store.reserveQuiescence("fenced-session", "external");
+
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: silentLogger,
+      store,
+      outputRouter
+    });
+    await manager.reconcilePersistedSessions();
+
+    expect(store.getSession("idle-session")?.state).toBe("idle");
+    expect(store.getSession("fenced-session")?.state).toBe("running");
   });
 });

@@ -191,6 +191,7 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
       outputRouter: state.outputRouter,
       ledger: state.usageLedger
     });
+    await state.manager.reconcilePersistedSessions?.();
     state.orchestrator =
       getConfiguredPluginConfig().backend === "daemon"
         ? new DaemonOrchestratorClient({

@@ -2229,6 +2229,48 @@ export class AcpxSessionManager implements ISessionManager {
     }
   }
 
+  /**
+   * Startup sweep: classifies sessions persisted as running against the live
+   * process table. After a daemon restart the in-memory turn registries are
+   * empty, so a running session whose turn process died with the previous
+   * daemon would otherwise stay "running" in state.json until something
+   * re-reads it — and gc() never collects it because it only reaps terminal
+   * states. Classification only: no process is spawned or killed.
+   */
+  async reconcilePersistedSessions(): Promise<void> {
+    for (const stored of this.deps.store.listSessions()) {
+      if (stored.state !== "running") {
+        continue;
+      }
+      // Quiesced sessions are fenced against mutation and already presented
+      // as stopped; leave them for the quiescence release path.
+      if (this.deps.store.getQuiescence(stored.name) != null) {
+        continue;
+      }
+      const reconciled = await this.reconcileVisibleSession(stored);
+      if (reconciled.turn.classification !== "orphaned") {
+        continue;
+      }
+      try {
+        await this.deps.store.patchSession(stored.name, (current) =>
+          current == null || current.state !== "running"
+            ? current
+            : {
+                ...reconciled.session,
+                lastStopReason: "Interrupted by daemon restart"
+              }
+        );
+        this.deps.logger.warn(
+          `Session ${stored.name} was persisted as running but its turn process is gone; marked failed at startup.`
+        );
+      } catch (error) {
+        this.deps.logger.warn(
+          `Unable to reconcile persisted session ${stored.name} at startup: ${ensureError(error).message}`
+        );
+      }
+    }
+  }
+
   private async withSessionTurnLock<T>(
     name: string,
     lifecycleEpoch: number | undefined,
