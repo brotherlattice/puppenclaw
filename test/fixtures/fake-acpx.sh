@@ -244,7 +244,10 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
   else
     emit_json "{\"type\":\"usage_update\",\"used\":${#normalized_input},\"size\":4096,\"input_tokens\":${#normalized_input},\"output_tokens\":12,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3}"
   fi
-  if [[ "$normalized_input" == *"FAIL_TURN"* ]]; then
+  if [[ "$normalized_input" == *"SECRET_ERROR"* ]]; then
+    emit_error "SIM_SECRET" "authorization: Bearer bearer-secret at https://user:pass@example.test/path?token=query-secret OPENAI_API_KEY=sk-proj-rawsecret PUPPENCLAW_DAEMON_TOKEN=raw-token Incorrect API key provided: sk-proj-anotherraw"
+    exit 0
+  elif [[ "$normalized_input" == *"FAIL_TURN"* ]]; then
     emit_error "SIM_FAIL" "Simulated turn failure"
     exit 0
   fi

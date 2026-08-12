@@ -1,6 +1,6 @@
 import { createReadStream } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { access, mkdir, open, readFile, rename, stat } from "node:fs/promises";
+import { access, chmod, mkdir, open, readFile, rename, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, isAbsolute, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -16,10 +16,14 @@ export async function ensureDir(path: string): Promise<void> {
   await mkdir(path, { recursive: true });
 }
 
-export async function writeJsonFileAtomic(path: string, value: unknown): Promise<void> {
+export async function writeJsonFileAtomic(
+  path: string,
+  value: unknown,
+  options: { mode?: number } = {}
+): Promise<void> {
   await ensureDir(dirname(path));
   const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  const handle = await open(tmpPath, "w");
+  const handle = await open(tmpPath, "w", options.mode);
   try {
     await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
     await handle.sync();
@@ -27,6 +31,9 @@ export async function writeJsonFileAtomic(path: string, value: unknown): Promise
     await handle.close();
   }
   await rename(tmpPath, path);
+  if (options.mode != null) {
+    await chmod(path, options.mode).catch(() => {});
+  }
   try {
     const dirHandle = await open(dirname(path), "r");
     try {
@@ -148,6 +155,37 @@ export function truncateText(input: string, maxChars: number): { text: string; t
     text: `${input.slice(0, maxChars)}\n\n[truncated]`,
     truncated: true
   };
+}
+
+/** Redact common durable-output secrets while leaving ordinary URLs untouched. */
+export function redactSensitiveText(text: string): string {
+  return text
+    .replace(
+      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/giu,
+      "[redacted private key]"
+    )
+    .replace(
+      /(["']?authorization["']?\s*:\s*["']?\s*bearer\s+)[^\s"',}]+/giu,
+      "$1[redacted]"
+    )
+    .replace(
+      /(["']?\b(?:api[_-]?key|token|secret|password)\b["']?\s*[:=]\s*["']?)[^"',}\s]+/giu,
+      "$1[redacted]"
+    )
+    .replace(
+      /(["']?[A-Z0-9_]{0,128}(?:API_KEY|TOKEN|SECRET|PASSWORD)["']?\s*[:=]\s*["']?)[^"',}\s]+/gu,
+      "$1[redacted]"
+    )
+    .replace(
+      /(\b(?:incorrect|invalid|provided|using)\s+(?:api\s+)?key(?:\s+provided)?\s*[:=]?\s*)\b(?:sk|pk|rk|key)-[A-Za-z0-9._-]+/giu,
+      "$1[redacted]"
+    )
+    .replace(/\b(?:sk|pk|rk)-(?:proj-|ant-)?[A-Za-z0-9._-]{6,}\b/gu, "[redacted]")
+    .replace(/\b(https?:\/\/)([^/\s@]+)@/giu, "$1[redacted]@")
+    .replace(
+      /([?&](?:access[_-]?token|api[_-]?key|auth(?:orization)?|password|secret|signature)=)[^&#\s"'<>]+/giu,
+      "$1[redacted]"
+    );
 }
 
 export async function loadContextFiles(

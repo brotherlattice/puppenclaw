@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { z } from "zod";
@@ -21,12 +21,25 @@ import type {
   SessionInfo,
   SessionQuiescenceReservation,
   StateRecoveryStatus,
-  StoredState
+  StoredState,
+  TurnRequestErrorOutcome,
+  TurnRequestReceipt,
+  TurnRequestSuccessOutcome
 } from "./types.js";
-import { ensureDir, nowIso, quarantineFile, writeJsonFileAtomic } from "./utils.js";
+import {
+  ensureDir,
+  nowIso,
+  quarantineFile,
+  redactSensitiveText,
+  writeJsonFileAtomic
+} from "./utils.js";
 
 const OWNER_LEASE_VERSION = 1 as const;
 const OWNER_LEASE_FILE = ".state-owner.json";
+/** Full terminal outcomes retained per logical session. Older identities become tombstones. */
+export const MAX_TURN_REQUEST_OUTCOMES_PER_SESSION = 64;
+export const MAX_TURN_REQUEST_IDENTITIES_PER_SESSION = 4_096;
+export const MAX_TURN_REPLAY_OUTPUT_CHARS = 200_000;
 const persistedTimestampZod = z.string().min(1).refine(
   (value) => Number.isFinite(Date.parse(value)),
   "Expected a parseable timestamp."
@@ -43,6 +56,8 @@ const transcriptEntryZod = z
 const activeTurnZod = z
   .object({
     id: z.string().min(1),
+    turnKey: z.string().min(1).max(128).regex(/^[a-zA-Z0-9._:-]+$/u).optional(),
+    requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
     state: z.enum(["running", "completed", "failed", "stopped", "orphaned"]),
     startedAt: persistedTimestampZod,
     updatedAt: persistedTimestampZod,
@@ -58,6 +73,13 @@ const activeTurnZod = z
   })
   .strict()
   .superRefine((turn, context) => {
+    if ((turn.turnKey == null) !== (turn.requestFingerprint == null)) {
+      context.addIssue({
+        code: "custom",
+        path: [turn.turnKey == null ? "turnKey" : "requestFingerprint"],
+        message: "A keyed active turn requires both its turn key and request fingerprint."
+      });
+    }
     const startedAt = Date.parse(turn.startedAt);
     const updatedAt = Date.parse(turn.updatedAt);
     if (updatedAt < startedAt) {
@@ -209,6 +231,156 @@ const sessionInfoZod = z
   })
   .strict();
 
+const replaySessionZod = z
+  .object({
+    name: z.string().min(1),
+    state: z.enum(["idle", "running", "waiting_input", "suspended", "completed", "failed", "stopped"]),
+    lastActivity: persistedTimestampZod,
+    pendingQuestion: z.string().optional(),
+    lastError: z.string().optional(),
+    activeTurn: activeTurnZod.optional(),
+    tokenUsage: tokenUsageZod.optional()
+  })
+  .strict();
+
+const turnSignalsZod = z
+  .object({
+    nativeMode: z.string().optional(),
+    plan: z
+      .object({
+        source: z.enum(["acp", "claude-tool"]),
+        entries: z
+          .array(
+            z
+              .object({
+                content: z.string(),
+                status: z.string().optional(),
+                priority: z.string().optional()
+              })
+              .strict()
+          )
+          .optional()
+      })
+      .strict()
+      .optional(),
+    inputRequest: z
+      .object({
+        source: z.literal("claude-tool"),
+        toolName: z.literal("AskUserQuestion"),
+        text: z.string().optional()
+      })
+      .strict()
+      .optional(),
+    stopReason: z.string().optional()
+  })
+  .strict();
+
+const contextFileEntryZod = z
+  .object({
+    path: z.string(),
+    resolvedPath: z.string(),
+    bytes: z.number().int().nonnegative(),
+    truncated: z.boolean()
+  })
+  .strict();
+
+const installedSkillReceiptZod = z
+  .object({
+    name: z.string().min(1),
+    sourcePath: z.string().min(1),
+    targetPath: z.string().min(1)
+  })
+  .strict();
+
+const safeErrorDetailsZod = z.record(
+  z.string(),
+  z.union([z.string(), z.number().finite(), z.boolean(), z.null()])
+);
+
+const turnRequestOutcomeZod = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("success"),
+      version: z.literal(1),
+      summary: z.string().min(1),
+      session: replaySessionZod,
+      output: z.string().max(MAX_TURN_REPLAY_OUTPUT_CHARS),
+      outputRole: z.enum(["assistant", "status"]),
+      turnSignals: turnSignalsZod.optional(),
+      contextFiles: z.array(contextFileEntryZod.omit({ resolvedPath: true }).strict()),
+      skills: z.array(installedSkillReceiptZod.pick({ name: true }).strict()).optional()
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("error"),
+      version: z.literal(1),
+      code: z.string().min(1),
+      message: z.string(),
+      details: safeErrorDetailsZod.optional(),
+      session: replaySessionZod.optional()
+    })
+    .strict()
+]);
+
+const turnRequestReceiptZod = z
+  .object({
+    sessionName: z.string().min(1),
+    turnKey: z.string().min(1).max(128).regex(/^[a-zA-Z0-9._:-]+$/u),
+    operation: z.enum(["start", "send"]),
+    requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+    state: z.enum(["running", "settled", "tombstone"]),
+    acceptedAt: persistedTimestampZod,
+    updatedAt: persistedTimestampZod,
+    completedAt: persistedTimestampZod.optional(),
+    activeTurnId: z.string().min(1).optional(),
+    outcome: turnRequestOutcomeZod.optional()
+  })
+  .strict()
+  .superRefine((receipt, context) => {
+    if (Date.parse(receipt.updatedAt) < Date.parse(receipt.acceptedAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["updatedAt"],
+        message: "Turn-request update time cannot precede acceptance."
+      });
+    }
+    if (receipt.state === "running" && (receipt.completedAt != null || receipt.outcome != null)) {
+      context.addIssue({
+        code: "custom",
+        path: [receipt.completedAt != null ? "completedAt" : "outcome"],
+        message: "An unsettled turn request cannot already have a terminal outcome."
+      });
+    }
+    if (receipt.state === "settled" && (receipt.completedAt == null || receipt.outcome == null)) {
+      context.addIssue({
+        code: "custom",
+        path: [receipt.completedAt == null ? "completedAt" : "outcome"],
+        message: "A settled turn request requires a completion time and outcome."
+      });
+    }
+    if (
+      receipt.state === "tombstone" &&
+      (receipt.completedAt == null || receipt.outcome != null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: [receipt.completedAt == null ? "completedAt" : "outcome"],
+        message: "A turn-request tombstone requires a completion time and no replay payload."
+      });
+    }
+    if (
+      receipt.completedAt != null &&
+      Date.parse(receipt.completedAt) < Date.parse(receipt.acceptedAt)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedAt"],
+        message: "Turn-request completion time cannot precede acceptance."
+      });
+    }
+  });
+
 const exposureRecordZod = z
   .object({
     bindingId: z.string().min(1),
@@ -235,6 +407,14 @@ const storedStateZod = z
   .object({
     version: z.literal(SESSION_STORE_VERSION),
     sessions: z.record(z.string().min(1), sessionInfoZod),
+    turnRequests: z.record(
+      z.string().min(1),
+      z.record(z.string().min(1), turnRequestReceiptZod)
+    ),
+    turnGenerations: z.record(
+      z.string().min(1),
+      z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+    ),
     exposures: z.record(z.string().min(1), exposureRecordZod),
     quiescence: z
       .object({
@@ -266,6 +446,137 @@ const storedStateZod = z
           code: "custom",
           path: ["sessions", name, "handle"],
           message: "Session runtime handle identity does not match its owning session."
+        });
+      }
+    }
+
+    for (const [sessionName, receipts] of Object.entries(state.turnRequests)) {
+      if (
+        Object.values(receipts).filter((receipt) => receipt.state === "settled").length >
+        MAX_TURN_REQUEST_OUTCOMES_PER_SESSION
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["turnRequests", sessionName],
+          message: `Turn-request replay retention exceeds ${MAX_TURN_REQUEST_OUTCOMES_PER_SESSION} outcomes.`
+        });
+      }
+      if (Object.keys(receipts).length > MAX_TURN_REQUEST_IDENTITIES_PER_SESSION) {
+        context.addIssue({
+          code: "custom",
+          path: ["turnRequests", sessionName],
+          message: `Turn-request identity retention exceeds ${MAX_TURN_REQUEST_IDENTITIES_PER_SESSION} keys.`
+        });
+      }
+      let runningReceipts = 0;
+      for (const [turnKey, receipt] of Object.entries(receipts)) {
+        if (receipt.sessionName !== sessionName || receipt.turnKey !== turnKey) {
+          context.addIssue({
+            code: "custom",
+            path: ["turnRequests", sessionName, turnKey],
+            message: "Turn-request map identity does not match its embedded session and key."
+          });
+        }
+        if (receipt.state === "running") {
+          runningReceipts += 1;
+          if (receipt.activeTurnId != null) {
+            const linkedTurn = state.sessions[sessionName]?.activeTurn;
+            if (
+              linkedTurn == null ||
+              linkedTurn.state !== "running" ||
+              linkedTurn.id !== receipt.activeTurnId ||
+              linkedTurn.turnKey !== receipt.turnKey ||
+              linkedTurn.requestFingerprint !== receipt.requestFingerprint
+            ) {
+              context.addIssue({
+                code: "custom",
+                path: ["turnRequests", sessionName, turnKey, "activeTurnId"],
+                message: "A linked running turn request requires its exact running session active turn."
+              });
+            }
+          }
+        }
+        if (receipt.state === "settled" && receipt.activeTurnId != null) {
+          const activeTurn = state.sessions[sessionName]?.activeTurn;
+          if (activeTurn?.id === receipt.activeTurnId && activeTurn.state === "running") {
+            context.addIssue({
+              code: "custom",
+              path: ["turnRequests", sessionName, turnKey, "state"],
+              message: "A settled turn request cannot point at a running active turn."
+            });
+          }
+        }
+        if (
+          receipt.outcome?.kind === "success" &&
+          receipt.outcome.session.name !== sessionName
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["turnRequests", sessionName, turnKey, "outcome", "session", "name"],
+            message: "A replay outcome must belong to its receipt session."
+          });
+        }
+        if (receipt.outcome?.kind === "success") {
+          const replayTurn = receipt.outcome.session.activeTurn;
+          if (
+            receipt.activeTurnId == null ||
+            receipt.outcome.session.state === "running" ||
+            replayTurn == null ||
+            replayTurn.state === "running" ||
+            replayTurn.id !== receipt.activeTurnId ||
+            replayTurn.turnKey !== receipt.turnKey ||
+            replayTurn.requestFingerprint !== receipt.requestFingerprint
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: ["turnRequests", sessionName, turnKey, "outcome", "session"],
+              message: "A successful replay outcome must contain its matching terminal active turn."
+            });
+          }
+        }
+        if (receipt.outcome?.kind === "error" && receipt.activeTurnId != null) {
+          const replayTurn = receipt.outcome.session?.activeTurn;
+          if (
+            replayTurn == null ||
+            receipt.outcome.session?.state === "running" ||
+            replayTurn.state === "running" ||
+            replayTurn.id !== receipt.activeTurnId ||
+            replayTurn.turnKey !== receipt.turnKey ||
+            replayTurn.requestFingerprint !== receipt.requestFingerprint
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: ["turnRequests", sessionName, turnKey, "outcome", "session"],
+              message: "A replay error linked to an active turn requires its matching terminal snapshot."
+            });
+          }
+        }
+      }
+      if (runningReceipts > 1) {
+        context.addIssue({
+          code: "custom",
+          path: ["turnRequests", sessionName],
+          message: "A session cannot have more than one active or ambiguous turn request."
+        });
+      }
+    }
+
+    for (const [sessionName, session] of Object.entries(state.sessions)) {
+      const activeTurn = session.activeTurn;
+      if (activeTurn?.turnKey == null || activeTurn.requestFingerprint == null) {
+        continue;
+      }
+      const receipt = state.turnRequests[sessionName]?.[activeTurn.turnKey];
+      if (
+        receipt == null ||
+        receipt.requestFingerprint !== activeTurn.requestFingerprint ||
+        receipt.activeTurnId !== activeTurn.id ||
+        (activeTurn.state === "running" && receipt.state !== "running")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["sessions", sessionName, "activeTurn"],
+          message: "A keyed active turn must match its durable turn-request receipt."
         });
       }
     }
@@ -343,6 +654,8 @@ function freshState(): StoredState {
   return {
     version: SESSION_STORE_VERSION,
     sessions: {},
+    turnRequests: {},
+    turnGenerations: {},
     exposures: {},
     quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
   };
@@ -363,6 +676,13 @@ export class SessionStore {
     const ownerLease = await acquireOwnerLease(rootDir);
     try {
       const loaded = await loadStoredState(join(rootDir, "state.json"));
+      if (process.platform !== "win32") {
+        await chmod(join(rootDir, "state.json"), 0o600).catch((error) => {
+          if (!isNodeError(error, "ENOENT")) {
+            throw error;
+          }
+        });
+      }
       return new SessionStore(rootDir, loaded.state, loaded.recovery, ownerLease);
     } catch (error) {
       await releaseOwnerLease(rootDir, ownerLease);
@@ -388,7 +708,7 @@ export class SessionStore {
     }
     await this.enqueueMutation(async () => {
       const nextState = freshState();
-      await writeJsonFileAtomic(this.statePath, nextState);
+      await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
       this.state = nextState;
       this.recovery = { required: false };
     });
@@ -412,6 +732,198 @@ export class SessionStore {
 
   getSession(name: string): SessionInfo | null {
     return this.state.sessions[name] ?? null;
+  }
+
+  getTurnRequest(sessionName: string, turnKey: string): TurnRequestReceipt | null {
+    return this.state.turnRequests[sessionName]?.[turnKey] ?? null;
+  }
+
+  getTurnRequests(sessionName: string): Record<string, TurnRequestReceipt> {
+    return this.state.turnRequests[sessionName] ?? {};
+  }
+
+  listRunningTurnRequests(): TurnRequestReceipt[] {
+    return Object.values(this.state.turnRequests)
+      .flatMap((receipts) => Object.values(receipts))
+      .filter((receipt) => receipt.state === "running");
+  }
+
+  getTurnGeneration(sessionName: string): number {
+    return this.state.turnGenerations[sessionName] ?? 0;
+  }
+
+  async claimTurnRequest(params: {
+    sessionName: string;
+    turnKey: string;
+    operation: "start" | "send";
+    requestFingerprint: string;
+  }): Promise<TurnRequestReceipt> {
+    return await this.mutate((state) => {
+      assertSessionMutable(state, params.sessionName);
+      const receipts = (state.turnRequests[params.sessionName] ??= {});
+      if (receipts[params.turnKey] != null) {
+        throw new PuppenclawError(
+          "TURN_KEY_ALREADY_CLAIMED",
+          `Turn key ${params.turnKey} is already claimed for session ${params.sessionName}.`
+        );
+      }
+      const unsettled = Object.values(receipts).find((receipt) => receipt.state === "running");
+      if (unsettled != null) {
+        throw new PuppenclawError(
+          "TURN_REPLAY_UNAVAILABLE",
+          `Session ${params.sessionName} has active or ambiguous turn key ${unsettled.turnKey}; refusing another dispatch.`,
+          { name: params.sessionName, turnKey: unsettled.turnKey }
+        );
+      }
+      if (Object.keys(receipts).length >= MAX_TURN_REQUEST_IDENTITIES_PER_SESSION) {
+        throw new PuppenclawError(
+          "TURN_RECEIPT_CAPACITY_REACHED",
+          `Session ${params.sessionName} has reached its durable ${MAX_TURN_REQUEST_IDENTITIES_PER_SESSION}-key identity limit; explicitly purge it before accepting another key.`,
+          {
+            name: params.sessionName,
+            maximum: MAX_TURN_REQUEST_IDENTITIES_PER_SESSION
+          }
+        );
+      }
+      compactOldestReplayOutcome(receipts);
+      const acceptedAt = nowIso();
+      const receipt: TurnRequestReceipt = {
+        sessionName: params.sessionName,
+        turnKey: params.turnKey,
+        operation: params.operation,
+        requestFingerprint: params.requestFingerprint,
+        state: "running",
+        acceptedAt,
+        updatedAt: acceptedAt
+      };
+      receipts[params.turnKey] = receipt;
+      return receipt;
+    });
+  }
+
+  async patchSessionAndLinkTurnRequest(
+    sessionName: string,
+    turnKey: string,
+    requestFingerprint: string,
+    patch: (current: SessionInfo | null) => SessionInfo
+  ): Promise<SessionInfo> {
+    return await this.mutate((state) => {
+      assertSessionMutable(state, sessionName);
+      const receipt = requireRunningTurnRequest(
+        state,
+        sessionName,
+        turnKey,
+        requestFingerprint
+      );
+      const next = patch(state.sessions[sessionName] ?? null);
+      const activeTurn = next.activeTurn;
+      if (
+        activeTurn?.turnKey !== turnKey ||
+        activeTurn.requestFingerprint !== requestFingerprint
+      ) {
+        throw new PuppenclawError(
+          "INVALID_STATE_MUTATION",
+          `Active turn for ${sessionName} does not link to turn key ${turnKey}.`
+        );
+      }
+      state.sessions[sessionName] = next;
+      receipt.activeTurnId = activeTurn.id;
+      receipt.updatedAt = nowIso();
+      return next;
+    });
+  }
+
+  async patchSessionAndSettleTurnRequest(
+    sessionName: string,
+    turnKey: string,
+    requestFingerprint: string,
+    patch: (current: SessionInfo | null) => SessionInfo,
+    outcome:
+      | Omit<TurnRequestSuccessOutcome, "session">
+      | TurnRequestErrorOutcome
+  ): Promise<SessionInfo> {
+    return await this.mutate((state) => {
+      assertSessionMutable(state, sessionName);
+      const receipt = requireRunningTurnRequest(
+        state,
+        sessionName,
+        turnKey,
+        requestFingerprint
+      );
+      const next = patch(state.sessions[sessionName] ?? null);
+      state.sessions[sessionName] = next;
+      const completedAt = nowIso();
+      receipt.state = "settled";
+      receipt.updatedAt = completedAt;
+      receipt.completedAt = completedAt;
+      receipt.outcome =
+        outcome.kind === "success"
+          ? compactSuccessOutcome(outcome, next)
+          : { ...outcome, ...(receipt.activeTurnId != null ? { session: replaySessionSnapshot(next) } : {}) };
+      return next;
+    });
+  }
+
+  async settleTurnRequestError(
+    sessionName: string,
+    turnKey: string,
+    requestFingerprint: string,
+    outcome: TurnRequestErrorOutcome
+  ): Promise<TurnRequestReceipt> {
+    return await this.mutate((state) => {
+      const receipt = requireRunningTurnRequest(
+        state,
+        sessionName,
+        turnKey,
+        requestFingerprint
+      );
+      const completedAt = nowIso();
+      receipt.state = "settled";
+      receipt.updatedAt = completedAt;
+      receipt.completedAt = completedAt;
+      const session = state.sessions[sessionName];
+      receipt.outcome = {
+        ...outcome,
+        ...(receipt.activeTurnId != null && session != null
+          ? { session: replaySessionSnapshot(session) }
+          : {})
+      };
+      return receipt;
+    });
+  }
+
+  async settleTurnRequestDuringReconciliation(
+    sessionName: string,
+    turnKey: string,
+    requestFingerprint: string,
+    outcome: TurnRequestErrorOutcome,
+    patch?: (current: SessionInfo) => SessionInfo
+  ): Promise<TurnRequestReceipt> {
+    return await this.mutate((state) => {
+      const receipt = requireRunningTurnRequest(
+        state,
+        sessionName,
+        turnKey,
+        requestFingerprint
+      );
+      const current = state.sessions[sessionName];
+      let next = current;
+      if (current != null && patch != null) {
+        next = patch(current);
+        state.sessions[sessionName] = next;
+      }
+      const completedAt = nowIso();
+      receipt.state = "settled";
+      receipt.updatedAt = completedAt;
+      receipt.completedAt = completedAt;
+      receipt.outcome = {
+        ...outcome,
+        ...(receipt.activeTurnId != null && next != null
+          ? { session: replaySessionSnapshot(next) }
+          : {})
+      };
+      return receipt;
+    });
   }
 
   async upsertSession(session: SessionInfo): Promise<void> {
@@ -465,11 +977,21 @@ export class SessionStore {
 
   async removeSession(name: string): Promise<boolean> {
     return await this.mutate((state) => {
-      if (!(name in state.sessions)) {
-        return false;
-      }
+      const existed = name in state.sessions || name in state.turnRequests;
       delete state.sessions[name];
-      return true;
+      // Explicit purge is the data-forgetting boundary. Its caller must first
+      // prove that no keyed work can survive; only then are replay outcomes
+      // removed with the session transcript they contain.
+      delete state.turnRequests[name];
+      const generation = state.turnGenerations[name] ?? 0;
+      if (!Number.isSafeInteger(generation) || generation >= Number.MAX_SAFE_INTEGER) {
+        throw new PuppenclawError(
+          "TURN_GENERATION_EXHAUSTED",
+          `Session ${name} cannot allocate another purge generation.`
+        );
+      }
+      state.turnGenerations[name] = generation + 1;
+      return existed;
     });
   }
 
@@ -671,7 +1193,7 @@ export class SessionStore {
           `Refusing to persist invalid session state: ${z.prettifyError(validated.error)}`
         );
       }
-      await writeJsonFileAtomic(this.statePath, nextState);
+      await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
       this.state = nextState;
       return result;
     });
@@ -764,45 +1286,45 @@ function upgradeCompatibleState(value: unknown): unknown {
   }
   const state = value as Record<string, unknown>;
   const rawQuiescence = state.quiescence;
+  let quiescence = rawQuiescence;
   if (
-    rawQuiescence == null ||
-    typeof rawQuiescence !== "object" ||
-    Array.isArray(rawQuiescence) ||
-    "latestByName" in rawQuiescence
+    rawQuiescence != null &&
+    typeof rawQuiescence === "object" &&
+    !Array.isArray(rawQuiescence) &&
+    !("latestByName" in rawQuiescence)
   ) {
-    return value;
-  }
-  const quiescence = rawQuiescence as Record<string, unknown>;
-  const active =
-    quiescence.active != null &&
-    typeof quiescence.active === "object" &&
-    !Array.isArray(quiescence.active)
-      ? (quiescence.active as Record<string, unknown>)
-      : {};
-  const latestByName: Record<string, number> = {};
-  for (const [name, rawReservation] of Object.entries(active)) {
-    if (
-      rawReservation != null &&
-      typeof rawReservation === "object" &&
-      !Array.isArray(rawReservation)
-    ) {
-      const reservation = rawReservation as Record<string, unknown>;
+    const legacyQuiescence = rawQuiescence as Record<string, unknown>;
+    const active =
+      legacyQuiescence.active != null &&
+      typeof legacyQuiescence.active === "object" &&
+      !Array.isArray(legacyQuiescence.active)
+        ? (legacyQuiescence.active as Record<string, unknown>)
+        : {};
+    const latestByName: Record<string, number> = {};
+    for (const [name, rawReservation] of Object.entries(active)) {
       if (
-        reservation.purpose === "external" &&
-        typeof reservation.epoch === "number" &&
-        Number.isSafeInteger(reservation.epoch) &&
-        reservation.epoch > 0
+        rawReservation != null &&
+        typeof rawReservation === "object" &&
+        !Array.isArray(rawReservation)
       ) {
-        latestByName[name] = reservation.epoch;
+        const reservation = rawReservation as Record<string, unknown>;
+        if (
+          reservation.purpose === "external" &&
+          typeof reservation.epoch === "number" &&
+          Number.isSafeInteger(reservation.epoch) &&
+          reservation.epoch > 0
+        ) {
+          latestByName[name] = reservation.epoch;
+        }
       }
     }
+    quiescence = { ...legacyQuiescence, latestByName };
   }
   return {
     ...state,
-    quiescence: {
-      ...quiescence,
-      latestByName
-    }
+    ...(state.turnRequests == null ? { turnRequests: {} } : {}),
+    ...(state.turnGenerations == null ? { turnGenerations: {} } : {}),
+    ...(quiescence !== rawQuiescence ? { quiescence } : {})
   };
 }
 
@@ -980,6 +1502,100 @@ function isNodeError(error: unknown, code: string): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function replaySessionSnapshot(
+  session: SessionInfo
+): TurnRequestSuccessOutcome["session"] {
+  return structuredClone({
+    name: session.name,
+    state: session.state,
+    lastActivity: session.lastActivity,
+    ...(session.pendingQuestion != null
+      ? { pendingQuestion: redactSensitiveText(session.pendingQuestion) }
+      : {}),
+    ...(session.lastError != null ? { lastError: redactSensitiveText(session.lastError) } : {}),
+    ...(session.activeTurn != null
+      ? {
+          activeTurn: {
+            ...session.activeTurn,
+            ...(session.activeTurn.error != null
+              ? { error: redactSensitiveText(session.activeTurn.error) }
+              : {})
+          }
+        }
+      : {}),
+    ...(session.tokenUsage != null ? { tokenUsage: session.tokenUsage } : {})
+  });
+}
+
+function compactSuccessOutcome(
+  outcome: Omit<TurnRequestSuccessOutcome, "session">,
+  session: SessionInfo
+): TurnRequestSuccessOutcome {
+  const sanitizedOutput = redactSensitiveText(outcome.output);
+  const truncationMarker = `[replay output truncated: kept latest content within ${MAX_TURN_REPLAY_OUTPUT_CHARS} chars]\n`;
+  return {
+    ...outcome,
+    output:
+      sanitizedOutput.length <= MAX_TURN_REPLAY_OUTPUT_CHARS
+        ? sanitizedOutput
+        : `${truncationMarker}${sanitizedOutput.slice(
+            -(MAX_TURN_REPLAY_OUTPUT_CHARS - truncationMarker.length)
+          )}`,
+    session: replaySessionSnapshot(session)
+  };
+}
+
+function compactOldestReplayOutcome(
+  receipts: Record<string, TurnRequestReceipt>
+): void {
+  const settled = Object.values(receipts)
+    .filter((receipt) => receipt.state === "settled")
+    .sort((left, right) => {
+      const byCompletion = Date.parse(left.completedAt ?? left.updatedAt) - Date.parse(right.completedAt ?? right.updatedAt);
+      return byCompletion !== 0
+        ? byCompletion
+        : left.turnKey.localeCompare(right.turnKey);
+    });
+  if (settled.length < MAX_TURN_REQUEST_OUTCOMES_PER_SESSION) {
+    return;
+  }
+  const oldest = settled[0];
+  if (oldest == null) {
+    return;
+  }
+  oldest.state = "tombstone";
+  delete oldest.outcome;
+  oldest.updatedAt = nowIso();
+}
+
+function requireRunningTurnRequest(
+  state: StoredState,
+  sessionName: string,
+  turnKey: string,
+  requestFingerprint: string
+): TurnRequestReceipt {
+  const receipt = state.turnRequests[sessionName]?.[turnKey];
+  if (receipt == null) {
+    throw new PuppenclawError(
+      "TURN_RECEIPT_MISSING",
+      `Turn key ${turnKey} has no durable receipt for session ${sessionName}.`
+    );
+  }
+  if (receipt.requestFingerprint !== requestFingerprint) {
+    throw new PuppenclawError(
+      "TURN_KEY_CONFLICT",
+      `Turn key ${turnKey} was already used for a different request in session ${sessionName}.`
+    );
+  }
+  if (receipt.state !== "running") {
+    throw new PuppenclawError(
+      "TURN_RECEIPT_ALREADY_SETTLED",
+      `Turn key ${turnKey} is already settled for session ${sessionName}.`
+    );
+  }
+  return receipt;
 }
 
 function assertSessionMutable(state: StoredState, name: string): void {

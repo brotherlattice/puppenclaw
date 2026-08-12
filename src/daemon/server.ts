@@ -46,7 +46,7 @@ import {
   workerManifestZod
 } from "../shared/schema.js";
 import type { ParsedPluginConfig, StateRecoveryStatus, ToolResult } from "../shared/types.js";
-import { ensureDir } from "../shared/utils.js";
+import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 
 export async function createDaemonServer(params: {
   config: ParsedPluginConfig;
@@ -68,13 +68,16 @@ export async function createDaemonServer(params: {
 
   app.setErrorHandler((error, _request, reply) => {
     if (!(error instanceof PuppenclawError)) {
+      if (error instanceof Error) {
+        error.message = redactSensitiveText(error.message);
+      }
       return reply.send(error);
     }
     const details = daemonLifecycleErrorDetails(error);
     return reply.code(daemonStatusForError(error.code)).send({
       ok: false,
       code: error.code,
-      error: error.message,
+      error: redactSensitiveText(error.message),
       ...(details != null ? { details } : {})
     });
   });
@@ -212,6 +215,15 @@ export async function createDaemonServer(params: {
     sessionStartStream: true,
     sessionSend: true,
     sessionSendStream: true,
+    sessionTurnIdempotency: {
+      version: 1,
+      durable: true,
+      concurrentWait: true,
+      terminalReplay: true,
+      requestFingerprint: true,
+      terminalReplayRetention: 64,
+      turnKeyRetention: 4096
+    },
     sessionModelProviderRefresh: true,
     interactionModes: ["plan", "execute"],
     codexTurnPolicy: {
@@ -404,6 +416,7 @@ export async function createDaemonServer(params: {
       reply,
       sessionName: parsed.name,
       outputRouter,
+      subscribeToSessionOutput: parsed.turnKey == null,
       run: async () => ok(await manager.start(parsed))
     });
   });
@@ -428,6 +441,7 @@ export async function createDaemonServer(params: {
       reply,
       sessionName: parsed.name,
       outputRouter,
+      subscribeToSessionOutput: parsed.turnKey == null,
       run: async () => ok(await manager.send(parsed))
     });
   });
@@ -696,6 +710,10 @@ function daemonStatusForError(code: string): number {
     case "LIFECYCLE_EPOCH_REQUIRED":
     case "STALE_LIFECYCLE_EPOCH":
     case "TURN_ALREADY_RUNNING":
+    case "TURN_KEY_CONFLICT":
+    case "TURN_REPLAY_UNAVAILABLE":
+    case "TURN_RECEIPT_CAPACITY_REACHED":
+    case "STALE_TURN_GENERATION":
     case "FORK_TARGET_CLAIMED":
     case "RECOVERY_FENCE_ACTIVE":
       return 409;
@@ -709,6 +727,7 @@ function daemonStatusForError(code: string): number {
 }
 
 function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unknown> | null {
+  const turnReceipt = parseTurnReceipt(error.details?.turnReceipt);
   if (
     ![
       "NO_SESSION",
@@ -716,15 +735,20 @@ function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unk
       "STALE_QUIESCENCE_EPOCH",
       "LIFECYCLE_EPOCH_REQUIRED",
       "STALE_LIFECYCLE_EPOCH",
+      "TURN_KEY_CONFLICT",
+      "TURN_REPLAY_UNAVAILABLE",
       "QUIESCENCE_UNAVAILABLE"
     ].includes(error.code) ||
     error.details == null
   ) {
-    return null;
+    return turnReceipt == null ? null : { turnReceipt };
   }
-  const details: Record<string, unknown> = {};
+  const details: Record<string, unknown> = {
+    ...(turnReceipt != null ? { turnReceipt } : {})
+  };
   for (const key of [
     "name",
+    "turnKey",
     "quiescenceEpoch",
     "requestedEpoch",
     "activeEpoch",
@@ -747,10 +771,22 @@ function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unk
   return details;
 }
 
+function parseTurnReceipt(value: unknown): { turnKey: string; state: "accepted" | "replayed" } | null {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const turnKey = (value as { turnKey?: unknown }).turnKey;
+  const state = (value as { state?: unknown }).state;
+  return typeof turnKey === "string" && (state === "accepted" || state === "replayed")
+    ? { turnKey, state }
+    : null;
+}
+
 async function streamToolResult(params: {
   reply: FastifyReply;
   sessionName: string;
   outputRouter: OutputRouter;
+  subscribeToSessionOutput?: boolean;
   run: () => Promise<ToolResult>;
 }): Promise<FastifyReply> {
   let closed = false;
@@ -782,21 +818,26 @@ async function streamToolResult(params: {
     params.reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
   };
 
-  const subscription = params.outputRouter.attach(params.sessionName, (event) => {
-    write(event);
-  });
+  const subscription =
+    params.subscribeToSessionOutput === false
+      ? null
+      : params.outputRouter.attach(params.sessionName, (event) => {
+          write(event);
+        });
 
   try {
-    write({
-      kind: "chunk",
-      sessionName: params.sessionName,
-      text: ""
-    });
+    if (subscription != null) {
+      write({
+        kind: "chunk",
+        sessionName: params.sessionName,
+        text: ""
+      });
+    }
     const result = await params.run();
     write({ kind: "result", result });
     write({ kind: "done" });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
     const lifecycleDetails =
       error instanceof PuppenclawError ? daemonLifecycleErrorDetails(error) : null;
     write({
@@ -812,7 +853,9 @@ async function streamToolResult(params: {
     // Identity-guarded: only removes this stream's own subscription, so a
     // racing second stream (e.g. rejected with TURN_ALREADY_RUNNING) can
     // never silence the first stream's live dispatcher.
-    params.outputRouter.detach(subscription);
+    if (subscription != null) {
+      params.outputRouter.detach(subscription);
+    }
     if (!params.reply.raw.writableEnded) {
       params.reply.raw.end();
     }

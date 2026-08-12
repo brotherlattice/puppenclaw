@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
-import { dirname, extname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, extname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SessionStore } from "../shared/store.js";
@@ -18,6 +18,10 @@ import {
   resolveReasoningMode
 } from "../shared/reasoning.js";
 import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
+import {
+  fingerprintSendRequest,
+  fingerprintStartRequest
+} from "../shared/turn-idempotency.js";
 import type {
   ActiveTurnLifecycleState,
   ActiveTurnMetadata,
@@ -47,11 +51,19 @@ import type {
   SuspendParams,
   ToolResult,
   TokenUsage,
+  TurnRequestErrorOutcome,
+  TurnRequestReceipt,
+  TurnRequestSuccessOutcome,
   TurnOutputRole,
   TurnSignals,
   UnfocusParams
 } from "../shared/types.js";
-import { loadContextFiles, nowIso, summarizePromptEvents } from "../shared/utils.js";
+import {
+  loadContextFiles,
+  nowIso,
+  redactSensitiveText,
+  summarizePromptEvents
+} from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -89,6 +101,77 @@ type TurnResult = {
 
 function outputRoleForTurn(turn: TurnResult): TurnOutputRole {
   return turn.state === "failed" ? "status" : "assistant";
+}
+
+function withTurnReceipt(
+  result: ToolResult,
+  turnKey: string,
+  state: "accepted" | "replayed"
+): ToolResult {
+  return {
+    ...result,
+    details: {
+      ...result.details,
+      turnReceipt: { turnKey, state }
+    }
+  };
+}
+
+function toolResultFromTurnOutcome(
+  outcome: TurnRequestSuccessOutcome,
+  turnKey: string,
+  receiptState: "accepted" | "replayed"
+): ToolResult {
+  return withTurnReceipt(
+    textToolResult(outcome.summary, {
+      session: outcome.session,
+      output: outcome.output,
+      outputRole: outcome.outputRole,
+      ...(outcome.turnSignals != null ? { turnSignals: outcome.turnSignals } : {}),
+      contextFiles: outcome.contextFiles,
+      ...(outcome.skills != null ? { skills: outcome.skills } : {})
+    }),
+    turnKey,
+    receiptState
+  );
+}
+
+function durableTurnError(error: unknown): TurnRequestErrorOutcome {
+  const source = ensureError(error);
+  const details: Record<string, string | number | boolean | null> = {};
+  if (error instanceof PuppenclawError && error.details != null) {
+    for (const [key, value] of Object.entries(error.details)) {
+      if (/(?:auth|credential|password|provider|secret|token|url)/iu.test(key)) {
+        continue;
+      }
+      if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean" ||
+        value === null
+      ) {
+        details[key] = typeof value === "string" ? sanitizeActiveTurnText(value) : value;
+      }
+    }
+  }
+  return {
+    version: 1,
+    kind: "error",
+    code: error instanceof PuppenclawError ? error.code : "TURN_EXECUTION_FAILED",
+    message: sanitizeActiveTurnText(source.message),
+    ...(Object.keys(details).length > 0 ? { details } : {})
+  };
+}
+
+function throwDurableTurnError(
+  outcome: TurnRequestErrorOutcome,
+  turnKey: string,
+  state: "accepted" | "replayed"
+): never {
+  throw new PuppenclawError(outcome.code, outcome.message, {
+    ...outcome.details,
+    turnReceipt: { turnKey, state }
+  });
 }
 
 type ActiveTurnOutput = {
@@ -139,6 +222,14 @@ type InstalledSkill = {
   name: string;
   sourcePath: string;
   targetPath: string;
+};
+
+type KeyedTurnExecution = {
+  turnKey: string;
+  requestFingerprint: string;
+  promise: Promise<ToolResult>;
+  resolve: (result: ToolResult) => void;
+  reject: (error: unknown) => void;
 };
 
 type AvailableSkill = {
@@ -830,19 +921,7 @@ function isToolOutputEvent(type: string, subjectType: string): boolean {
 }
 
 function sanitizeActiveTurnText(text: string): string {
-  return text
-    .replace(
-      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/giu,
-      "[redacted private key]"
-    )
-    .replace(
-      /(["']?authorization["']?\s*:\s*["']?\s*bearer\s+)[^\s"',}]+/giu,
-      "$1[redacted]"
-    )
-    .replace(
-      /(["']?\b(?:api[_-]?key|token|secret|password)\b["']?\s*[:=]\s*["']?)[^"',}\s]+/giu,
-      "$1[redacted]"
-    );
+  return redactSensitiveText(text);
 }
 
 function truncateOneLine(text: string, maxChars: number): string {
@@ -1314,6 +1393,13 @@ function resolveSpawnCommand(commandText: string, args: string[]): SpawnCommand 
   };
 }
 
+function childExit(child: ChildProcess): Promise<number | null> {
+  return new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code));
+  });
+}
+
 function shouldUseShellForSpawnCommand(command: string): boolean {
   if (process.platform !== "win32") {
     return false;
@@ -1392,6 +1478,7 @@ export class AcpxSessionManager implements ISessionManager {
     string,
     { promise: Promise<void>; resolve: () => void }
   >();
+  private readonly keyedTurnExecutions = new Map<string, KeyedTurnExecution>();
   /**
    * Model/effort config options last applied to each live ACP runtime. Each
    * redundant `set` control command pays a full adapter spawn (~8s); acpx
@@ -1441,8 +1528,18 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async start(params: StartParams): Promise<ToolResult> {
-    return await this.withSessionTurnLock(params.name, params.lifecycleEpoch, async () =>
-      await this.startTurn(params)
+    return await this.runSessionTurn(
+      params.name,
+      params.lifecycleEpoch,
+      this.deps.store.getTurnGeneration(params.name),
+      params.turnKey == null
+        ? undefined
+        : {
+            operation: "start",
+            turnKey: params.turnKey,
+            requestFingerprint: fingerprintStartRequest(params)
+          },
+      async () => await this.startTurn(params)
     );
   }
 
@@ -1484,6 +1581,7 @@ export class AcpxSessionManager implements ISessionManager {
       }
 
       const installedSkills = await this.installSessionSkills(directory, requestedSkills);
+      this.assertTurnWasNotStopped(params.name);
       const installedSkillNames = installedSkills.map((skill) => skill.name);
       const baseSession =
         existing ??
@@ -1535,6 +1633,7 @@ export class AcpxSessionManager implements ISessionManager {
       // Persist the identity before starting external runtime work. A cleanup
       // request racing an ambiguous start response can then fence this runtime.
       await this.deps.store.upsertSession(provisionalSession);
+      this.assertTurnWasNotStopped(params.name);
 
       try {
         if (!this.usesOneShotRuntime(session)) {
@@ -1550,7 +1649,10 @@ export class AcpxSessionManager implements ISessionManager {
           });
         }
 
+        this.assertTurnWasNotStopped(params.name);
+
         const context = await loadContextFiles(directory, params.contextFiles);
+        this.assertTurnWasNotStopped(params.name);
         const promptText = [
           interactionPromptPrefix(params.interactionMode),
           this.buildPlanningPromptPrefix({
@@ -1581,6 +1683,7 @@ export class AcpxSessionManager implements ISessionManager {
             ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
           });
         } catch (error) {
+          const durableError = durableTurnError(error);
           await this.persistFinalTurnSession(
             params.name,
             "failed",
@@ -1588,10 +1691,11 @@ export class AcpxSessionManager implements ISessionManager {
               ...current,
               state: "failed",
               lastActivity: nowIso(),
-              lastError: ensureError(error).message,
+              lastError: durableError.message,
               ...(activeTurn != null ? { activeTurn } : {})
             }),
-            ensureError(error).message
+            durableError.message,
+            durableError
           );
           throw error;
         }
@@ -1629,7 +1733,21 @@ export class AcpxSessionManager implements ISessionManager {
             ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {}),
             ...(activeTurn != null ? { activeTurn } : {})
           }),
-          turn.state === "failed" ? turn.output : undefined
+          turn.state === "failed" ? turn.output : undefined,
+          {
+            kind: "success",
+            version: 1,
+            summary: `Started session ${params.name}.`,
+            output: turn.output,
+            outputRole: outputRoleForTurn(turn),
+            ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
+            contextFiles: context.files.map((file) => ({
+              path: basename(file.path),
+              bytes: file.bytes,
+              truncated: file.truncated
+            })),
+            skills: installedSkills.map(({ name }) => ({ name }))
+          }
         );
         this.recordTurnUsage(nextSession, turn);
         return textToolResult(`Started session ${params.name}.`, {
@@ -1641,7 +1759,10 @@ export class AcpxSessionManager implements ISessionManager {
           skills: installedSkills
         });
       } catch (error) {
-        if (this.deps.store.getActiveQuiescenceEpoch(params.name) == null) {
+        if (
+          this.keyedTurnExecutions.get(params.name) == null &&
+          this.deps.store.getActiveQuiescenceEpoch(params.name) == null
+        ) {
           await this.deps.store.patchSession(params.name, (current) => {
             if (current?.state === "stopped" || current?.activeTurn?.state === "failed") {
               return current;
@@ -1659,7 +1780,18 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async send(params: SendParams): Promise<ToolResult> {
-    return await this.withSessionTurnLock(params.name, params.lifecycleEpoch, async () => {
+    return await this.runSessionTurn(
+      params.name,
+      params.lifecycleEpoch,
+      this.deps.store.getTurnGeneration(params.name),
+      params.turnKey == null
+        ? undefined
+        : {
+            operation: "send",
+            turnKey: params.turnKey,
+            requestFingerprint: fingerprintSendRequest(params)
+          },
+      async () => {
       const storedSession = this.requireSession(params.name);
       const providerRefresh = await this.prepareModelProviderRefresh(storedSession, params);
       const session = providerRefresh.session;
@@ -1724,6 +1856,7 @@ export class AcpxSessionManager implements ISessionManager {
           ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
         });
       } catch (error) {
+        const durableError = durableTurnError(error);
         await this.persistFinalTurnSession(
           params.name,
           "failed",
@@ -1731,10 +1864,11 @@ export class AcpxSessionManager implements ISessionManager {
             ...current,
             state: "failed",
             lastActivity: nowIso(),
-            lastError: ensureError(error).message,
+            lastError: durableError.message,
             ...(activeTurn != null ? { activeTurn } : {})
           }),
-          ensureError(error).message
+          durableError.message,
+          durableError
         );
         throw error;
       }
@@ -1770,7 +1904,20 @@ export class AcpxSessionManager implements ISessionManager {
           ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {}),
           ...(activeTurn != null ? { activeTurn } : {})
         }),
-        turn.state === "failed" ? turn.output : undefined
+        turn.state === "failed" ? turn.output : undefined,
+        {
+          kind: "success",
+          version: 1,
+          summary: `Updated session ${params.name}.`,
+          output: turn.output,
+          outputRole: outputRoleForTurn(turn),
+          ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
+          contextFiles: context.files.map((file) => ({
+            path: basename(file.path),
+            bytes: file.bytes,
+            truncated: file.truncated
+          }))
+        }
       );
       this.recordTurnUsage(nextSession, turn);
       return textToolResult(`Updated session ${params.name}.`, {
@@ -1780,13 +1927,61 @@ export class AcpxSessionManager implements ISessionManager {
         ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
         contextFiles: context.files
       });
-    });
+      }
+    );
   }
 
   async stop(params: StopParams): Promise<ToolResult> {
     return await this.withLifecycleLock(params.name, async () => {
       this.deps.store.assertSessionMutable(params.name);
-      const session = this.requireSession(params.name);
+      let runningReceipt = Object.values(this.deps.store.getTurnRequests(params.name)).find(
+        (receipt) => receipt.state === "running"
+      );
+      let session = this.deps.store.getSession(params.name);
+      const hadUnpublishedTurn = session == null && this.activeTurns.has(params.name);
+      if (hadUnpublishedTurn) {
+        this.stopRequests.add(params.name);
+        this.terminateActiveTurnProcess(params.name, "SIGTERM");
+        const drained = await this.waitForActiveTurnDrain(params.name);
+        if (!drained) {
+          throw new PuppenclawError(
+            "QUIESCENCE_UNAVAILABLE",
+            `Unpublished turn for session ${params.name} did not drain after Stop.`
+          );
+        }
+        session = this.deps.store.getSession(params.name);
+        runningReceipt = Object.values(this.deps.store.getTurnRequests(params.name)).find(
+          (receipt) => receipt.state === "running"
+        );
+      }
+      if (session == null) {
+        if (runningReceipt == null) {
+          if (hadUnpublishedTurn) {
+            this.stopRequests.delete(params.name);
+            return textToolResult(`Stopped unpublished turn for session ${params.name}.`, {
+              sessionName: params.name,
+              stopped: true
+            });
+          }
+          throw new PuppenclawError("NO_SESSION", `Unknown session ${params.name}.`);
+        }
+        await this.deps.store.settleTurnRequestError(
+          params.name,
+          runningReceipt.turnKey,
+          runningReceipt.requestFingerprint,
+          durableTurnError(
+            new PuppenclawError(
+              "TURN_ABORTED",
+              `Unpublished turn ${runningReceipt.turnKey} was stopped by the operator before replay could be proved.`
+            )
+          )
+        );
+        this.stopRequests.delete(params.name);
+        return textToolResult(`Stopped unresolved turn for session ${params.name}.`, {
+          sessionName: params.name,
+          turnReceipt: { turnKey: runningReceipt.turnKey, state: "accepted" }
+        });
+      }
       const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
       this.stopRequests.add(params.name);
       const hadActiveTurn = this.activeTurns.has(params.name);
@@ -1814,6 +2009,18 @@ export class AcpxSessionManager implements ISessionManager {
         }, 2_000);
         forceKillTimer.unref();
       }
+      if (hadActiveTurn) {
+        const drained = await this.waitForActiveTurnDrain(params.name);
+        if (!drained) {
+          throw new PuppenclawError(
+            "QUIESCENCE_UNAVAILABLE",
+            `Session ${params.name} did not drain after Stop.`
+          );
+        }
+        runningReceipt = Object.values(this.deps.store.getTurnRequests(params.name)).find(
+          (receipt) => receipt.state === "running"
+        );
+      }
 
       const nextSession: SessionInfo = {
         ...session,
@@ -1821,7 +2028,7 @@ export class AcpxSessionManager implements ISessionManager {
         lastActivity: nowIso(),
         lastStopReason: "stopped by user"
       };
-      const persistedSession = await this.deps.store.patchSession(params.name, (current) => {
+      const stopPatch = (current: SessionInfo | null): SessionInfo => {
         const latest = current ?? nextSession;
         const stoppedAt = nowIso();
         return {
@@ -1840,7 +2047,26 @@ export class AcpxSessionManager implements ISessionManager {
               }
             : {})
         };
-      });
+      };
+      const hasLocalKeyedExecution = this.keyedTurnExecutions.has(params.name);
+      let persistedSession: SessionInfo | null;
+      if (runningReceipt != null && !hasLocalKeyedExecution) {
+        await this.deps.store.settleTurnRequestDuringReconciliation(
+          params.name,
+          runningReceipt.turnKey,
+          runningReceipt.requestFingerprint,
+          durableTurnError(
+            new PuppenclawError(
+              "TURN_ABORTED",
+              `Turn ${runningReceipt.turnKey} was stopped by the operator.`
+            )
+          ),
+          (current) => stopPatch(current)
+        );
+        persistedSession = this.deps.store.getSession(params.name);
+      } else {
+        persistedSession = await this.deps.store.patchSession(params.name, stopPatch);
+      }
       if (!hadActiveTurn) {
         this.stopRequests.delete(params.name);
       }
@@ -2290,7 +2516,11 @@ export class AcpxSessionManager implements ISessionManager {
     return await this.withLifecycleLock(params.name, async () => {
       const existingReservation = this.deps.store.getQuiescence(params.name);
       const locallyTrackedTurn =
-        this.activeTurns.has(params.name) || this.activeTurnProcesses.has(params.name);
+        this.activeTurns.has(params.name) ||
+        this.activeTurnProcesses.has(params.name) ||
+        Object.values(this.deps.store.getTurnRequests(params.name)).some(
+          (receipt) => receipt.state === "running"
+        );
       if (this.deps.store.getSession(params.name) == null) {
         if (existingReservation != null && existingReservation.purpose === "purge") {
           await this.deps.store.releaseQuiescence(params.name, existingReservation.epoch);
@@ -2412,30 +2642,103 @@ export class AcpxSessionManager implements ISessionManager {
 
   /** Reconcile persisted turns before accepting any new work. */
   async reconcilePersistedSessions(): Promise<void> {
-    for (const snapshot of this.deps.store.listSessions()) {
-      await this.withLifecycleLock(snapshot.name, async () => {
-        const stored = this.deps.store.getSession(snapshot.name);
+    const names = new Set([
+      ...this.deps.store.listSessions().map((session) => session.name),
+      ...this.deps.store.listRunningTurnRequests().map((receipt) => receipt.sessionName)
+    ]);
+    for (const name of names) {
+      await this.withLifecycleLock(name, async () => {
+        const stored = this.deps.store.getSession(name);
+        const receipt = Object.values(this.deps.store.getTurnRequests(name)).find(
+          (candidate) => candidate.state === "running"
+        );
+        const interruptedOutcome = (reason: string): TurnRequestErrorOutcome =>
+          durableTurnError(
+            new PuppenclawError(
+              "TURN_INTERRUPTED_RESTART",
+              `Turn for session ${name} cannot be replayed after daemon restart: ${reason}`
+            )
+          );
+
+        // A durable claim is written before any provider process can launch.
+        // If restart finds no published active turn, it can prove that this
+        // daemon never dispatched the provider request and settle the key as
+        // interrupted. The durable error remains replayable and prevents an
+        // ambiguous client retry from becoming new work.
         if (
-          stored == null ||
-          (stored.state !== "running" &&
-            stored.activeTurn?.state !== "running" &&
-            stored.recoveryFence == null)
+          receipt != null &&
+          (stored == null ||
+            receipt.activeTurnId == null ||
+            stored.activeTurn?.id !== receipt.activeTurnId)
+        ) {
+          await this.deps.store.settleTurnRequestDuringReconciliation(
+            name,
+            receipt.turnKey,
+            receipt.requestFingerprint,
+            interruptedOutcome("no matching active-turn publication was persisted"),
+            stored == null
+              ? undefined
+              : (current) => ({
+                  ...withoutRecoveryFence(current),
+                  state: current.state === "stopped" ? "stopped" : "failed",
+                  lastActivity: nowIso(),
+                  lastError:
+                    current.lastError ??
+                    "Durable turn claim was interrupted before active-turn publication."
+                })
+          );
+          this.deps.logger.warn(
+            `Session ${name} had an unpublished durable turn claim; settled it as interrupted at startup.`
+          );
+          return;
+        }
+        if (stored == null) {
+          return;
+        }
+
+        // A terminal active turn with an unsettled receipt can result from a
+        // crash or operator stop during final persistence. Never synthesize a
+        // success; retain an explicit replayable interruption instead.
+        if (receipt != null && stored.activeTurn?.state !== "running") {
+          await this.deps.store.settleTurnRequestDuringReconciliation(
+            name,
+            receipt.turnKey,
+            receipt.requestFingerprint,
+            interruptedOutcome(`the published turn is already ${stored.activeTurn?.state ?? "absent"}`)
+          );
+          return;
+        }
+
+        if (
+          stored.state !== "running" &&
+          stored.activeTurn?.state !== "running" &&
+          stored.recoveryFence == null
         ) {
           return;
         }
         const reconciled = await this.reconcileVisibleSession(stored);
         try {
           if (reconciled.turn.classification === "orphaned") {
-            await this.patchSessionDuringReconciliation(stored.name, (current) =>
+            const patch = (current: SessionInfo): SessionInfo =>
               current.activeTurn?.id !== stored.activeTurn?.id
                 ? current
                 : {
                     ...withoutRecoveryFence(reconciled.session),
                     lastStopReason: "Interrupted by daemon restart"
-                  }
-            );
+                  };
+            if (receipt != null) {
+              await this.deps.store.settleTurnRequestDuringReconciliation(
+                name,
+                receipt.turnKey,
+                receipt.requestFingerprint,
+                interruptedOutcome("the recorded provider process is definitely gone"),
+                patch
+              );
+            } else {
+              await this.patchSessionDuringReconciliation(name, patch);
+            }
             this.deps.logger.warn(
-              `Session ${stored.name} had a persisted active turn whose process is gone; marked failed at startup.`
+              `Session ${name} had a persisted active turn whose process is gone; marked failed at startup.`
             );
             return;
           }
@@ -2456,7 +2759,7 @@ export class AcpxSessionManager implements ISessionManager {
               ? { processStartIdentity: stored.activeTurn.processStartIdentity }
               : {})
           };
-          await this.patchSessionDuringReconciliation(stored.name, (current) =>
+          await this.patchSessionDuringReconciliation(name, (current) =>
             current.activeTurn?.id !== stored.activeTurn?.id
               ? current
               : {
@@ -2465,11 +2768,11 @@ export class AcpxSessionManager implements ISessionManager {
                 }
           );
           this.deps.logger.warn(
-            `Session ${stored.name} may still have restart-surviving work; fenced against new turns.`
+            `Session ${name} may still have restart-surviving work; fenced against new turns.`
           );
         } catch (error) {
           this.deps.logger.warn(
-            `Unable to reconcile persisted session ${stored.name} at startup: ${ensureError(error).message}`
+            `Unable to reconcile persisted session ${name} at startup: ${ensureError(error).message}`
           );
         }
       });
@@ -2492,11 +2795,13 @@ export class AcpxSessionManager implements ISessionManager {
   private async withSessionTurnLock<T>(
     name: string,
     lifecycleEpoch: number | undefined,
+    admissionGeneration: number,
     run: () => Promise<T>
   ): Promise<T> {
-    await this.withLifecycleLock(name, async () =>
-      await this.enterSessionTurnAfterLifecycleLock(name, lifecycleEpoch)
-    );
+    await this.withLifecycleLock(name, async () => {
+      this.assertTurnGeneration(name, admissionGeneration);
+      await this.enterSessionTurnAfterLifecycleLock(name, lifecycleEpoch);
+    });
     try {
       return await run();
     } finally {
@@ -2504,10 +2809,235 @@ export class AcpxSessionManager implements ISessionManager {
     }
   }
 
+  private async runSessionTurn(
+    name: string,
+    lifecycleEpoch: number | undefined,
+    admissionGeneration: number,
+    idempotency:
+      | {
+          operation: "start" | "send";
+          turnKey: string;
+          requestFingerprint: string;
+        }
+      | undefined,
+    run: () => Promise<ToolResult>
+  ): Promise<ToolResult> {
+    if (idempotency == null) {
+      return await this.withSessionTurnLock(name, lifecycleEpoch, admissionGeneration, run);
+    }
+
+    const disposition = await this.withLifecycleLock(name, async () => {
+      this.assertTurnGeneration(name, admissionGeneration);
+      const existing = this.deps.store.getTurnRequest(name, idempotency.turnKey);
+      if (existing != null) {
+        if (
+          existing.operation !== idempotency.operation ||
+          existing.requestFingerprint !== idempotency.requestFingerprint
+        ) {
+          throw new PuppenclawError(
+            "TURN_KEY_CONFLICT",
+            `Turn key ${idempotency.turnKey} was already used for a different request in session ${name}.`,
+            { name, turnKey: idempotency.turnKey }
+          );
+        }
+        if (existing.state === "settled") {
+          return { kind: "replay" as const, receipt: existing };
+        }
+        const inFlight = this.keyedTurnExecutions.get(name);
+        if (
+          inFlight?.turnKey === idempotency.turnKey &&
+          inFlight.requestFingerprint === idempotency.requestFingerprint
+        ) {
+          return { kind: "wait" as const, promise: inFlight.promise };
+        }
+        throw new PuppenclawError(
+          "TURN_REPLAY_UNAVAILABLE",
+          `Turn key ${idempotency.turnKey} is durably active or ambiguous after restart; refusing to launch it again.`,
+          { name, turnKey: idempotency.turnKey }
+        );
+      }
+
+      await this.enterSessionTurnAfterLifecycleLock(name, lifecycleEpoch);
+      let resolveExecution!: (result: ToolResult) => void;
+      let rejectExecution!: (error: unknown) => void;
+      const promise = new Promise<ToolResult>((resolve, reject) => {
+        resolveExecution = resolve;
+        rejectExecution = reject;
+      });
+      void promise.catch(() => undefined);
+      const execution: KeyedTurnExecution = {
+        turnKey: idempotency.turnKey,
+        requestFingerprint: idempotency.requestFingerprint,
+        promise,
+        resolve: resolveExecution,
+        reject: rejectExecution
+      };
+      try {
+        await this.deps.store.claimTurnRequest({
+          sessionName: name,
+          turnKey: idempotency.turnKey,
+          operation: idempotency.operation,
+          requestFingerprint: idempotency.requestFingerprint
+        });
+        this.keyedTurnExecutions.set(name, execution);
+      } catch (error) {
+        this.releaseSessionTurn(name);
+        throw error;
+      }
+      return { kind: "execute" as const, execution };
+    });
+
+    if (disposition.kind === "replay") {
+      return this.replayTurnRequest(disposition.receipt);
+    }
+    if (disposition.kind === "wait") {
+      await disposition.promise.catch(() => undefined);
+      const receipt = this.deps.store.getTurnRequest(name, idempotency.turnKey);
+      if (receipt?.state === "settled") {
+        return this.replayTurnRequest(receipt);
+      }
+      throw new PuppenclawError(
+        "TURN_REPLAY_UNAVAILABLE",
+        `Turn key ${idempotency.turnKey} did not produce a durable replay outcome; refusing to launch it again.`,
+        { name, turnKey: idempotency.turnKey }
+      );
+    }
+
+    try {
+      await run();
+      const durableReceipt = this.deps.store.getTurnRequest(name, idempotency.turnKey);
+      if (durableReceipt?.state !== "settled" || durableReceipt.outcome == null) {
+        throw new PuppenclawError(
+          "TURN_RECEIPT_NOT_SETTLED",
+          `Turn key ${idempotency.turnKey} completed without a durable outcome.`
+        );
+      }
+      if (durableReceipt.outcome.kind === "error") {
+        const durableError = new PuppenclawError(
+          durableReceipt.outcome.code,
+          durableReceipt.outcome.message,
+          {
+            ...durableReceipt.outcome.details,
+            turnReceipt: { turnKey: idempotency.turnKey, state: "accepted" }
+          }
+        );
+        disposition.execution.reject(durableError);
+        throw durableError;
+      }
+      const accepted = toolResultFromTurnOutcome(
+        durableReceipt.outcome,
+        idempotency.turnKey,
+        "accepted"
+      );
+      disposition.execution.resolve(accepted);
+      return accepted;
+    } catch (error) {
+      let thrownError: unknown = error;
+      const receipt = this.deps.store.getTurnRequest(name, idempotency.turnKey);
+      if (receipt?.state === "settled" && receipt.outcome?.kind === "error") {
+        thrownError = new PuppenclawError(receipt.outcome.code, receipt.outcome.message, {
+          ...receipt.outcome.details,
+          turnReceipt: { turnKey: idempotency.turnKey, state: "accepted" }
+        });
+      } else if (receipt?.state === "running") {
+        const outcome = durableTurnError(error);
+        const settled = await this.deps.store
+          .settleTurnRequestDuringReconciliation(
+            name,
+            idempotency.turnKey,
+            idempotency.requestFingerprint,
+            outcome,
+            (current) => {
+              if (current.state === "stopped") {
+                return current;
+              }
+              const failedAt = nowIso();
+              const activeTurn =
+                current.activeTurn?.turnKey === idempotency.turnKey &&
+                current.activeTurn.requestFingerprint === idempotency.requestFingerprint &&
+                current.activeTurn.state === "running"
+                  ? {
+                      ...current.activeTurn,
+                      state: "failed" as const,
+                      updatedAt: failedAt,
+                      completedAt: failedAt,
+                      error: outcome.message
+                    }
+                  : current.activeTurn;
+              return {
+                ...current,
+                state: "failed",
+                lastActivity: failedAt,
+                lastError: outcome.message,
+                ...(activeTurn != null ? { activeTurn } : {})
+              };
+            }
+          )
+          .then(
+            () => true,
+            (settleError) => {
+              this.deps.logger.error(
+                `Unable to settle failed turn receipt ${idempotency.turnKey} for ${name}: ${ensureError(settleError).message}`
+              );
+              return false;
+            }
+          );
+        if (settled) {
+          thrownError = new PuppenclawError(outcome.code, outcome.message, {
+            ...outcome.details,
+            turnReceipt: { turnKey: idempotency.turnKey, state: "accepted" }
+          });
+        }
+      }
+      disposition.execution.reject(thrownError);
+      throw thrownError;
+    } finally {
+      if (this.keyedTurnExecutions.get(name) === disposition.execution) {
+        this.keyedTurnExecutions.delete(name);
+      }
+      this.releaseSessionTurn(name);
+    }
+  }
+
+  private replayTurnRequest(receipt: TurnRequestReceipt): ToolResult {
+    if (receipt.state !== "settled" || receipt.outcome == null) {
+      throw new PuppenclawError(
+        "TURN_REPLAY_UNAVAILABLE",
+        `Turn key ${receipt.turnKey} has no durable terminal outcome; refusing to launch it again.`,
+        { name: receipt.sessionName, turnKey: receipt.turnKey }
+      );
+    }
+    if (receipt.outcome.kind === "error") {
+      return throwDurableTurnError(receipt.outcome, receipt.turnKey, "replayed");
+    }
+    return toolResultFromTurnOutcome(receipt.outcome, receipt.turnKey, "replayed");
+  }
+
+  private assertTurnGeneration(name: string, expected: number): void {
+    const current = this.deps.store.getTurnGeneration(name);
+    if (current !== expected) {
+      throw new PuppenclawError(
+        "STALE_TURN_GENERATION",
+        `Session ${name} was purged while this turn request was waiting; refusing to resurrect it.`,
+        { name, requestedGeneration: expected, currentGeneration: current }
+      );
+    }
+  }
+
   private async enterSessionTurnAfterLifecycleLock(
     name: string,
     lifecycleEpoch: number | undefined
   ): Promise<void> {
+    const unsettledReceipt = Object.values(this.deps.store.getTurnRequests(name)).find(
+      (receipt) => receipt.state === "running"
+    );
+    if (unsettledReceipt != null) {
+      throw new PuppenclawError(
+        "TURN_REPLAY_UNAVAILABLE",
+        `Session ${name} has active or ambiguous turn key ${unsettledReceipt.turnKey}; refusing another dispatch.`,
+        { name, turnKey: unsettledReceipt.turnKey }
+      );
+    }
     if (this.activeTurns.has(name)) {
       throw new PuppenclawError(
         "TURN_ALREADY_RUNNING",
@@ -3949,7 +4479,7 @@ export class AcpxSessionManager implements ISessionManager {
     } catch (error) {
       await this.restoreNativeInteractionMode(params.session, nativeMode).catch((restoreError) => {
         this.deps.logger.warn(
-          `Unable to restore ACP mode for ${params.session.name}: ${ensureError(restoreError).message}`
+          `Unable to restore ACP mode for ${params.session.name}: ${redactSensitiveText(ensureError(restoreError).message)}`
         );
       });
       throw error;
@@ -3958,7 +4488,7 @@ export class AcpxSessionManager implements ISessionManager {
     const restoreWarning = await this.restoreNativeInteractionMode(params.session, nativeMode).then(
       () => undefined,
       (error) => {
-        const message = `Unable to restore ACP mode for ${params.session.name}: ${ensureError(error).message}`;
+        const message = `Unable to restore ACP mode for ${params.session.name}: ${redactSensitiveText(ensureError(error).message)}`;
         this.deps.logger.warn(message);
         return message;
       }
@@ -3998,6 +4528,7 @@ export class AcpxSessionManager implements ISessionManager {
         (await this.getRuntimeMessageCount(params.session).catch(() => undefined)));
     const promptStartedAtMs = Date.now();
     await this.startActiveTurnOutput(params.session);
+    this.assertTurnWasNotStopped(params.session.name);
     const args = this.buildVerbArgs(
       params.session.agent,
       params.session.directory,
@@ -4024,6 +4555,8 @@ export class AcpxSessionManager implements ISessionManager {
           detached: process.platform !== "win32",
           env
         });
+    const exit = childExit(child);
+    void exit.catch(() => undefined);
     await this.registerActiveTurnProcess(params.session.name, child);
 
     // If the child exits or closes stdin before the prompt is fully written
@@ -4160,10 +4693,7 @@ export class AcpxSessionManager implements ISessionManager {
       stderr += chunk;
     });
 
-    const exitCode = await new Promise<number | null>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (code) => resolve(code));
-    }).catch((error) => {
+    const exitCode = await exit.catch((error) => {
       this.completeActiveTurnOutput(params.session.name);
       throw new PuppenclawError("ACP_TURN_FAILED", ensureError(error).message);
     });
@@ -4196,6 +4726,7 @@ export class AcpxSessionManager implements ISessionManager {
         : undefined) ??
       (/needs reconnect/iu.test(stderr) ? stderr.trim() : undefined);
     if (reconnectText != null && !oneShotRuntime) {
+      const safeReconnectText = sanitizeActiveTurnText(reconnectText);
       this.deps.logger.warn(
         `ACPX session ${params.session.name} requested reconnect; waiting for delayed assistant output.`
       );
@@ -4239,15 +4770,15 @@ export class AcpxSessionManager implements ISessionManager {
           ...(baselineMessageCount != null ? { baselineMessageCount } : {})
         });
       }
-      await this.deps.outputRouter.onError(params.session.name, new Error(reconnectText));
+      await this.deps.outputRouter.onError(params.session.name, new Error(safeReconnectText));
       this.completeActiveTurnOutput(params.session.name);
       return {
-        output: reconnectText,
+        output: safeReconnectText,
         warnings: [],
         transcript: [
           {
             role: "status",
-            text: reconnectText,
+            text: safeReconnectText,
             createdAt: nowIso()
           }
         ],
@@ -4255,18 +4786,19 @@ export class AcpxSessionManager implements ISessionManager {
       };
     }
     if (errorEvent != null) {
+      const safeErrorMessage = sanitizeActiveTurnText(errorEvent.message);
       this.deps.logger.warn(
-        `ACPX session ${params.session.name} returned error event: ${errorEvent.message}`
+        `ACPX session ${params.session.name} returned error event: ${safeErrorMessage}`
       );
-      await this.deps.outputRouter.onError(params.session.name, new Error(errorEvent.message));
+      await this.deps.outputRouter.onError(params.session.name, new Error(safeErrorMessage));
       this.completeActiveTurnOutput(params.session.name);
       return {
-        output: errorEvent.message,
+        output: safeErrorMessage,
         warnings: [],
         transcript: [
           {
             role: "status",
-            text: errorEvent.message,
+            text: safeErrorMessage,
             createdAt: nowIso()
           }
         ],
@@ -4274,7 +4806,9 @@ export class AcpxSessionManager implements ISessionManager {
       };
     }
     if ((exitCode ?? 0) !== 0) {
-      const message = stderr.trim() || `acpx exited with code ${exitCode ?? "unknown"}`;
+      const message = sanitizeActiveTurnText(
+        stderr.trim() || `acpx exited with code ${exitCode ?? "unknown"}`
+      );
       this.deps.logger.warn(
         `ACPX session ${params.session.name} exited with code ${exitCode ?? "unknown"}: ${message}`
       );
@@ -4358,6 +4892,7 @@ export class AcpxSessionManager implements ISessionManager {
     };
 
     await this.startActiveTurnOutput(params.session);
+    this.assertTurnWasNotStopped(params.session.name);
     const child = spawnCommand.shell
       ? spawn(spawnCommand.command, {
           cwd: params.session.directory,
@@ -4372,6 +4907,8 @@ export class AcpxSessionManager implements ISessionManager {
           detached: process.platform !== "win32",
           env
         });
+    const exit = childExit(child);
+    void exit.catch(() => undefined);
     await this.registerActiveTurnProcess(params.session.name, child);
 
     let stderr = "";
@@ -4459,10 +4996,7 @@ export class AcpxSessionManager implements ISessionManager {
     child.stdin.write(buildCodexPermissionPrompt(params.promptText, params.permissionMode));
     child.stdin.end();
 
-    const exitCode = await new Promise<number | null>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (code) => resolve(code));
-    }).catch((error) => {
+    const exitCode = await exit.catch((error) => {
       this.setActiveTurnOutput(params.session.name, `\n[error] ${ensureError(error).message}\n`);
       this.completeActiveTurnOutput(params.session.name);
       throw new PuppenclawError("CODEX_TURN_FAILED", ensureError(error).message);
@@ -4534,6 +5068,7 @@ export class AcpxSessionManager implements ISessionManager {
 
   private async startActiveTurnOutput(session: SessionInfo): Promise<void> {
     const sessionName = session.name;
+    this.assertTurnWasNotStopped(sessionName);
     const now = nowIso();
     const turnId = this.activeTurnIds.get(sessionName) ?? randomUUID();
     this.activeTurnIds.set(sessionName, turnId);
@@ -4546,19 +5081,47 @@ export class AcpxSessionManager implements ISessionManager {
       totalChars: 0
     });
     this.activeTurnCheckpointAt.set(sessionName, Date.now());
-    const current = this.deps.store.getSession(sessionName) ?? session;
-    await this.deps.store.upsertSession({
-      ...current,
-      state: "running",
-      lastActivity: now,
-      activeTurn: {
-        id: turnId,
+    const keyedExecution = this.keyedTurnExecutions.get(sessionName);
+    const buildSession = (stored: SessionInfo | null): SessionInfo => {
+      const current = stored ?? session;
+      return {
+        ...current,
         state: "running",
-        startedAt: current.activeTurn?.id === turnId ? current.activeTurn.startedAt : now,
-        updatedAt: now,
-        outputChars: 0
-      }
-    });
+        lastActivity: now,
+        activeTurn: {
+          id: turnId,
+          ...(keyedExecution != null
+            ? {
+                turnKey: keyedExecution.turnKey,
+                requestFingerprint: keyedExecution.requestFingerprint
+              }
+            : {}),
+          state: "running",
+          startedAt: current.activeTurn?.id === turnId ? current.activeTurn.startedAt : now,
+          updatedAt: now,
+          outputChars: 0
+        }
+      };
+    };
+    if (keyedExecution == null) {
+      await this.deps.store.upsertSession(buildSession(this.deps.store.getSession(sessionName)));
+    } else {
+      await this.deps.store.patchSessionAndLinkTurnRequest(
+        sessionName,
+        keyedExecution.turnKey,
+        keyedExecution.requestFingerprint,
+        buildSession
+      );
+    }
+  }
+
+  private assertTurnWasNotStopped(sessionName: string): void {
+    if (this.stopRequests.has(sessionName)) {
+      throw new PuppenclawError(
+        "TURN_ABORTED",
+        `Turn for session ${sessionName} was stopped before provider dispatch.`
+      );
+    }
   }
 
   private appendActiveTurnOutput(sessionName: string, text: string): void {
@@ -4625,14 +5188,6 @@ export class AcpxSessionManager implements ISessionManager {
       child,
       turnId
     });
-    const pid = child.pid;
-    const identity = pid != null ? await readLinuxProcessIdentity(pid) : null;
-    await this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
-      ...activeTurn,
-      ...(pid != null ? { pid } : {}),
-      ...(identity != null ? identity : {}),
-      updatedAt: nowIso()
-    }));
     const clear = (exitCode: number | null, signal: NodeJS.Signals | null): void => {
       if (this.activeTurnProcesses.get(sessionName)?.child === child) {
         this.activeTurnProcesses.delete(sessionName);
@@ -4644,8 +5199,20 @@ export class AcpxSessionManager implements ISessionManager {
         signal
       }));
     };
+    // Register process lifecycle listeners synchronously. In particular, an
+    // ENOENT spawn can emit `error` before the first awaited identity lookup;
+    // delaying this listener would turn a durable keyed failure into an
+    // uncaught process exception.
     child.once("close", clear);
     child.once("error", () => clear(child.exitCode, child.signalCode));
+    const pid = child.pid;
+    const identity = pid != null ? await readLinuxProcessIdentity(pid) : null;
+    await this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
+      ...activeTurn,
+      ...(pid != null ? { pid } : {}),
+      ...(identity != null ? identity : {}),
+      updatedAt: nowIso()
+    }));
   }
 
   private checkpointActiveTurnOutput(sessionName: string, force = false): void {
@@ -4705,13 +5272,14 @@ export class AcpxSessionManager implements ISessionManager {
       activeTurn: ActiveTurnMetadata | undefined,
       stoppedDuringTurn: boolean
     ) => SessionInfo,
-    error?: string
+    error?: string,
+    receiptOutcome?: Omit<TurnRequestSuccessOutcome, "session"> | TurnRequestErrorOutcome
   ): Promise<SessionInfo> {
     this.checkpointActiveTurnOutput(sessionName, true);
     await this.activeTurnPersistence.get(sessionName)?.catch(() => undefined);
     const turnId = this.activeTurnIds.get(sessionName);
     const completedAt = nowIso();
-    const nextSession = await this.deps.store.patchSession(sessionName, (current) => {
+    const patchSession = (current: SessionInfo | null): SessionInfo => {
       if (current == null) {
         throw new PuppenclawError("NO_SESSION", `Unknown session ${sessionName}.`);
       }
@@ -4737,7 +5305,18 @@ export class AcpxSessionManager implements ISessionManager {
         lastStopReason: current.lastStopReason ?? "stopped by user",
         ...(activeTurn != null ? { activeTurn } : {})
       };
-    });
+    };
+    const keyedExecution = this.keyedTurnExecutions.get(sessionName);
+    const nextSession =
+      keyedExecution != null && receiptOutcome != null
+        ? await this.deps.store.patchSessionAndSettleTurnRequest(
+            sessionName,
+            keyedExecution.turnKey,
+            keyedExecution.requestFingerprint,
+            patchSession,
+            receiptOutcome
+          )
+        : await this.deps.store.patchSession(sessionName, patchSession);
     this.stopRequests.delete(sessionName);
     this.activeTurnIds.delete(sessionName);
     this.activeTurnCheckpointAt.delete(sessionName);

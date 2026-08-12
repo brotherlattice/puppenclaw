@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { DaemonSessionManager } from "../../src/manager/daemon.js";
@@ -81,6 +81,7 @@ describe("DaemonSessionManager", () => {
       const payload = JSON.parse(response.body) as {
         sessionStartStream?: boolean;
         sessionSendStream?: boolean;
+        sessionTurnIdempotency?: unknown;
         sessionModelProviderRefresh?: boolean;
         codexTurnPolicy?: unknown;
         sessionOutput?: boolean;
@@ -97,6 +98,15 @@ describe("DaemonSessionManager", () => {
       expect(response.statusCode).toBe(200);
       expect(payload.sessionStartStream).toBe(true);
       expect(payload.sessionSendStream).toBe(true);
+      expect(payload.sessionTurnIdempotency).toEqual({
+        version: 1,
+        durable: true,
+        concurrentWait: true,
+        terminalReplay: true,
+        requestFingerprint: true,
+        terminalReplayRetention: 64,
+        turnKeyRetention: 4096
+      });
       expect(payload.sessionModelProviderRefresh).toBe(true);
       expect(payload.codexTurnPolicy).toEqual({
         version: 1,
@@ -351,6 +361,245 @@ describe("DaemonSessionManager", () => {
       });
     } finally {
       globalThis.fetch = originalFetch;
+      await app.close();
+    }
+  });
+
+  it("emits durable accepted and replayed receipts on keyed SSE without session output events", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-daemon-idempotency-");
+    const { app } = await createDaemonServer({
+      config: makeConfig({
+        backend: "daemon",
+        acpxCommand: await resolveFakeAcpxCommand()
+      }),
+      dataDir: workspaceDir
+    });
+    const request = {
+      agent: "claude",
+      name: "daemon-keyed",
+      directory: workspaceDir,
+      task: "ASK_USER",
+      contextFiles: [],
+      turnKey: "queue:daemon-1"
+    };
+    const events = (body: string): Array<Record<string, unknown>> =>
+      body
+        .split(/\r?\n/u)
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => JSON.parse(line.slice("data: ".length)) as Record<string, unknown>);
+
+    try {
+      const acceptedResponse = await app.inject({
+        method: "POST",
+        url: "/session/start/stream",
+        payload: request
+      });
+      const acceptedEvents = events(acceptedResponse.body);
+      expect(acceptedEvents.map((event) => event.kind)).toEqual(["result", "done"]);
+      expect(acceptedEvents[0]).toMatchObject({
+        result: {
+          details: {
+            session: { state: "waiting_input" },
+            turnSignals: { inputRequest: { toolName: "AskUserQuestion" } },
+            turnReceipt: { turnKey: request.turnKey, state: "accepted" }
+          }
+        }
+      });
+
+      const replayResponse = await app.inject({
+        method: "POST",
+        url: "/session/start/stream",
+        payload: { ...request, lifecycleEpoch: 42 }
+      });
+      const replayEvents = events(replayResponse.body);
+      expect(replayEvents.map((event) => event.kind)).toEqual(["result", "done"]);
+      expect(replayEvents[0]).toMatchObject({
+        result: {
+          details: {
+            session: { state: "waiting_input" },
+            turnReceipt: { turnKey: request.turnKey, state: "replayed" }
+          }
+        }
+      });
+
+      const activeTurn = app.inject({
+        method: "POST",
+        url: "/session/daemon-keyed/send/stream",
+        payload: { message: "SLOW_TURN newer output", contextFiles: [] }
+      });
+      const marker = join(workspaceDir, ".fake-acpx-state", "daemon-keyed.slow");
+      let markerObserved = false;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        markerObserved = await readFile(marker, "utf8").then(
+          () => true,
+          () => false
+        );
+        if (markerObserved) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(markerObserved).toBe(true);
+      const isolatedReplay = await app.inject({
+        method: "POST",
+        url: "/session/start/stream",
+        payload: request
+      });
+      const isolatedEvents = events(isolatedReplay.body);
+      expect(isolatedEvents.map((event) => event.kind)).toEqual(["result", "done"]);
+      expect(JSON.stringify(isolatedEvents)).not.toContain("newer output");
+      await app.inject({ method: "DELETE", url: "/session/daemon-keyed" });
+      await activeTurn;
+
+      const conflictResponse = await app.inject({
+        method: "POST",
+        url: "/session/start/stream",
+        payload: { ...request, task: "Conflicting payload." }
+      });
+      expect(events(conflictResponse.body)).toEqual([
+        expect.objectContaining({
+          kind: "error",
+          code: "TURN_KEY_CONFLICT",
+          details: expect.objectContaining({ turnKey: request.turnKey }) as unknown
+        }),
+        expect.objectContaining({ kind: "done" })
+      ]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("emits accepted and replayed durable receipts for post-dispatch SSE errors", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-daemon-idempotent-error-");
+    const missingCommand = join(workspaceDir, "missing-codex-executable");
+    const { app } = await createDaemonServer({
+      config: makeConfig({
+        backend: "daemon",
+        agentCommands: { codex: missingCommand }
+      }),
+      dataDir: workspaceDir
+    });
+    const request = {
+      agent: "codex",
+      name: "daemon-keyed-error",
+      directory: workspaceDir,
+      task: "Fail after active-turn publication.",
+      contextFiles: [],
+      turnKey: "queue:daemon-error",
+      modelProviderId: "openai-test",
+      modelProvider: {
+        id: "openai-test",
+        kind: "codex-openai",
+        model: "test-model"
+      }
+    };
+    const parseEvents = (body: string): Array<Record<string, unknown>> =>
+      body
+        .split(/\r?\n/u)
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => JSON.parse(line.slice("data: ".length)) as Record<string, unknown>);
+
+    try {
+      const accepted = parseEvents(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/session/start/stream",
+            payload: request
+          })
+        ).body
+      );
+      expect(accepted).toEqual([
+        expect.objectContaining({
+          kind: "error",
+          code: "CODEX_TURN_FAILED",
+          details: { turnReceipt: { turnKey: request.turnKey, state: "accepted" } }
+        }),
+        expect.objectContaining({ kind: "done" })
+      ]);
+      const replayed = parseEvents(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/session/start/stream",
+            payload: request
+          })
+        ).body
+      );
+      expect(replayed).toEqual([
+        expect.objectContaining({
+          kind: "error",
+          code: "CODEX_TURN_FAILED",
+          details: { turnReceipt: { turnKey: request.turnKey, state: "replayed" } }
+        }),
+        expect.objectContaining({ kind: "done" })
+      ]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("redacts credentials from JSON and SSE error boundaries", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-daemon-error-redaction-");
+    const { app } = await createDaemonServer({
+      config: makeConfig({
+        backend: "daemon",
+        acpxCommand: await resolveFakeAcpxCommand()
+      }),
+      dataDir: workspaceDir
+    });
+    const payload = {
+      agent: "claude",
+      name: "redacted-error",
+      directory: workspaceDir,
+      task: "SECRET_ERROR",
+      contextFiles: [],
+      turnKey: "queue:redacted-error"
+    };
+
+    try {
+      const stream = await app.inject({
+        method: "POST",
+        url: "/session/start/stream",
+        payload
+      });
+      const json = await app.inject({
+        method: "POST",
+        url: "/session/start",
+        payload
+      });
+      const status = await app.inject({
+        method: "GET",
+        url: "/session/redacted-error"
+      });
+      const persisted = await readFile(join(workspaceDir, "state.json"), "utf8");
+      const surfaces = [json.body, stream.body, status.body, persisted];
+      for (const body of surfaces) {
+        expect(body).not.toContain("bearer-secret");
+        expect(body).not.toContain("user:pass");
+        expect(body).not.toContain("query-secret");
+        expect(body).not.toContain("sk-proj-rawsecret");
+        expect(body).not.toContain("raw-token");
+        expect(body).not.toContain("sk-proj-anotherraw");
+      }
+      expect(surfaces.join("\n")).toContain("[redacted]");
+      expect(JSON.parse(persisted)).toMatchObject({
+        sessions: {
+          "redacted-error": {
+            activeTurn: { error: expect.stringContaining("[redacted]") as string }
+          }
+        },
+        turnRequests: {
+          "redacted-error": {
+            "queue:redacted-error": {
+              outcome: {
+                session: {
+                  activeTurn: { error: expect.stringContaining("[redacted]") as string }
+                }
+              }
+            }
+          }
+        }
+      });
+    } finally {
       await app.close();
     }
   });

@@ -156,6 +156,8 @@ export type ActiveTurnLifecycleState =
 
 export type ActiveTurnMetadata = {
   id: string;
+  turnKey?: string;
+  requestFingerprint?: string;
   state: ActiveTurnLifecycleState;
   startedAt: string;
   updatedAt: string;
@@ -229,6 +231,60 @@ export type ContextFileEntry = {
   resolvedPath: string;
   bytes: number;
   truncated: boolean;
+};
+
+export type InstalledSkillReceipt = {
+  name: string;
+  sourcePath: string;
+  targetPath: string;
+};
+
+export type TurnRequestSuccessOutcome = {
+  version: 1;
+  kind: "success";
+  summary: string;
+  session: {
+    name: string;
+    state: SessionState;
+    lastActivity: string;
+    pendingQuestion?: string;
+    lastError?: string;
+    activeTurn?: ActiveTurnMetadata;
+    tokenUsage?: TokenUsage;
+  };
+  output: string;
+  outputRole: TurnOutputRole;
+  turnSignals?: TurnSignals;
+  contextFiles: Array<Omit<ContextFileEntry, "resolvedPath">>;
+  skills?: Array<Pick<InstalledSkillReceipt, "name">>;
+};
+
+export type TurnRequestErrorOutcome = {
+  version: 1;
+  kind: "error";
+  code: string;
+  message: string;
+  details?: Record<string, string | number | boolean | null>;
+  session?: TurnRequestSuccessOutcome["session"];
+};
+
+export type TurnRequestOutcome = TurnRequestSuccessOutcome | TurnRequestErrorOutcome;
+
+export type TurnRequestReceipt = {
+  sessionName: string;
+  turnKey: string;
+  operation: "start" | "send";
+  requestFingerprint: string;
+  /**
+   * Tombstones retain only request identity after the bounded replay window.
+   * They deliberately fail closed instead of making an old key executable.
+   */
+  state: "running" | "settled" | "tombstone";
+  acceptedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  activeTurnId?: string;
+  outcome?: TurnRequestOutcome;
 };
 
 export type AcpxSessionHandle = {
@@ -409,6 +465,8 @@ export type LogsResult = {
 export type StoredState = {
   version: 1;
   sessions: Record<string, SessionInfo>;
+  turnRequests: Record<string, Record<string, TurnRequestReceipt>>;
+  turnGenerations: Record<string, number>;
   exposures: Record<string, ExposureRecord>;
   quiescence: SessionQuiescenceState;
 };

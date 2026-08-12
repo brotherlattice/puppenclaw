@@ -57,6 +57,7 @@ export const DEFAULT_ACPX_AGENT_COMMANDS = {
 const nonEmptyString = z.string().trim().min(1);
 const idString = nonEmptyString.regex(/^[a-zA-Z0-9._:-]+$/u);
 const skillNameString = nonEmptyString.regex(/^[a-zA-Z0-9._-]+$/u);
+export const turnKeyZod = z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9._:-]+$/u);
 
 export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
@@ -482,6 +483,7 @@ export const startParamsZod = z
     model: nonEmptyString.optional(),
     modelProviderId: skillNameString.optional(),
     modelProvider: modelProviderConfigZod.optional(),
+    turnKey: turnKeyZod.optional(),
     lifecycleEpoch: z.number().int().positive().safe().optional(),
     contextFiles: z.array(nonEmptyString).default([]),
     skills: z.array(skillNameString).default([])
@@ -489,7 +491,7 @@ export const startParamsZod = z
   .strict();
 
 export const pluginStartParamsZod = startParamsZod
-  .omit({ permissionMode: true, interactionMode: true, lifecycleEpoch: true })
+  .omit({ permissionMode: true, interactionMode: true, lifecycleEpoch: true, turnKey: true })
   .strict();
 
 export const sendParamsZod = z
@@ -502,6 +504,7 @@ export const sendParamsZod = z
     effort: effortLevelZod.optional(),
     permissionMode: permissionModeZod.optional(),
     interactionMode: interactionModeZod.optional(),
+    turnKey: turnKeyZod.optional(),
     lifecycleEpoch: z.number().int().positive().safe().optional(),
     modelProviderId: skillNameString.optional(),
     modelProvider: modelProviderConfigZod.optional(),
@@ -514,6 +517,7 @@ export const pluginSendParamsZod = sendParamsZod
     permissionMode: true,
     interactionMode: true,
     lifecycleEpoch: true,
+    turnKey: true,
     modelProviderId: true,
     modelProvider: true
   })

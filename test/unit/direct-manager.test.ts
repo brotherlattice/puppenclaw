@@ -3,6 +3,11 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
+import { PuppenclawError } from "../../src/shared/errors.js";
+import { SessionStore } from "../../src/shared/store.js";
+import {
+  fingerprintSendRequest
+} from "../../src/shared/turn-idempotency.js";
 import { UsageLedgerStore } from "../../src/shared/usage-ledger.js";
 import type { SessionInfo } from "../../src/shared/types.js";
 import { createStoreAndRouter, createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
@@ -2094,10 +2099,10 @@ describe("AcpxSessionManager", () => {
       contextFiles: []
     });
     await finalPatchEntered;
-    const stopped = await manager.stop({ name: "stop-terminal-race" });
-    expect((stopped.details as { session: SessionInfo }).session.state).toBe("stopped");
+    const stopOutcome = manager.stop({ name: "stop-terminal-race" });
     releaseFinalPatch();
-    const started = await startOutcome;
+    const [stopped, started] = await Promise.all([stopOutcome, startOutcome]);
+    expect((stopped.details as { session: SessionInfo }).session.state).toBe("stopped");
     const startedSession = (started.details as { session: SessionInfo }).session;
     const persisted = store.getSession("stop-terminal-race");
 
@@ -3078,5 +3083,249 @@ process.exit(1);
     manager["activeTurns"].delete("busy");
     await manager.gc();
     expect(store.getSession("busy")).toBeNull();
+  });
+
+  it("joins a concurrent duplicate turn key and replays its durable result after restart", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-keyed-join-");
+    const config = makeConfig({ acpxCommand: await resolveFakeAcpxCommand() });
+    const first = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      ...first
+    });
+    const originalRunTurn = manager["runTurn"].bind(manager);
+    let runs = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const startedRun = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    manager["runTurn"] = async (params) => {
+      runs += 1;
+      entered();
+      await gate;
+      return await originalRunTurn(params);
+    };
+    const request = {
+      agent: "claude" as const,
+      name: "keyed-join",
+      directory: workspaceDir,
+      task: "Execute this request once.",
+      contextFiles: [],
+      turnKey: "queue:join-1"
+    };
+    const original = manager.start(request);
+    await startedRun;
+    const duplicate = manager.start({ ...request, lifecycleEpoch: 99 });
+    release();
+    const [accepted, replayed] = await Promise.all([original, duplicate]);
+
+    expect(runs).toBe(1);
+    expect(accepted.details).toMatchObject({
+      turnReceipt: { turnKey: request.turnKey, state: "accepted" }
+    });
+    expect(replayed.details).toMatchObject({
+      turnReceipt: { turnKey: request.turnKey, state: "replayed" }
+    });
+    expect((accepted.details as { output: string }).output).toBe(
+      (replayed.details as { output: string }).output
+    );
+
+    await first.store.close();
+    const second = await createStoreAndRouter(workspaceDir);
+    const restarted = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      ...second
+    });
+    const durableReplay = await restarted.start({ ...request, lifecycleEpoch: 1234 });
+    expect(durableReplay.details).toMatchObject({
+      turnReceipt: { turnKey: request.turnKey, state: "replayed" }
+    });
+    await expect(
+      restarted.start({ ...request, task: "Conflicting request body." })
+    ).rejects.toMatchObject({ code: "TURN_KEY_CONFLICT" });
+    await second.store.close();
+  });
+
+  it("replays waiting-input and failed keyed outcomes without another dispatch", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-keyed-outcomes-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    const waitingRequest = {
+      agent: "claude" as const,
+      name: "keyed-waiting",
+      directory: workspaceDir,
+      task: "ASK_USER",
+      contextFiles: [],
+      turnKey: "queue:waiting"
+    };
+    const waiting = await manager.start(waitingRequest);
+    const waitingReplay = await manager.start(waitingRequest);
+    expect(waiting.details).toMatchObject({
+      session: { state: "waiting_input" },
+      turnSignals: { inputRequest: { toolName: "AskUserQuestion" } },
+      turnReceipt: { state: "accepted" }
+    });
+    expect(waitingReplay.details).toMatchObject({
+      session: { state: "waiting_input" },
+      turnSignals: { inputRequest: { toolName: "AskUserQuestion" } },
+      turnReceipt: { state: "replayed" }
+    });
+
+    const planRequest = {
+      name: "keyed-waiting",
+      message: "EXIT_PLAN_MODE",
+      interactionMode: "plan" as const,
+      contextFiles: [],
+      turnKey: "queue:plan"
+    };
+    const plan = await manager.send(planRequest);
+    const planReplay = await manager.send(planRequest);
+    const expectedPlan = {
+      session: { state: "idle", activeTurn: { state: "completed" } },
+      turnSignals: {
+        nativeMode: "plan",
+        plan: {
+          source: "claude-tool",
+          entries: [
+            { content: "Search primary sources", status: "pending", priority: "high" }
+          ]
+        }
+      }
+    };
+    expect(plan.details).toMatchObject({
+      ...expectedPlan,
+      turnReceipt: { turnKey: planRequest.turnKey, state: "accepted" }
+    });
+    expect(planReplay.details).toMatchObject({
+      ...expectedPlan,
+      turnReceipt: { turnKey: planRequest.turnKey, state: "replayed" }
+    });
+
+    const failureRequest = {
+      name: "keyed-waiting",
+      message: "Trigger a provider exception exactly once.",
+      contextFiles: [],
+      turnKey: "queue:failure"
+    };
+    let failures = 0;
+    manager["runTurn"] = async (params) => {
+      failures += 1;
+      await manager["startActiveTurnOutput"](params.session);
+      throw new PuppenclawError(
+        "TEST_POST_DISPATCH_FAILURE",
+        "Provider failed after active-turn publication."
+      );
+    };
+    await expect(manager.send(failureRequest)).rejects.toMatchObject({
+      code: "TEST_POST_DISPATCH_FAILURE",
+      details: { turnReceipt: { turnKey: "queue:failure", state: "accepted" } }
+    });
+    await expect(manager.send(failureRequest)).rejects.toMatchObject({
+      code: "TEST_POST_DISPATCH_FAILURE",
+      details: { turnReceipt: { turnKey: "queue:failure", state: "replayed" } }
+    });
+    expect(failures).toBe(1);
+  });
+
+  it("lets Stop fence a keyed start before provider dispatch", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-keyed-stop-pre-dispatch-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    const originalRunTurn = manager["runTurn"].bind(manager);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const reachedPreDispatch = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    manager["runTurn"] = async (params) => {
+      entered();
+      await gate;
+      return await originalRunTurn(params);
+    };
+    const start = manager.start({
+      agent: "claude",
+      name: "keyed-stop",
+      directory: workspaceDir,
+      task: "Must never dispatch after Stop wins.",
+      contextFiles: [],
+      turnKey: "queue:stopped"
+    });
+    await reachedPreDispatch;
+    const stop = manager.stop({ name: "keyed-stop" });
+    release();
+    await expect(start).rejects.toMatchObject({
+      code: "TURN_ABORTED",
+      details: { turnReceipt: { state: "accepted" } }
+    });
+    await expect(stop).resolves.toMatchObject({ details: { session: { state: "stopped" } } });
+    expect(store.getSession("keyed-stop")).toMatchObject({ state: "stopped" });
+    expect(store.getTurnRequest("keyed-stop", "queue:stopped")?.state).toBe("settled");
+  });
+
+  it("lets Stop fence a keyed start before its provisional session is published", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-keyed-stop-unpublished-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const claimed = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    manager["installSessionSkills"] = async () => {
+      entered();
+      await gate;
+      return [];
+    };
+    const start = manager.start({
+      agent: "claude",
+      name: "unpublished-stop",
+      directory: workspaceDir,
+      task: "Never publish this session after Stop.",
+      contextFiles: [],
+      turnKey: "queue:unpublished"
+    });
+    await claimed;
+    const stop = manager.stop({ name: "unpublished-stop" });
+    release();
+
+    await expect(start).rejects.toMatchObject({
+      code: "TURN_ABORTED",
+      details: { turnReceipt: { state: "accepted" } }
+    });
+    await expect(stop).resolves.toMatchObject({
+      details: { sessionName: "unpublished-stop", stopped: true }
+    });
+    expect(store.getSession("unpublished-stop")).toBeNull();
+    expect(store.getTurnRequest("unpublished-stop", "queue:unpublished")).toMatchObject({
+      state: "settled",
+      outcome: { kind: "error", code: "TURN_ABORTED" }
+    });
   });
 });

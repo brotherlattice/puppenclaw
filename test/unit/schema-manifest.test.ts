@@ -156,6 +156,54 @@ describe("plugin manifest and config schema", () => {
     ).not.toHaveProperty("lifecycleEpoch");
   });
 
+  it("keeps validated turn idempotency keys on the authenticated daemon boundary", () => {
+    expect(
+      startParamsZod.parse({
+        agent: "claude",
+        name: "keyed-start",
+        directory: "/tmp/keyed-start",
+        task: "Start exactly once.",
+        turnKey: "queue:turn-1"
+      }).turnKey
+    ).toBe("queue:turn-1");
+    expect(
+      sendParamsZod.parse({
+        name: "keyed-send",
+        message: "Send exactly once.",
+        turnKey: "queue.turn_2"
+      }).turnKey
+    ).toBe("queue.turn_2");
+    expect(
+      sendParamsZod.safeParse({
+        name: "bad-key",
+        message: "Reject unsafe key characters.",
+        turnKey: "contains whitespace"
+      }).success
+    ).toBe(false);
+    expect(
+      pluginStartParamsZod.safeParse({
+        agent: "claude",
+        name: "plugin-key",
+        directory: "/tmp/plugin-key",
+        task: "Plugins cannot claim daemon keys.",
+        turnKey: "not-trusted"
+      }).success
+    ).toBe(false);
+    expect(
+      pluginSendParamsZod.safeParse({
+        name: "plugin-key",
+        message: "Plugins cannot bypass recovery fences.",
+        turnKey: "not-trusted"
+      }).success
+    ).toBe(false);
+    expect(
+      (toolStartSchema as unknown as { properties: Record<string, unknown> }).properties
+    ).not.toHaveProperty("turnKey");
+    expect(
+      (toolSendSchema as unknown as { properties: Record<string, unknown> }).properties
+    ).not.toHaveProperty("turnKey");
+  });
+
   it("keeps follow-up model-provider refresh on the authenticated daemon boundary", () => {
     const refresh = {
       modelProviderId: "local-glm",

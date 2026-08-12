@@ -1,11 +1,16 @@
 import { spawn } from "node:child_process";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
 import { SessionStore } from "../../src/shared/store.js";
+import type { SessionInfo } from "../../src/shared/types.js";
+import {
+  fingerprintSendRequest,
+  fingerprintStartRequest
+} from "../../src/shared/turn-idempotency.js";
 import {
   readJsonFile,
   readJsonFileResilient,
@@ -126,6 +131,24 @@ describe("SessionStore.open", () => {
     });
     await store.close();
   });
+
+  it.skipIf(process.platform === "win32")(
+    "secures an existing state file before exposing the store",
+    async () => {
+      const dir = await createTempDir("puppenclaw-state-mode-");
+      const first = await SessionStore.open(dir);
+      await first.flush();
+      await first.close();
+      const path = join(dir, "state.json");
+      await chmod(path, 0o644);
+
+      const reopened = await SessionStore.open(dir);
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      await reopened.flush();
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      await reopened.close();
+    }
+  );
 
   it("requires recovery for version-mismatched and structurally invalid state", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -411,6 +434,254 @@ describe("SessionStore.open", () => {
   });
 });
 
+describe("durable turn requests", () => {
+  const timestamp = "2026-08-12T00:00:00.000Z";
+  const session = (name: string, directory: string) => ({
+    agent: "claude" as const,
+    name,
+    directory,
+    state: "idle" as const,
+    createdAt: timestamp,
+    lastActivity: timestamp,
+    permissionMode: "approve-reads" as const,
+    warnings: [],
+    transcript: []
+  });
+
+  it("bounds full replay outcomes without ever making an old key executable", async () => {
+    const dir = await createTempDir("puppenclaw-turn-retention-");
+    const seededReceipts = Object.fromEntries(
+      Array.from({ length: 64 }, (_, index) => {
+        const turnKey = `turn-${String(index).padStart(2, "0")}`;
+        const fingerprint = index.toString(16).padStart(64, "0");
+        const completedAt = new Date(Date.parse(timestamp) + index * 1_000).toISOString();
+        const activeTurn = {
+          id: `active-${index}`,
+          turnKey,
+          requestFingerprint: fingerprint,
+          state: "completed",
+          startedAt: timestamp,
+          updatedAt: completedAt,
+          completedAt,
+          outputChars: 0
+        };
+        return [
+          turnKey,
+          {
+            sessionName: "retained",
+            turnKey,
+            operation: "send",
+            requestFingerprint: fingerprint,
+            state: "settled",
+            acceptedAt: timestamp,
+            updatedAt: completedAt,
+            completedAt,
+            activeTurnId: activeTurn.id,
+            outcome: {
+              version: 1,
+              kind: "success",
+              summary: "Seeded retained turn.",
+              session: {
+                name: "retained",
+                state: "idle",
+                lastActivity: completedAt,
+                activeTurn
+              },
+              output: `output-${index}`,
+              outputRole: "assistant",
+              contextFiles: []
+            }
+          }
+        ];
+      })
+    );
+    await writeFile(
+      join(dir, "state.json"),
+      JSON.stringify({
+        version: 1,
+        sessions: { retained: session("retained", dir) },
+        turnRequests: { retained: seededReceipts },
+        turnGenerations: {},
+        exposures: {},
+        quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
+      }),
+      "utf8"
+    );
+    const store = await SessionStore.open(dir);
+    const turnKey = "turn-64";
+    const fingerprint = "40".padStart(64, "0");
+    await store.claimTurnRequest({
+      sessionName: "retained",
+      turnKey,
+      operation: "send",
+      requestFingerprint: fingerprint
+    });
+    await store.patchSessionAndLinkTurnRequest("retained", turnKey, fingerprint, (current) => ({
+      ...(current ?? session("retained", dir)),
+      state: "running",
+      activeTurn: {
+        id: "active-64",
+        turnKey,
+        requestFingerprint: fingerprint,
+        state: "running",
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        outputChars: 0
+      }
+    }));
+    await store.patchSessionAndSettleTurnRequest(
+      "retained",
+      turnKey,
+      fingerprint,
+      (current) => ({
+        ...(current ?? session("retained", dir)),
+        state: "idle",
+        activeTurn: {
+          ...(current?.activeTurn as NonNullable<SessionInfo["activeTurn"]>),
+          state: "completed",
+          updatedAt: timestamp,
+          completedAt: timestamp
+        }
+      }),
+      {
+        version: 1,
+        kind: "success",
+        summary: "Completed retained turn.",
+        output: `${"x".repeat(200_100)} ordinary https://example.test/docs secret https://user:pass@example.test/path?token=abc&view=full`,
+        outputRole: "assistant",
+        contextFiles: [{ path: "context.txt", bytes: 10, truncated: false }]
+      }
+    );
+
+    expect(store.getTurnRequest("retained", "turn-00")?.state).toBe("tombstone");
+    expect(store.getTurnRequest("retained", "turn-00")?.outcome).toBeUndefined();
+    expect(store.getTurnRequest("retained", "turn-01")?.state).toBe("settled");
+    const newest = store.getTurnRequest("retained", "turn-64");
+    expect(newest?.outcome?.kind).toBe("success");
+    if (newest?.outcome?.kind === "success") {
+      expect(newest.outcome.output.length).toBeLessThanOrEqual(200_000);
+      expect(newest.outcome.output).toMatch(/^\[replay output truncated:/u);
+      expect(newest.outcome.output).toContain("https://example.test/docs");
+      expect(newest.outcome.output).not.toContain("user:pass");
+      expect(newest.outcome.output).not.toContain("token=abc");
+      expect(newest.outcome.output).toContain("token=[redacted]");
+    }
+    await expect(
+      store.claimTurnRequest({
+        sessionName: "retained",
+        turnKey: "turn-00",
+        operation: "send",
+        requestFingerprint: "0".repeat(64)
+      })
+    ).rejects.toMatchObject({ code: "TURN_KEY_ALREADY_CLAIMED" });
+    await store.close();
+  });
+
+  it("fails closed on a malformed successful receipt snapshot", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = await createTempDir("puppenclaw-turn-invalid-");
+    const store = await SessionStore.open(dir);
+    await store.upsertSession(session("damaged", dir));
+    const fingerprint = "a".repeat(64);
+    await store.claimTurnRequest({
+      sessionName: "damaged",
+      turnKey: "damaged-key",
+      operation: "send",
+      requestFingerprint: fingerprint
+    });
+    await store.patchSessionAndLinkTurnRequest("damaged", "damaged-key", fingerprint, (current) => ({
+      ...(current ?? session("damaged", dir)),
+      state: "running",
+      activeTurn: {
+        id: "active-damaged",
+        turnKey: "damaged-key",
+        requestFingerprint: fingerprint,
+        state: "running",
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        outputChars: 0
+      }
+    }));
+    await store.patchSessionAndSettleTurnRequest(
+      "damaged",
+      "damaged-key",
+      fingerprint,
+      (current) => ({
+        ...(current ?? session("damaged", dir)),
+        state: "idle",
+        activeTurn: {
+          ...(current?.activeTurn as NonNullable<SessionInfo["activeTurn"]>),
+          state: "completed",
+          updatedAt: timestamp,
+          completedAt: timestamp
+        }
+      }),
+      {
+        version: 1,
+        kind: "success",
+        summary: "Done.",
+        output: "done",
+        outputRole: "assistant",
+        contextFiles: []
+      }
+    );
+    await store.close();
+
+    const path = join(dir, "state.json");
+    const raw = JSON.parse(await readFile(path, "utf8")) as {
+      turnRequests: Record<string, Record<string, { outcome: { session: { state: string } } }>>;
+    };
+    raw.turnRequests["damaged"]!["damaged-key"]!.outcome.session.state = "running";
+    await writeFile(path, JSON.stringify(raw), "utf8");
+    const reopened = await SessionStore.open(dir);
+    expect(reopened.getRecoveryStatus()).toMatchObject({ required: true, reason: "invalid" });
+    await reopened.close();
+  });
+
+  it("fails closed on a running receipt with a dangling active-turn link", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = await createTempDir("puppenclaw-turn-dangling-");
+    const store = await SessionStore.open(dir);
+    await store.upsertSession(session("dangling", dir));
+    const fingerprint = "b".repeat(64);
+    await store.claimTurnRequest({
+      sessionName: "dangling",
+      turnKey: "dangling-key",
+      operation: "send",
+      requestFingerprint: fingerprint
+    });
+    await store.patchSessionAndLinkTurnRequest(
+      "dangling",
+      "dangling-key",
+      fingerprint,
+      (current) => ({
+        ...(current ?? session("dangling", dir)),
+        state: "running",
+        activeTurn: {
+          id: "active-linked",
+          turnKey: "dangling-key",
+          requestFingerprint: fingerprint,
+          state: "running",
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          outputChars: 0
+        }
+      })
+    );
+    await store.close();
+    const path = join(dir, "state.json");
+    const raw = JSON.parse(await readFile(path, "utf8")) as {
+      sessions: Record<string, { activeTurn: { id: string } }>;
+    };
+    raw.sessions["dangling"]!.activeTurn.id = "different-active-turn";
+    await writeFile(path, JSON.stringify(raw), "utf8");
+
+    const reopened = await SessionStore.open(dir);
+    expect(reopened.getRecoveryStatus()).toMatchObject({ required: true, reason: "invalid" });
+    await reopened.close();
+  });
+});
+
 describe("startup reconciliation", () => {
   const silentLogger = {
     info() {},
@@ -418,6 +689,114 @@ describe("startup reconciliation", () => {
     error() {},
     debug() {}
   };
+
+  it("settles a receipt-only crash as a replayable interruption", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-receipt-only-restart-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const request = {
+      agent: "claude" as const,
+      name: "receipt-only",
+      directory: workspaceDir,
+      task: "Do not relaunch after a lost claim response.",
+      contextFiles: [],
+      turnKey: "queue:receipt-only"
+    };
+    const fingerprint = fingerprintStartRequest(request);
+    await store.claimTurnRequest({
+      sessionName: request.name,
+      turnKey: request.turnKey,
+      operation: "start",
+      requestFingerprint: fingerprint
+    });
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: silentLogger,
+      store,
+      outputRouter
+    });
+
+    await manager.reconcilePersistedSessions();
+
+    expect(store.getTurnRequest(request.name, request.turnKey)).toMatchObject({
+      state: "settled",
+      outcome: { kind: "error", code: "TURN_INTERRUPTED_RESTART" }
+    });
+    await expect(manager.start(request)).rejects.toMatchObject({
+      code: "TURN_INTERRUPTED_RESTART",
+      details: { turnReceipt: { turnKey: request.turnKey, state: "replayed" } }
+    });
+  });
+
+  it("atomically settles a keyed active turn whose recorded process is dead", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-keyed-dead-restart-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const timestamp = new Date().toISOString();
+    const request = {
+      name: "keyed-dead",
+      message: "Never run this twice.",
+      contextFiles: [],
+      turnKey: "queue:keyed-dead"
+    };
+    const fingerprint = fingerprintSendRequest(request);
+    await store.upsertSession({
+      agent: "claude",
+      name: request.name,
+      directory: workspaceDir,
+      state: "idle",
+      createdAt: timestamp,
+      lastActivity: timestamp,
+      permissionMode: "approve-reads",
+      warnings: [],
+      transcript: []
+    });
+    await store.claimTurnRequest({
+      sessionName: request.name,
+      turnKey: request.turnKey,
+      operation: "send",
+      requestFingerprint: fingerprint
+    });
+    await store.patchSessionAndLinkTurnRequest(
+      request.name,
+      request.turnKey,
+      fingerprint,
+      (current) => ({
+        ...(current as NonNullable<typeof current>),
+        state: "running",
+        activeTurn: {
+          id: "turn-keyed-dead",
+          turnKey: request.turnKey,
+          requestFingerprint: fingerprint,
+          state: "running",
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          pid: 999_999_999,
+          processStartIdentity: "999999999:0",
+          outputChars: 0
+        }
+      })
+    );
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: silentLogger,
+      store,
+      outputRouter
+    });
+
+    await manager.reconcilePersistedSessions();
+
+    expect(store.getSession(request.name)).toMatchObject({
+      state: "failed",
+      activeTurn: { state: "orphaned" }
+    });
+    expect(store.getTurnRequest(request.name, request.turnKey)).toMatchObject({
+      state: "settled",
+      outcome: { kind: "error", code: "TURN_INTERRUPTED_RESTART" }
+    });
+    await expect(manager.send(request)).rejects.toMatchObject({
+      code: "TURN_INTERRUPTED_RESTART",
+      details: { turnReceipt: { state: "replayed" } }
+    });
+  });
 
   it("marks a persisted running session with a dead turn process as failed", async () => {
     const workspaceDir = await createTempDir("puppenclaw-durability-startup-sweep-");

@@ -277,7 +277,13 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
     );
   }
   let reply;
-  if (normalizedInput.includes("FAIL_TURN")) {
+  if (normalizedInput.includes("SECRET_ERROR")) {
+    emitError(
+      "SIM_SECRET",
+      "authorization: Bearer bearer-secret at https://user:pass@example.test/path?token=query-secret OPENAI_API_KEY=sk-proj-rawsecret PUPPENCLAW_DAEMON_TOKEN=raw-token Incorrect API key provided: sk-proj-anotherraw"
+    );
+    process.exit(0);
+  } else if (normalizedInput.includes("FAIL_TURN")) {
     emitError("SIM_FAIL", "Simulated turn failure");
     process.exit(0);
   } else if (normalizedInput.includes("PUPPENFUSION_ROLE: planning")) {
