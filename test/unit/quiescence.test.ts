@@ -477,7 +477,7 @@ describe("session quiescence", () => {
     });
   });
 
-  it("serializes source forks before proving source quiescence", async () => {
+  it("releases source lifecycle ownership after snapshotting a fork", async () => {
     const workspaceDir = await createTempDir("puppenclaw-quiescence-fork-race-");
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
     const manager = new AcpxSessionManager({
@@ -520,13 +520,22 @@ describe("session quiescence", () => {
       quiesceFinished = true;
       return result;
     });
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(quiesceFinished).toBe(false);
-    expect(store.getActiveQuiescenceEpoch("fork-source")).toBeNull();
+    const proof = quiescenceDetails(
+      await Promise.race([
+        quiesceOutcome,
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(
+            () => reject(new Error("Source quiescence remained blocked by the fork target turn.")),
+            1_000
+          ).unref();
+        })
+      ])
+    );
+    expect(quiesceFinished).toBe(true);
+    expect(store.getActiveQuiescenceEpoch("fork-source")).toBe(proof.quiescenceEpoch);
 
     unblockFork();
     await forkOutcome;
-    const proof = quiescenceDetails(await quiesceOutcome);
     expect(proof.runtimeClosed).toBe(true);
     expect(store.getSession("fork-target")).not.toBeNull();
   });

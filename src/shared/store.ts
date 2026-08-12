@@ -27,12 +27,16 @@ import { ensureDir, nowIso, quarantineFile, writeJsonFileAtomic } from "./utils.
 
 const OWNER_LEASE_VERSION = 1 as const;
 const OWNER_LEASE_FILE = ".state-owner.json";
+const persistedTimestampZod = z.string().min(1).refine(
+  (value) => Number.isFinite(Date.parse(value)),
+  "Expected a parseable timestamp."
+);
 
 const transcriptEntryZod = z
   .object({
     role: z.enum(["system", "user", "assistant", "status"]),
     text: z.string(),
-    createdAt: z.string().min(1)
+    createdAt: persistedTimestampZod
   })
   .strict();
 
@@ -40,19 +44,98 @@ const activeTurnZod = z
   .object({
     id: z.string().min(1),
     state: z.enum(["running", "completed", "failed", "stopped", "orphaned"]),
-    startedAt: z.string().min(1),
-    updatedAt: z.string().min(1),
-    completedAt: z.string().min(1).optional(),
+    startedAt: persistedTimestampZod,
+    updatedAt: persistedTimestampZod,
+    completedAt: persistedTimestampZod.optional(),
     pid: z.number().int().positive().optional(),
     processGroupId: z.number().int().positive().optional(),
     processStartIdentity: z.string().min(1).optional(),
-    lastOutputAt: z.string().min(1).optional(),
+    lastOutputAt: persistedTimestampZod.optional(),
     outputChars: z.number().int().nonnegative(),
     exitCode: z.number().int().nullable().optional(),
     signal: z.string().nullable().optional(),
     error: z.string().optional()
   })
-  .strict();
+  .strict()
+  .superRefine((turn, context) => {
+    const startedAt = Date.parse(turn.startedAt);
+    const updatedAt = Date.parse(turn.updatedAt);
+    if (updatedAt < startedAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["updatedAt"],
+        message: "Active-turn update time cannot precede its start time."
+      });
+    }
+    if (turn.lastOutputAt != null && Date.parse(turn.lastOutputAt) < startedAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["lastOutputAt"],
+        message: "Active-turn output time cannot precede its start time."
+      });
+    }
+    if (turn.state === "running" && turn.completedAt != null) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedAt"],
+        message: "A running active turn cannot already have a completion time."
+      });
+    }
+    if (turn.state !== "running" && turn.completedAt == null) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedAt"],
+        message: "A terminal active turn requires a completion time."
+      });
+    }
+    if (turn.completedAt != null && Date.parse(turn.completedAt) < startedAt) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedAt"],
+        message: "Active-turn completion time cannot precede its start time."
+      });
+    }
+    if (turn.processGroupId != null && turn.pid == null) {
+      context.addIssue({
+        code: "custom",
+        path: ["processGroupId"],
+        message: "An active-turn process group requires its owning PID."
+      });
+    }
+    if (turn.processStartIdentity != null && turn.pid == null) {
+      context.addIssue({
+        code: "custom",
+        path: ["processStartIdentity"],
+        message: "An active-turn process identity requires its PID."
+      });
+    }
+  });
+
+const recoveryFenceZod = z
+  .object({
+    reason: z.enum(["restart-survivor", "unverified-process", "missing-turn-metadata"]),
+    detectedAt: persistedTimestampZod,
+    pid: z.number().int().positive().optional(),
+    processGroupId: z.number().int().positive().optional(),
+    processStartIdentity: z.string().min(1).optional()
+  })
+  .strict()
+  .superRefine((fence, context) => {
+    if (fence.processGroupId != null && fence.pid == null) {
+      context.addIssue({
+        code: "custom",
+        path: ["processGroupId"],
+        message: "A recovery-fence process group requires its owning PID."
+      });
+    }
+    if (fence.processStartIdentity != null && fence.pid == null) {
+      context.addIssue({
+        code: "custom",
+        path: ["processStartIdentity"],
+        message: "A recovery-fence process identity requires its PID."
+      });
+    }
+  });
 
 const tokenUsageZod = z
   .object({
@@ -91,9 +174,9 @@ const sessionInfoZod = z
     agent: agentKindZod,
     directory: z.string().min(1),
     state: z.enum(["idle", "running", "waiting_input", "suspended", "completed", "failed", "stopped"]),
-    createdAt: z.string().min(1),
-    lastActivity: z.string().min(1),
-    focusedUntil: z.string().min(1).optional(),
+    createdAt: persistedTimestampZod,
+    lastActivity: persistedTimestampZod,
+    focusedUntil: persistedTimestampZod.optional(),
     permissionMode: permissionModeZod,
     effort: effortLevelZod.optional(),
     effectiveEffort: effortLevelZod.optional(),
@@ -120,16 +203,7 @@ const sessionInfoZod = z
       .optional(),
     lastStopReason: z.string().optional(),
     activeTurn: activeTurnZod.optional(),
-    recoveryFence: z
-      .object({
-        reason: z.enum(["restart-survivor", "unverified-process", "missing-turn-metadata"]),
-        detectedAt: z.string().min(1),
-        pid: z.number().int().positive().optional(),
-        processGroupId: z.number().int().positive().optional(),
-        processStartIdentity: z.string().min(1).optional()
-      })
-      .strict()
-      .optional(),
+    recoveryFence: recoveryFenceZod.optional(),
     source: sessionSourceZod.optional(),
     origin: conversationScopeZod.optional()
   })
@@ -144,33 +218,114 @@ const exposureRecordZod = z
     mode: exposureModeZod,
     allowedVerbs: z.array(remoteVerbZod),
     allowedProjectRoots: z.array(z.string()),
-    updatedAt: z.string().min(1)
+    updatedAt: persistedTimestampZod
   })
   .strict();
 
 const quiescenceReservationZod = z
   .object({
     name: z.string().min(1),
-    epoch: z.number().int().positive(),
+    epoch: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     purpose: z.enum(["external", "purge"]),
-    updatedAt: z.string().min(1)
+    updatedAt: persistedTimestampZod
   })
   .strict();
 
 const storedStateZod = z
   .object({
     version: z.literal(SESSION_STORE_VERSION),
-    sessions: z.record(z.string(), sessionInfoZod),
-    exposures: z.record(z.string(), exposureRecordZod),
+    sessions: z.record(z.string().min(1), sessionInfoZod),
+    exposures: z.record(z.string().min(1), exposureRecordZod),
     quiescence: z
       .object({
-        lastEpoch: z.number().int().nonnegative(),
-        active: z.record(z.string(), quiescenceReservationZod),
-        latestByName: z.record(z.string(), z.number().int().positive())
+        lastEpoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        active: z.record(z.string().min(1), quiescenceReservationZod),
+        latestByName: z.record(
+          z.string().min(1),
+          z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+        )
       })
       .strict()
   })
-  .strict();
+  .strict()
+  .superRefine((state, context) => {
+    for (const [name, session] of Object.entries(state.sessions)) {
+      if (session.name !== name) {
+        context.addIssue({
+          code: "custom",
+          path: ["sessions", name, "name"],
+          message: `Session map key ${JSON.stringify(name)} does not match embedded name ${JSON.stringify(session.name)}.`
+        });
+      }
+      if (
+        session.handle != null &&
+        (session.handle.runtimeSessionName !== session.name ||
+          session.handle.agent !== session.agent)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["sessions", name, "handle"],
+          message: "Session runtime handle identity does not match its owning session."
+        });
+      }
+    }
+
+    for (const [bindingId, exposure] of Object.entries(state.exposures)) {
+      if (exposure.bindingId !== bindingId) {
+        context.addIssue({
+          code: "custom",
+          path: ["exposures", bindingId, "bindingId"],
+          message: `Exposure map key ${JSON.stringify(bindingId)} does not match embedded binding id ${JSON.stringify(exposure.bindingId)}.`
+        });
+      }
+    }
+
+    for (const [name, reservation] of Object.entries(state.quiescence.active)) {
+      if (reservation.name !== name) {
+        context.addIssue({
+          code: "custom",
+          path: ["quiescence", "active", name, "name"],
+          message: `Quiescence map key ${JSON.stringify(name)} does not match embedded name ${JSON.stringify(reservation.name)}.`
+        });
+      }
+      if (reservation.epoch > state.quiescence.lastEpoch) {
+        context.addIssue({
+          code: "custom",
+          path: ["quiescence", "active", name, "epoch"],
+          message: "Active quiescence epoch exceeds the durable epoch high-water mark."
+        });
+      }
+      const latestEpoch = state.quiescence.latestByName[name];
+      if (reservation.purpose === "external" && latestEpoch !== reservation.epoch) {
+        context.addIssue({
+          code: "custom",
+          path: ["quiescence", "latestByName", name],
+          message: "An external quiescence fence must match the latest lifecycle epoch."
+        });
+      }
+      if (
+        reservation.purpose === "purge" &&
+        latestEpoch != null &&
+        latestEpoch >= reservation.epoch
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["quiescence", "latestByName", name],
+          message: "A transient purge fence must be newer than prior external lifecycle history."
+        });
+      }
+    }
+
+    for (const [name, epoch] of Object.entries(state.quiescence.latestByName)) {
+      if (epoch > state.quiescence.lastEpoch) {
+        context.addIssue({
+          code: "custom",
+          path: ["quiescence", "latestByName", name],
+          message: "Latest lifecycle epoch exceeds the durable epoch high-water mark."
+        });
+      }
+    }
+  });
 
 const ownerLeaseZod = z
   .object({
@@ -178,7 +333,7 @@ const ownerLeaseZod = z
     ownerId: z.string().min(1),
     pid: z.number().int().positive(),
     processStartIdentity: z.string().min(1).optional(),
-    acquiredAt: z.string().min(1)
+    acquiredAt: persistedTimestampZod
   })
   .strict();
 
@@ -509,6 +664,13 @@ export class SessionStore {
     return await this.enqueueMutation(async () => {
       const nextState = structuredClone(this.state);
       const result = mutator(nextState);
+      const validated = storedStateZod.safeParse(nextState);
+      if (!validated.success) {
+        throw new PuppenclawError(
+          "INVALID_STATE_MUTATION",
+          `Refusing to persist invalid session state: ${z.prettifyError(validated.error)}`
+        );
+      }
       await writeJsonFileAtomic(this.statePath, nextState);
       this.state = nextState;
       return result;

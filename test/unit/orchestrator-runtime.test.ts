@@ -227,7 +227,7 @@ describe("OrchestratorRuntime", () => {
     const orchestratedSession = sessionStore.listSessions().find((session) => session.name === sessionName);
     expect(orchestratedSession?.agent).toBe("codex");
     expect(orchestratedSession?.planningProfile).toBe("deep");
-    expect(orchestratedSession?.permissionMode).toBe("approve-all");
+    expect(orchestratedSession?.permissionMode).toBe("approve-reads");
     expect(orchestratedSession?.effort).toBe("high");
     expect(orchestratedSession?.model).toBe("openai/gpt-5.4");
     expect(
@@ -242,7 +242,7 @@ describe("OrchestratorRuntime", () => {
     await writeFile(join(workspaceDir, "README.md"), "# Reassess Demo\n", "utf8");
     await writeFile(
       join(workspaceDir, ".gitignore"),
-      [".orchestrator/", "state.json", ".fake-acpx-state/"].join("\n") + "\n",
+      [".orchestrator/", "state.json", ".state-owner.json", ".fake-acpx-state/"].join("\n") + "\n",
       "utf8"
     );
     runGit(workspaceDir, ["init"]);
@@ -380,7 +380,7 @@ describe("OrchestratorRuntime", () => {
     await writeFile(join(workspaceDir, "src.ts"), "export const value = 1;\n", "utf8");
     await writeFile(
       join(workspaceDir, ".gitignore"),
-      [".orchestrator/", "state.json", ".fake-acpx-state/"].join("\n") + "\n",
+      [".orchestrator/", "state.json", ".state-owner.json", ".fake-acpx-state/"].join("\n") + "\n",
       "utf8"
     );
     runGit(workspaceDir, ["init"]);
@@ -612,6 +612,7 @@ describe("OrchestratorRuntime", () => {
   it("pauses for approval and resumes when approved", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-approval-");
     const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
     const manager = new AcpxSessionManager({
       config: makeConfig({
         acpxCommand
@@ -622,7 +623,7 @@ describe("OrchestratorRuntime", () => {
         error() {},
         debug() {}
       },
-      store: await SessionStore.open(workspaceDir),
+      store: sessionStore,
       outputRouter: new OutputRouter({
         info() {},
         warn() {},
@@ -640,7 +641,7 @@ describe("OrchestratorRuntime", () => {
         error() {},
         debug() {}
       },
-      sessionStore: await SessionStore.open(workspaceDir),
+      sessionStore,
       store: await OrchestratorStore.open(join(workspaceDir, ".orchestrator")),
       sessionManager: manager
     });

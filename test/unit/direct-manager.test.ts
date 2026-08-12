@@ -362,6 +362,9 @@ describe("AcpxSessionManager", () => {
     expect((started.details as { output: string }).output).toBe(
       "Permission mode: approve-reads"
     );
+    expect((started.details as { session: SessionInfo }).session.permissionMode).toBe(
+      "approve-all"
+    );
 
     const approved = await manager.send({
       name: "turn-permission-demo",
@@ -371,7 +374,7 @@ describe("AcpxSessionManager", () => {
     });
     const approvedDetails = approved.details as { session: SessionInfo; output: string };
     expect(approvedDetails.output).toBe("Permission mode: approve-all");
-    expect(approvedDetails.session.permissionMode).toBe("approve-reads");
+    expect(approvedDetails.session.permissionMode).toBe("approve-all");
 
     const denied = await manager.send({
       name: "turn-permission-demo",
@@ -381,7 +384,7 @@ describe("AcpxSessionManager", () => {
     });
     const deniedDetails = denied.details as { session: SessionInfo; output: string };
     expect(deniedDetails.output).toBe("Permission mode: deny-all");
-    expect(deniedDetails.session.permissionMode).toBe("approve-reads");
+    expect(deniedDetails.session.permissionMode).toBe("approve-all");
 
     const following = await manager.send({
       name: "turn-permission-demo",
@@ -389,8 +392,81 @@ describe("AcpxSessionManager", () => {
       contextFiles: []
     });
     const followingDetails = following.details as { session: SessionInfo; output: string };
-    expect(followingDetails.output).toBe("Permission mode: approve-reads");
-    expect(followingDetails.session.permissionMode).toBe("approve-reads");
+    expect(followingDetails.output).toBe("Permission mode: approve-all");
+    expect(followingDetails.session.permissionMode).toBe("approve-all");
+  });
+
+  it("applies start-time elevation for one turn without persisting it", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-start-permission-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand: await resolveFakeAcpxCommand(),
+        permissionMode: "approve-reads"
+      }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+
+    const started = await manager.start({
+      agent: "claude",
+      name: "elevated-start",
+      directory: workspaceDir,
+      task: "REPORT_PERMISSION_MODE",
+      permissionMode: "approve-all",
+      contextFiles: []
+    });
+    const startedDetails = started.details as { session: SessionInfo; output: string };
+    expect(startedDetails.output).toBe("Permission mode: approve-all");
+    expect(startedDetails.session.permissionMode).toBe("approve-reads");
+
+    const following = await manager.send({
+      name: "elevated-start",
+      message: "REPORT_PERMISSION_MODE",
+      contextFiles: []
+    });
+    expect((following.details as { session: SessionInfo; output: string })).toMatchObject({
+      output: "Permission mode: approve-reads",
+      session: { permissionMode: "approve-reads" }
+    });
+  });
+
+  it("never elevates a deny-all baseline", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-deny-all-start-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand: await resolveFakeAcpxCommand(),
+        permissionMode: "deny-all"
+      }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+
+    const started = await manager.start({
+      agent: "claude",
+      name: "deny-all-start",
+      directory: workspaceDir,
+      task: "REPORT_PERMISSION_MODE",
+      permissionMode: "approve-all",
+      contextFiles: []
+    });
+    expect((started.details as { session: SessionInfo; output: string })).toMatchObject({
+      output: "Permission mode: deny-all",
+      session: { permissionMode: "deny-all" }
+    });
+    const attemptedElevation = await manager.send({
+      name: "deny-all-start",
+      message: "REPORT_PERMISSION_MODE",
+      permissionMode: "approve-all",
+      contextFiles: []
+    });
+    expect((attemptedElevation.details as { session: SessionInfo; output: string })).toMatchObject({
+      output: "Permission mode: deny-all",
+      session: { permissionMode: "deny-all" }
+    });
   });
 
   it("allows a lower permission mode for one turn without lowering the baseline", async () => {
@@ -1974,6 +2050,69 @@ describe("AcpxSessionManager", () => {
     });
   });
 
+  it("preserves Stop and the completed turn when Stop races terminal persistence", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-stop-terminal-race-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const originalPatchSession = store.patchSession.bind(store);
+    let releaseFinalPatch!: () => void;
+    const finalPatchGate = new Promise<void>((resolve) => {
+      releaseFinalPatch = resolve;
+    });
+    let signalFinalPatch!: () => void;
+    const finalPatchEntered = new Promise<void>((resolve) => {
+      signalFinalPatch = resolve;
+    });
+    let heldFinalPatch = false;
+    store.patchSession = async (name, patch) => {
+      const current = store.getSession(name);
+      if (name === "stop-terminal-race" && current?.activeTurn?.state === "running") {
+        const preview = patch(structuredClone(current));
+        if (
+          !heldFinalPatch &&
+          preview?.activeTurn?.state === "completed" &&
+          preview.transcript.length > current.transcript.length
+        ) {
+          heldFinalPatch = true;
+          signalFinalPatch();
+          await finalPatchGate;
+        }
+      }
+      return await originalPatchSession(name, patch);
+    };
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+
+    const startOutcome = manager.start({
+      agent: "claude",
+      name: "stop-terminal-race",
+      directory: workspaceDir,
+      task: "Finish while Stop races persistence.",
+      contextFiles: []
+    });
+    await finalPatchEntered;
+    const stopped = await manager.stop({ name: "stop-terminal-race" });
+    expect((stopped.details as { session: SessionInfo }).session.state).toBe("stopped");
+    releaseFinalPatch();
+    const started = await startOutcome;
+    const startedSession = (started.details as { session: SessionInfo }).session;
+    const persisted = store.getSession("stop-terminal-race");
+
+    expect(startedSession.state).toBe("stopped");
+    expect(persisted).toMatchObject({
+      state: "stopped",
+      lastStopReason: "stopped by user",
+      activeTurn: { state: "stopped", completedAt: expect.any(String) }
+    });
+    expect(persisted?.transcript.some((entry) => entry.text.includes("Finish while Stop"))).toBe(
+      true
+    );
+    expect(persisted?.transcript.some((entry) => entry.text.includes("Handled:"))).toBe(true);
+  });
+
   it("switches advertised Claude modes per turn, restores the baseline, and exposes native plan signals", async () => {
     const workspaceDir = await createTempDir("puppenclaw-native-plan-");
     const acpxCommand = await resolveFakeAcpxCommand();
@@ -2447,6 +2586,276 @@ describe("AcpxSessionManager", () => {
         contextFiles: []
       })
     ).rejects.toThrow(/none can be suspended/u);
+  });
+
+  it("serializes simultaneous persistent-runtime capacity admission", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-capacity-race-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand: await resolveFakeAcpxCommand(),
+        maxSessions: 1
+      }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    const originalInstall = manager["installSessionSkills"].bind(manager);
+    let releaseAdmission!: () => void;
+    const admissionGate = new Promise<void>((resolve) => {
+      releaseAdmission = resolve;
+    });
+    let enteredAdmission!: () => void;
+    const admissionEntered = new Promise<void>((resolve) => {
+      enteredAdmission = resolve;
+    });
+    manager["installSessionSkills"] = async (...args) => {
+      if (manager["capacityReservations"].has("capacity-first")) {
+        enteredAdmission();
+        await admissionGate;
+      }
+      return await originalInstall(...args);
+    };
+    const first = manager.start({
+      agent: "claude",
+      name: "capacity-first",
+      directory: workspaceDir,
+      task: "First admitted session.",
+      contextFiles: []
+    });
+    await admissionEntered;
+
+    await expect(
+      manager.start({
+        agent: "claude",
+        name: "capacity-second",
+        directory: workspaceDir,
+        task: "Must not over-admit.",
+        contextFiles: []
+      })
+    ).rejects.toMatchObject({ code: "MAX_SESSIONS_REACHED" });
+    releaseAdmission();
+    await first;
+    expect(store.getSession("capacity-second")).toBeNull();
+    expect(manager["capacityReservations"].size).toBe(0);
+
+    manager["installSessionSkills"] = async () => {
+      throw new Error("simulated post-admission failure");
+    };
+    await expect(
+      manager.start({
+        agent: "claude",
+        name: "capacity-error",
+        directory: workspaceDir,
+        task: "Fail after reserving capacity.",
+        contextFiles: []
+      })
+    ).rejects.toThrow("simulated post-admission failure");
+    expect(manager["capacityReservations"].size).toBe(0);
+  });
+
+  it("serializes capacity eviction with lifecycle mutation of the victim", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-capacity-eviction-race-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand: await resolveFakeAcpxCommand(),
+        maxSessions: 1
+      }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    await manager.start({
+      agent: "claude",
+      name: "eviction-victim",
+      directory: workspaceDir,
+      task: "Hold the only slot.",
+      contextFiles: []
+    });
+    const originalSuspend = manager["suspendTrackedSession"].bind(manager);
+    let releaseEviction!: () => void;
+    const evictionGate = new Promise<void>((resolve) => {
+      releaseEviction = resolve;
+    });
+    let signalEviction!: () => void;
+    const evictionEntered = new Promise<void>((resolve) => {
+      signalEviction = resolve;
+    });
+    manager["suspendTrackedSession"] = async (...args) => {
+      if (args[0].name === "eviction-victim") {
+        signalEviction();
+        await evictionGate;
+      }
+      return await originalSuspend(...args);
+    };
+
+    const newcomer = manager.start({
+      agent: "claude",
+      name: "eviction-newcomer",
+      directory: workspaceDir,
+      task: "Claim the slot after eviction.",
+      contextFiles: []
+    });
+    await evictionEntered;
+    let stopFinished = false;
+    const stopVictim = manager.stop({ name: "eviction-victim" }).then((result) => {
+      stopFinished = true;
+      return result;
+    });
+    await sleep(25);
+    expect(stopFinished).toBe(false);
+
+    releaseEviction();
+    await newcomer;
+    await stopVictim;
+    expect(store.getSession("eviction-victim")?.state).toBe("stopped");
+    expect(store.getSession("eviction-newcomer")?.state).toBe("idle");
+    expect(manager["capacityReservations"].size).toBe(0);
+  });
+
+  it("does not charge one-shot logical sessions against persistent capacity", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-one-shot-capacity-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand: await resolveFakeAcpxCommand(),
+        agentCommands: { codex: await resolveFakeCodexPermissionCommand(workspaceDir) },
+        maxSessions: 1
+      }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    await manager.start({
+      agent: "claude",
+      name: "persistent-slot",
+      directory: workspaceDir,
+      task: "Hold the persistent worker slot.",
+      contextFiles: []
+    });
+
+    await expect(
+      manager.start({
+        agent: "codex",
+        name: "logical-one-shot",
+        directory: workspaceDir,
+        task: "Run independently.",
+        modelProvider: {
+          id: "one-shot-provider",
+          kind: "codex-openai",
+          model: "fake-model"
+        },
+        contextFiles: []
+      })
+    ).resolves.toMatchObject({ details: { session: { state: "idle" } } });
+    expect(store.getSession("persistent-slot")?.state).toBe("idle");
+  });
+
+  it("claims competing fork targets and includes the latest completed source turn", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-fork-race-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand(), maxSessions: 5 }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    await manager.start({
+      agent: "claude",
+      name: "fork-source-latest",
+      directory: workspaceDir,
+      task: "Initial source context.",
+      contextFiles: []
+    });
+    const sourceTurn = manager.send({
+      name: "fork-source-latest",
+      message: "SLOW_TURN latest source context",
+      contextFiles: []
+    });
+    const slowMarker = join(workspaceDir, ".fake-acpx-state", "fork-source-latest.slow");
+    let sourceTurnStarted = false;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (await readFile(slowMarker, "utf8").then(
+        () => true,
+        () => false
+      )) {
+        sourceTurnStarted = true;
+        break;
+      }
+      await sleep(10);
+    }
+    expect(sourceTurnStarted).toBe(true);
+    const forkOne = manager.fork({ source: "fork-source-latest", target: "shared-target" });
+    const forkTwo = manager.fork({ source: "fork-source-latest", target: "shared-target" });
+    const forkOutcomes = Promise.allSettled([forkOne, forkTwo]);
+    await manager.stop({ name: "fork-source-latest" });
+    await sourceTurn.catch(() => undefined);
+    const outcomes = await forkOutcomes;
+
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
+    expect(
+      (outcomes.find((outcome) => outcome.status === "rejected") as PromiseRejectedResult).reason
+    ).toMatchObject({ code: "FORK_TARGET_CLAIMED" });
+    const target = store.getSession("shared-target");
+    expect(target).not.toBeNull();
+    expect(target?.transcript.some((entry) => entry.text.includes("latest source context"))).toBe(
+      true
+    );
+  });
+
+  it("releases the source lifecycle lock before running the fork target turn", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-fork-source-lock-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand(), maxSessions: 3 }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    await manager.start({
+      agent: "claude",
+      name: "fork-lock-source",
+      directory: workspaceDir,
+      task: "SLOW_FORK_TARGET snapshot context",
+      contextFiles: []
+    });
+
+    const fork = manager.fork({ source: "fork-lock-source", target: "fork-lock-target" });
+    const observedFork = fork.then(
+      () => null,
+      (error: unknown) => error
+    );
+    const targetSlowMarker = join(
+      workspaceDir,
+      ".fake-acpx-state",
+      "fork-lock-target.slow"
+    );
+    let targetStarted = false;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (await readFile(targetSlowMarker, "utf8").then(
+        () => true,
+        () => false
+      )) {
+        targetStarted = true;
+        break;
+      }
+      await sleep(10);
+    }
+    expect(targetStarted).toBe(true);
+
+    const stoppedSource = await Promise.race([
+      manager.stop({ name: "fork-lock-source" }),
+      sleep(1_000).then(() => {
+        throw new Error("Stop remained blocked behind the fork target turn.");
+      })
+    ]);
+    expect((stoppedSource.details as { session: SessionInfo }).session.state).toBe("stopped");
+
+    await manager.stop({ name: "fork-lock-target" });
+    await observedFork;
+    expect(store.getSession("fork-lock-source")?.state).toBe("stopped");
   });
 
   it("survives a prompt child that exits before reading stdin (EPIPE)", async () => {

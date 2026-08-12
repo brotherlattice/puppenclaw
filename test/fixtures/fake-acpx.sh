@@ -235,7 +235,7 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
     emit_json "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32002,\"message\":\"No acpx session found\",\"data\":{\"acpxCode\":\"NO_SESSION\",\"origin\":\"cli\",\"sessionId\":\"unknown\"}}}"
     exit 4
   fi
-  if [[ "$normalized_input" == *"SLOW_TURN"* ]]; then
+  if [[ ( "$normalized_input" == *"SLOW_TURN"* && "$normalized_input" != *"This is a fork of session"* ) || ( "$normalized_input" == *"SLOW_FORK_TARGET"* && "$normalized_input" == *"This is a fork of session"* ) ]]; then
     : > "$state_dir/$(basename "$name").slow"
     sleep 60
   fi

@@ -279,14 +279,20 @@ function sanitizeBody(
   workspaceDir: string,
   liveTurn: LiveTurnProcess
 ): unknown {
+  const processGroupMarker = `__PUPPENCLAW_PROCESS_GROUP_${liveTurn.processGroupId}__`;
   const sanitized = body
     .replaceAll(liveTurn.processStartIdentity, FIXED_PROCESS_START_IDENTITY)
-    .replace(new RegExp(`\\b${liveTurn.pid}\\b`, "gu"), String(FIXED_PID))
     .replace(
       new RegExp(`\\b${liveTurn.processGroupId}\\b`, "gu"),
-      String(FIXED_PROCESS_GROUP_ID)
+      processGroupMarker
     )
+    .replace(new RegExp(`\\b${liveTurn.pid}\\b`, "gu"), String(FIXED_PID))
+    .replaceAll(processGroupMarker, String(FIXED_PROCESS_GROUP_ID))
     .replaceAll(workspaceDir, FIXED_WORKSPACE)
+    .replace(
+      /(\\?"completedAt\\?":\s*\\?")[^"\\]+(\\?")/gu,
+      `$1${T_TURN_OUTPUT}$2`
+    )
     .replace(/(\\?"detectedAt\\?":\s*\\?")[^"\\]+(\\?")/gu, `$1${T_LAST_ACTIVITY}$2`)
     .replace(/(\\?"ageMs\\?":\s*)\d+/gu, `$1${FIXED_AGE_MS}`)
     .replace(/(\\?"outputAgeMs\\?":\s*)\d+/gu, `$1${FIXED_OUTPUT_AGE_MS}`);

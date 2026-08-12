@@ -259,7 +259,11 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
     );
     process.exit(4);
   }
-  if (normalizedInput.includes("SLOW_TURN")) {
+  const isForkPrompt = normalizedInput.includes("This is a fork of session");
+  if (
+    (normalizedInput.includes("SLOW_TURN") && !isForkPrompt) ||
+    (normalizedInput.includes("SLOW_FORK_TARGET") && isForkPrompt)
+  ) {
     writeFileSync(join(stateDir, `${basename(name)}.slow`), "started\n", "utf8");
     await new Promise((resolve) => setTimeout(resolve, 60_000));
   }

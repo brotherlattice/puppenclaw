@@ -27,6 +27,7 @@ describe("daemon resource endpoints", () => {
     const dataDir = await createTempDir("puppenclaw-daemon-resources-");
     const seedStore = await SessionStore.open(dataDir);
     await seedStore.upsertSession(seedSession("chat-a"));
+    await seedStore.close();
     const { app } = await createDaemonServer({
       config: makeConfig({
         acpxCommand: await resolveFakeAcpxCommand(),

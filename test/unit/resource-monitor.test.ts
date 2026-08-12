@@ -254,6 +254,7 @@ describe("resource monitor", () => {
         state: "completed",
         startedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
         pid: 100,
         processStartIdentity: "100:5000",
         outputChars: 0

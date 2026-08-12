@@ -465,6 +465,26 @@ function buildPermissionArgs(mode: PermissionMode): string[] {
   return ["--approve-reads"];
 }
 
+function initialPermissionModes(
+  configuredBaseline: PermissionMode,
+  requested: PermissionMode | undefined
+): { baseline: PermissionMode; turn: PermissionMode } {
+  return {
+    baseline: configuredBaseline,
+    turn:
+      configuredBaseline === "deny-all"
+        ? "deny-all"
+        : (requested ?? configuredBaseline)
+  };
+}
+
+function turnPermissionMode(
+  baseline: PermissionMode,
+  requested: PermissionMode | undefined
+): PermissionMode {
+  return baseline === "deny-all" ? "deny-all" : (requested ?? baseline);
+}
+
 function buildCodexPermissionArgs(mode: PermissionMode): string[] {
   return mode === "approve-all"
     ? ["--dangerously-bypass-approvals-and-sandbox"]
@@ -1362,9 +1382,16 @@ export class AcpxSessionManager implements ISessionManager {
   private readonly activeTurnOutputs = new Map<string, ActiveTurnOutput>();
   private readonly activeTurnProcesses = new Map<string, ActiveTurnProcess>();
   private readonly lifecycleTails = new Map<string, Promise<void>>();
+  private admissionTail: Promise<void> = Promise.resolve();
+  private readonly capacityReservations = new Map<string, number>();
+  private readonly forkTargetClaims = new Set<string>();
   private readonly activeTurnIds = new Map<string, string>();
   private readonly activeTurnCheckpointAt = new Map<string, number>();
   private readonly activeTurnPersistence = new Map<string, Promise<void>>();
+  private readonly activeTurnCompletion = new Map<
+    string,
+    { promise: Promise<void>; resolve: () => void }
+  >();
   /**
    * Model/effort config options last applied to each live ACP runtime. Each
    * redundant `set` control command pays a full adapter spawn (~8s); acpx
@@ -1414,7 +1441,12 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async start(params: StartParams): Promise<ToolResult> {
-    return await this.withSessionTurnLock(params.name, params.lifecycleEpoch, async () => {
+    return await this.withSessionTurnLock(params.name, params.lifecycleEpoch, async () =>
+      await this.startTurn(params)
+    );
+  }
+
+  private async startTurn(params: StartParams): Promise<ToolResult> {
       const directory = resolvePath(params.directory);
       const now = nowIso();
       const requestedSkills = validateSkillNames(params.skills ?? []);
@@ -1433,7 +1465,21 @@ export class AcpxSessionManager implements ISessionManager {
           );
         }
       }
-      if (existing == null || !isConnectedSession(existing)) {
+      const permissionModes =
+        existing == null
+          ? initialPermissionModes(this.deps.config.permissionMode, params.permissionMode)
+          : {
+              baseline: existing.permissionMode,
+              turn: turnPermissionMode(existing.permissionMode, params.permissionMode)
+            };
+      const requestedRuntime = existing ?? {
+        agent: params.agent,
+        ...(params.modelProvider != null ? { modelProvider: params.modelProvider } : {})
+      };
+      if (
+        (existing == null || !isConnectedSession(existing)) &&
+        !this.usesOneShotRuntime(requestedRuntime)
+      ) {
         await this.ensureConnectedCapacity(params.name);
       }
 
@@ -1445,7 +1491,7 @@ export class AcpxSessionManager implements ISessionManager {
           name: params.name,
           agent: params.agent,
           directory,
-          permissionMode: params.permissionMode ?? this.deps.config.permissionMode,
+          permissionMode: permissionModes.baseline,
           ...(params.effort != null ? { effort: params.effort } : {}),
           ...(params.planningProfile != null ? { planningProfile: params.planningProfile } : {}),
           ...(params.model != null ? { model: params.model } : {}),
@@ -1525,7 +1571,7 @@ export class AcpxSessionManager implements ISessionManager {
         const effectivePromptText = this.usesOneShotRuntime(session)
           ? this.buildOneShotContinuationPrompt(session, runtimePromptText)
           : runtimePromptText;
-        const effectivePermissionMode = this.effectivePermissionMode(session);
+        const effectivePermissionMode = permissionModes.turn;
         let turn: TurnResult;
         try {
           turn = await this.runTurn({
@@ -1549,14 +1595,13 @@ export class AcpxSessionManager implements ISessionManager {
           );
           throw error;
         }
-        const stoppedDuringTurn = this.stopRequests.delete(params.name);
         const nextSession = await this.persistFinalTurnSession(
           params.name,
-          stoppedDuringTurn ? "stopped" : turn.state === "failed" ? "failed" : "completed",
-          (current, activeTurn) => ({
+          turn.state === "failed" ? "failed" : "completed",
+          (current, activeTurn, stoppedDuringTurn) => ({
             ...current,
             ...session,
-            permissionMode: effectivePermissionMode,
+            permissionMode: permissionModes.baseline,
             state: stoppedDuringTurn ? "stopped" : turn.state,
             lastActivity: nowIso(),
             warnings: dedupeWarnings([...warnings, ...turn.warnings]),
@@ -1610,7 +1655,6 @@ export class AcpxSessionManager implements ISessionManager {
         }
         throw error;
       }
-    });
   }
 
   async send(params: SendParams): Promise<ToolResult> {
@@ -1628,7 +1672,7 @@ export class AcpxSessionManager implements ISessionManager {
         // silently fall back to stale endpoint or model metadata.
         await this.deps.store.upsertSession(effectiveSession);
       }
-      if (!isConnectedSession(session)) {
+      if (!isConnectedSession(session) && !this.usesOneShotRuntime(effectiveSession)) {
         await this.ensureConnectedCapacity(params.name);
       }
       if (!this.usesOneShotRuntime(effectiveSession)) {
@@ -1666,8 +1710,10 @@ export class AcpxSessionManager implements ISessionManager {
       const effectivePromptText = this.usesOneShotRuntime(effectiveSession)
         ? this.buildOneShotContinuationPrompt(effectiveSession, runtimePromptText)
         : runtimePromptText;
-      const effectivePermissionMode =
-        params.permissionMode ?? this.effectivePermissionMode(session);
+      const effectivePermissionMode = turnPermissionMode(
+        this.effectivePermissionMode(session),
+        params.permissionMode
+      );
       let turn: TurnResult;
       try {
         turn = await this.runTurn({
@@ -1691,11 +1737,10 @@ export class AcpxSessionManager implements ISessionManager {
         );
         throw error;
       }
-      const stoppedDuringTurn = this.stopRequests.delete(params.name);
       const nextSession = await this.persistFinalTurnSession(
         params.name,
-        stoppedDuringTurn ? "stopped" : turn.state === "failed" ? "failed" : "completed",
-        (current, activeTurn) => ({
+        turn.state === "failed" ? "failed" : "completed",
+        (current, activeTurn, stoppedDuringTurn) => ({
           ...current,
           ...effectiveSession,
           permissionMode:
@@ -1769,156 +1814,248 @@ export class AcpxSessionManager implements ISessionManager {
       }
 
       const nextSession: SessionInfo = {
-        ...withoutRecoveryFence(withoutFocusLease(session)),
+        ...session,
         state: "stopped",
         lastActivity: nowIso(),
-        lastStopReason: "stopped by user",
-        ...(session.activeTurn != null
-          ? {
-              activeTurn: {
-                ...session.activeTurn,
-                state: "stopped",
-                updatedAt: nowIso(),
-                completedAt: nowIso()
-              }
-            }
-          : {})
+        lastStopReason: "stopped by user"
       };
-      await this.deps.store.upsertSession(nextSession);
+      const persistedSession = await this.deps.store.patchSession(params.name, (current) => {
+        const latest = current ?? nextSession;
+        const stoppedAt = nowIso();
+        return {
+          ...withoutRecoveryFence(withoutFocusLease(latest)),
+          state: "stopped",
+          lastActivity: stoppedAt,
+          lastStopReason: "stopped by user",
+          ...(latest.activeTurn != null
+            ? {
+                activeTurn: {
+                  ...latest.activeTurn,
+                  state: "stopped",
+                  updatedAt: stoppedAt,
+                  completedAt: latest.activeTurn.completedAt ?? stoppedAt
+                }
+              }
+            : {})
+        };
+      });
       if (!hadActiveTurn) {
         this.stopRequests.delete(params.name);
       }
       return textToolResult(`Stopped session ${params.name}.`, {
-        session: nextSession
+        session: persistedSession ?? nextSession
       });
     });
   }
 
   async resume(params: ResumeParams): Promise<ToolResult> {
+    let capacityReserved = false;
+    try {
+      while (true) {
+        const snapshot = this.requireSession(params.name);
+        if (
+          !capacityReserved &&
+          !isConnectedSession(snapshot) &&
+          !this.usesOneShotRuntime(snapshot)
+        ) {
+          capacityReserved = await this.ensureConnectedCapacity(snapshot.name);
+        }
+        const attempt = await this.withLifecycleLock(
+          params.name,
+          async (): Promise<{ retry: true } | { result: ToolResult }> => {
+            this.deps.store.assertSessionMutable(params.name);
+            const storedSession = this.requireSession(params.name);
+            if (
+              !capacityReserved &&
+              !isConnectedSession(storedSession) &&
+              !this.usesOneShotRuntime(storedSession)
+            ) {
+              return { retry: true };
+            }
+            const reasoning = this.resolveSessionReasoning(storedSession);
+            const session = reasoning.session;
+            if (!this.usesOneShotRuntime(session)) {
+              await this.ensureRuntimeSession({
+                name: session.name,
+                agent: session.agent,
+                directory: session.directory,
+                forceApply: true,
+                // Resume is a reconnect, not a turn: keep it usable even when the
+                // adapter no longer knows the pinned model. The failed set is not
+                // remembered as applied, so the next start/send re-attempts it and
+                // fails with MODEL_UNAVAILABLE before running anything.
+                tolerateModelRejection: true,
+                ...(session.model != null ? { model: session.model } : {}),
+                ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
+                ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+              });
+            }
+            const nextSession: SessionInfo = {
+              ...session,
+              state: "idle",
+              warnings: dedupeWarnings([
+                ...session.warnings,
+                ...(reasoning.warning != null ? [reasoning.warning] : [])
+              ])
+            };
+            await this.deps.store.upsertSession(nextSession);
+            return {
+              result: textToolResult(`Resumed session ${params.name}.`, {
+                session: nextSession
+              })
+            };
+          }
+        );
+        if ("result" in attempt) {
+          return attempt.result;
+        }
+      }
+    } finally {
+      if (capacityReserved) {
+        this.releaseCapacityReservation(params.name);
+      }
+    }
+  }
+
+  async suspend(params: SuspendParams): Promise<ToolResult> {
     return await this.withLifecycleLock(params.name, async () => {
       this.deps.store.assertSessionMutable(params.name);
-      const storedSession = this.requireSession(params.name);
-      const reasoning = this.resolveSessionReasoning(storedSession);
-      const session = reasoning.session;
-      if (!isConnectedSession(session)) {
-        await this.ensureConnectedCapacity(session.name);
+      const session = this.requireSession(params.name);
+      if (this.isTurnActive(session)) {
+        throw new PuppenclawError(
+          "TURN_ALREADY_RUNNING",
+          `Session ${params.name} is currently running a turn and cannot be suspended.`
+        );
       }
-      if (!this.usesOneShotRuntime(session)) {
-        await this.ensureRuntimeSession({
-          name: session.name,
-          agent: session.agent,
-          directory: session.directory,
-          forceApply: true,
-          // Resume is a reconnect, not a turn: keep it usable even when the
-          // adapter no longer knows the pinned model. The failed set is not
-          // remembered as applied, so the next start/send re-attempts it and
-          // fails with MODEL_UNAVAILABLE before running anything.
-          tolerateModelRejection: true,
-          ...(session.model != null ? { model: session.model } : {}),
-          ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
-          ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+      if (session.state === "suspended" || isTerminalSession(session)) {
+        return textToolResult(`Session ${params.name} is not connected.`, {
+          session
         });
       }
-      const nextSession: SessionInfo = {
-        ...session,
-        state: "idle",
-        warnings: dedupeWarnings([
-          ...session.warnings,
-          ...(reasoning.warning != null ? [reasoning.warning] : [])
-        ])
-      };
-      await this.deps.store.upsertSession(nextSession);
-      return textToolResult(`Resumed session ${params.name}.`, {
+      const nextSession = await this.suspendTrackedSession(session, "suspended by user");
+      return textToolResult(`Suspended session ${params.name}.`, {
         session: nextSession
       });
     });
   }
 
-  async suspend(params: SuspendParams): Promise<ToolResult> {
-    this.deps.store.assertSessionMutable(params.name);
-    const session = this.requireSession(params.name);
-    if (this.isTurnActive(session)) {
-      throw new PuppenclawError(
-        "TURN_ALREADY_RUNNING",
-        `Session ${params.name} is currently running a turn and cannot be suspended.`
-      );
-    }
-    if (session.state === "suspended" || isTerminalSession(session)) {
-      return textToolResult(`Session ${params.name} is not connected.`, {
-        session
-      });
-    }
-    const nextSession = await this.suspendTrackedSession(session, "suspended by user");
-    return textToolResult(`Suspended session ${params.name}.`, {
-      session: nextSession
-    });
-  }
-
   async focus(params: FocusParams): Promise<ToolResult> {
-    this.deps.store.assertSessionMutable(params.name);
-    const session = this.requireSession(params.name);
-    const ttlMs = params.ttlMs ?? DEFAULT_FOCUS_LEASE_MS;
-    const nextSession: SessionInfo = {
-      ...session,
-      focusedUntil: new Date(Date.now() + ttlMs).toISOString()
-    };
-    await this.deps.store.upsertSession(nextSession);
-    return textToolResult(`Focused session ${params.name}.`, {
-      session: nextSession
+    return await this.withLifecycleLock(params.name, async () => {
+      this.deps.store.assertSessionMutable(params.name);
+      const session = this.requireSession(params.name);
+      const ttlMs = params.ttlMs ?? DEFAULT_FOCUS_LEASE_MS;
+      const nextSession: SessionInfo = {
+        ...session,
+        focusedUntil: new Date(Date.now() + ttlMs).toISOString()
+      };
+      await this.deps.store.upsertSession(nextSession);
+      return textToolResult(`Focused session ${params.name}.`, {
+        session: nextSession
+      });
     });
   }
 
   async unfocus(params: UnfocusParams): Promise<ToolResult> {
-    this.deps.store.assertSessionMutable(params.name);
-    const session = this.requireSession(params.name);
-    const nextSession = withoutFocusLease(session);
-    await this.deps.store.upsertSession(nextSession);
-    return textToolResult(`Unfocused session ${params.name}.`, {
-      session: nextSession
+    return await this.withLifecycleLock(params.name, async () => {
+      this.deps.store.assertSessionMutable(params.name);
+      const session = this.requireSession(params.name);
+      const nextSession = withoutFocusLease(session);
+      await this.deps.store.upsertSession(nextSession);
+      return textToolResult(`Unfocused session ${params.name}.`, {
+        session: nextSession
+      });
     });
   }
 
   async fork(params: ForkParams): Promise<ToolResult> {
-    return await this.withLifecycleLock(params.source, async () => {
-      this.deps.store.assertSessionMutable(params.source);
-      this.deps.store.assertSessionMutable(params.target);
-      const source = this.requireSession(params.source);
-      if (this.deps.store.getSession(params.target) != null) {
+    const claimTarget = await this.withAdmissionLock(async () => {
+      if (this.forkTargetClaims.has(params.target)) {
         throw new PuppenclawError(
-          "SESSION_EXISTS",
-          `Target session ${params.target} already exists.`
+          "FORK_TARGET_CLAIMED",
+          `Target session ${params.target} is already being created by another fork.`
         );
       }
-      const transcriptText = source.transcript
-        .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
-        .join("\n\n");
-      const forkPrompt = [
+      this.forkTargetClaims.add(params.target);
+      return true;
+    });
+    try {
+      while (true) {
+        await this.activeTurnCompletion.get(params.source)?.promise;
+        const attempt = await this.withLifecycleLocks(
+          [params.source, params.target],
+          async (): Promise<{ startParams: StartParams } | { wait: Promise<void> }> => {
+            const racedCompletion = this.activeTurnCompletion.get(params.source)?.promise;
+            if (racedCompletion != null) {
+              return { wait: racedCompletion };
+            }
+            return {
+              startParams: await this.prepareForkWithLifecycleLocksHeld(params)
+            };
+          }
+        );
+        if ("wait" in attempt) {
+          await attempt.wait;
+          continue;
+        }
+        try {
+          const result = await this.startTurn(attempt.startParams);
+          return textToolResult(`Forked ${params.source} into ${params.target}.`, result.details);
+        } finally {
+          this.releaseSessionTurn(params.target);
+        }
+      }
+    } finally {
+      if (claimTarget) {
+        this.forkTargetClaims.delete(params.target);
+      }
+    }
+  }
+
+  private async prepareForkWithLifecycleLocksHeld(params: ForkParams): Promise<StartParams> {
+    this.deps.store.assertSessionMutable(params.source);
+    this.deps.store.assertSessionMutable(params.target);
+    if (params.source === params.target) {
+      throw new PuppenclawError(
+        "SESSION_CONFLICT",
+        "A fork target must differ from its source session."
+      );
+    }
+    if (this.deps.store.getSession(params.target) != null) {
+      throw new PuppenclawError(
+        "SESSION_EXISTS",
+        `Target session ${params.target} already exists.`
+      );
+    }
+    // Re-read only after the source turn is quiet and both stable-order locks
+    // are held, so the branch includes every durably completed source entry.
+    const source = this.requireSession(params.source);
+    const transcriptText = source.transcript
+      .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
+      .join("\n\n");
+    const startParams: StartParams = {
+      agent: source.agent,
+      name: params.target,
+      directory: source.directory,
+      task: [
         `This is a fork of session ${source.name}.`,
         "Treat the following transcript as prior context for the new branch.",
         transcriptText
-      ].join("\n\n");
-
-      const startParams: StartParams = {
-        agent: source.agent,
-        name: params.target,
-        directory: source.directory,
-        task: forkPrompt,
-        permissionMode: source.permissionMode,
-        effort: params.effort ?? source.effort,
-        planningProfile: source.planningProfile,
-        model: params.model ?? source.model,
-        contextFiles: [],
-        skills: source.skills ?? []
-      };
-      if (source.modelProviderId != null) {
-        startParams.modelProviderId = source.modelProviderId;
-      }
-      if (source.modelProvider != null) {
-        startParams.modelProvider = source.modelProvider;
-      }
-      const result = await this.start(startParams);
-      return textToolResult(`Forked ${params.source} into ${params.target}.`, result.details);
-    });
+      ].join("\n\n"),
+      permissionMode: source.permissionMode,
+      effort: params.effort ?? source.effort,
+      planningProfile: source.planningProfile,
+      model: params.model ?? source.model,
+      contextFiles: [],
+      skills: source.skills ?? []
+    };
+    if (source.modelProviderId != null) {
+      startParams.modelProviderId = source.modelProviderId;
+    }
+    if (source.modelProvider != null) {
+      startParams.modelProvider = source.modelProvider;
+    }
+    await this.enterSessionTurnAfterLifecycleLock(params.target, undefined);
+    return startParams;
   }
 
   async listSkills(): Promise<ToolResult> {
@@ -2267,62 +2404,81 @@ export class AcpxSessionManager implements ISessionManager {
 
   /** Reconcile persisted turns before accepting any new work. */
   async reconcilePersistedSessions(): Promise<void> {
-    for (const stored of this.deps.store.listSessions()) {
-      if (stored.state !== "running") {
-        continue;
-      }
-      // Quiesced sessions are fenced against mutation and already presented
-      // as stopped; leave them for the quiescence release path.
-      if (this.deps.store.getQuiescence(stored.name) != null) {
-        continue;
-      }
-      const reconciled = await this.reconcileVisibleSession(stored);
-      try {
-        if (reconciled.turn.classification === "orphaned") {
-          await this.deps.store.patchSession(stored.name, (current) =>
-            current == null || current.state !== "running"
+    for (const snapshot of this.deps.store.listSessions()) {
+      await this.withLifecycleLock(snapshot.name, async () => {
+        const stored = this.deps.store.getSession(snapshot.name);
+        if (
+          stored == null ||
+          (stored.state !== "running" &&
+            stored.activeTurn?.state !== "running" &&
+            stored.recoveryFence == null)
+        ) {
+          return;
+        }
+        const reconciled = await this.reconcileVisibleSession(stored);
+        try {
+          if (reconciled.turn.classification === "orphaned") {
+            await this.patchSessionDuringReconciliation(stored.name, (current) =>
+              current.activeTurn?.id !== stored.activeTurn?.id
+                ? current
+                : {
+                    ...withoutRecoveryFence(reconciled.session),
+                    lastStopReason: "Interrupted by daemon restart"
+                  }
+            );
+            this.deps.logger.warn(
+              `Session ${stored.name} had a persisted active turn whose process is gone; marked failed at startup.`
+            );
+            return;
+          }
+
+          const recoveryFence: SessionRecoveryFence = stored.recoveryFence ?? {
+            reason:
+              stored.activeTurn == null
+                ? "missing-turn-metadata"
+                : reconciled.turn.processAlive === true
+                  ? "restart-survivor"
+                  : "unverified-process",
+            detectedAt: nowIso(),
+            ...(reconciled.turn.pid != null ? { pid: reconciled.turn.pid } : {}),
+            ...(reconciled.turn.processGroupId != null
+              ? { processGroupId: reconciled.turn.processGroupId }
+              : {}),
+            ...(stored.activeTurn?.processStartIdentity != null
+              ? { processStartIdentity: stored.activeTurn.processStartIdentity }
+              : {})
+          };
+          await this.patchSessionDuringReconciliation(stored.name, (current) =>
+            current.activeTurn?.id !== stored.activeTurn?.id
               ? current
               : {
-                  ...withoutRecoveryFence(reconciled.session),
-                  lastStopReason: "Interrupted by daemon restart"
+                  ...current,
+                  recoveryFence
                 }
           );
           this.deps.logger.warn(
-            `Session ${stored.name} was persisted as running but its turn process is gone; marked failed at startup.`
+            `Session ${stored.name} may still have restart-surviving work; fenced against new turns.`
           );
-          continue;
+        } catch (error) {
+          this.deps.logger.warn(
+            `Unable to reconcile persisted session ${stored.name} at startup: ${ensureError(error).message}`
+          );
         }
-
-        const recoveryFence: SessionRecoveryFence = stored.recoveryFence ?? {
-          reason:
-            stored.activeTurn == null
-              ? "missing-turn-metadata"
-              : reconciled.turn.processAlive === true
-                ? "restart-survivor"
-                : "unverified-process",
-          detectedAt: nowIso(),
-          ...(reconciled.turn.pid != null ? { pid: reconciled.turn.pid } : {}),
-          ...(reconciled.turn.processGroupId != null
-            ? { processGroupId: reconciled.turn.processGroupId }
-            : {}),
-          ...(stored.activeTurn?.processStartIdentity != null
-            ? { processStartIdentity: stored.activeTurn.processStartIdentity }
-            : {})
-        };
-        await this.deps.store.patchSession(stored.name, (current) =>
-          current == null || current.state !== "running"
-            ? current
-            : { ...current, recoveryFence }
-        );
-        this.deps.logger.warn(
-          `Session ${stored.name} may still have restart-surviving work; fenced against new turns.`
-        );
-      } catch (error) {
-        this.deps.logger.warn(
-          `Unable to reconcile persisted session ${stored.name} at startup: ${ensureError(error).message}`
-        );
-      }
+      });
     }
+  }
+
+  private async patchSessionDuringReconciliation(
+    name: string,
+    patch: (current: SessionInfo) => SessionInfo
+  ): Promise<SessionInfo | null> {
+    const reservation = this.deps.store.getQuiescence(name);
+    if (reservation != null) {
+      return await this.deps.store.patchQuiescedSession(name, reservation.epoch, patch);
+    }
+    return await this.deps.store.patchSession(name, (current) =>
+      current == null ? null : patch(current)
+    );
   }
 
   private async withSessionTurnLock<T>(
@@ -2330,23 +2486,46 @@ export class AcpxSessionManager implements ISessionManager {
     lifecycleEpoch: number | undefined,
     run: () => Promise<T>
   ): Promise<T> {
-    await this.withLifecycleLock(name, async () => {
-      if (this.activeTurns.has(name)) {
-        throw new PuppenclawError(
-          "TURN_ALREADY_RUNNING",
-          `Session ${name} is already running a turn.`
-        );
-      }
-      await this.assertRecoveryFenceReleased(name);
-      await this.deps.store.enterLifecycleTurn(name, lifecycleEpoch);
-      this.activeTurns.add(name);
-      this.stopRequests.delete(name);
-    });
+    await this.withLifecycleLock(name, async () =>
+      await this.enterSessionTurnAfterLifecycleLock(name, lifecycleEpoch)
+    );
     try {
       return await run();
     } finally {
-      this.activeTurns.delete(name);
+      this.releaseSessionTurn(name);
     }
+  }
+
+  private async enterSessionTurnAfterLifecycleLock(
+    name: string,
+    lifecycleEpoch: number | undefined
+  ): Promise<void> {
+    if (this.activeTurns.has(name)) {
+      throw new PuppenclawError(
+        "TURN_ALREADY_RUNNING",
+        `Session ${name} is already running a turn.`
+      );
+    }
+    await this.assertRecoveryFenceReleased(name);
+    await this.deps.store.enterLifecycleTurn(name, lifecycleEpoch);
+    let resolveCompletion!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    this.activeTurnCompletion.set(name, {
+      promise: completion,
+      resolve: resolveCompletion
+    });
+    this.activeTurns.add(name);
+    this.stopRequests.delete(name);
+  }
+
+  private releaseSessionTurn(name: string): void {
+    this.activeTurns.delete(name);
+    this.releaseCapacityReservation(name);
+    const completion = this.activeTurnCompletion.get(name);
+    this.activeTurnCompletion.delete(name);
+    completion?.resolve();
   }
 
   private async withLifecycleLock<T>(name: string, run: () => Promise<T>): Promise<T> {
@@ -2364,6 +2543,27 @@ export class AcpxSessionManager implements ISessionManager {
         this.lifecycleTails.delete(name);
       }
     }
+  }
+
+  private async withAdmissionLock<T>(run: () => Promise<T>): Promise<T> {
+    const operation = this.admissionTail.catch(() => undefined).then(run);
+    this.admissionTail = operation.then(
+      () => undefined,
+      () => undefined
+    );
+    return await operation;
+  }
+
+  private async withLifecycleLocks<T>(names: readonly string[], run: () => Promise<T>): Promise<T> {
+    const ordered = [...new Set(names)].sort((left, right) => left.localeCompare(right));
+    const acquire = async (index: number): Promise<T> => {
+      const name = ordered[index];
+      if (name == null) {
+        return await run();
+      }
+      return await this.withLifecycleLock(name, async () => await acquire(index + 1));
+    };
+    return await acquire(0);
   }
 
   private async assertRecoveryFenceReleased(name: string): Promise<void> {
@@ -2495,12 +2695,14 @@ export class AcpxSessionManager implements ISessionManager {
     }
     try {
       process.kill(-(fence.processGroupId ?? observed.processGroupId), signal);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-        try {
-          process.kill(fence.pid, signal);
-        } catch {
-          // The polling proof below decides whether the fence may be cleared.
+    } catch {
+      try {
+        process.kill(fence.pid, signal);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+          this.deps.logger.debug(
+            `Unable to signal recovered process ${fence.pid}: ${ensureError(error).message}`
+          );
         }
       }
     }
@@ -2610,12 +2812,25 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private async recordQuiescedSessionState(name: string, epoch: number): Promise<void> {
-    await this.deps.store.patchQuiescedSession(name, epoch, (current) => ({
-      ...withoutRecoveryFence(withoutFocusLease(current)),
-      state: "stopped",
-      lastActivity: nowIso(),
-      lastStopReason: `quiesced at lifecycle epoch ${epoch}`
-    }));
+    await this.deps.store.patchQuiescedSession(name, epoch, (current) => {
+      const stoppedAt = nowIso();
+      return {
+        ...withoutRecoveryFence(withoutFocusLease(current)),
+        state: "stopped",
+        lastActivity: stoppedAt,
+        lastStopReason: `quiesced at lifecycle epoch ${epoch}`,
+        ...(current.activeTurn?.state === "running"
+          ? {
+              activeTurn: {
+                ...current.activeTurn,
+                state: "stopped" as const,
+                updatedAt: stoppedAt,
+                completedAt: stoppedAt
+              }
+            }
+          : {})
+      };
+    });
   }
 
   private async waitForActiveTurnDrain(name: string): Promise<boolean> {
@@ -2669,6 +2884,10 @@ export class AcpxSessionManager implements ISessionManager {
     if (turn.classification === "orphaned") {
       const warning =
         "Persisted active turn has no matching live process; the turn is orphaned.";
+      const orphanedAt =
+        session.activeTurn?.state === "running"
+          ? nowIso()
+          : (session.activeTurn?.completedAt ?? session.activeTurn?.updatedAt ?? nowIso());
       return {
         session: {
           ...session,
@@ -2679,7 +2898,9 @@ export class AcpxSessionManager implements ISessionManager {
             ? {
                 activeTurn: {
                   ...session.activeTurn,
-                  state: "orphaned"
+                  state: "orphaned",
+                  updatedAt: session.activeTurn.updatedAt,
+                  completedAt: session.activeTurn.completedAt ?? orphanedAt
                 }
               }
             : {})
@@ -2786,36 +3007,94 @@ export class AcpxSessionManager implements ISessionManager {
     };
   }
 
-  private async ensureConnectedCapacity(incomingSessionName: string): Promise<void> {
-    const incoming = this.deps.store.getSession(incomingSessionName);
-    if (incoming != null && isConnectedSession(incoming)) {
-      return;
-    }
-
-    const maxSessions = this.deps.config.maxSessions || DEFAULT_MAX_SESSIONS;
-    const connectedSessions = this.deps.store.listSessions().filter(isConnectedSession);
-    if (connectedSessions.length < maxSessions) {
-      return;
-    }
-
-    const evictionCandidate = connectedSessions
-      .filter((session) => session.name !== incomingSessionName)
-      .filter((session) => !this.isTurnActive(session))
-      .filter((session) => !isFocusLeaseActive(session))
-      .sort((left, right) => Date.parse(left.lastActivity) - Date.parse(right.lastActivity))
-      .at(0);
-
-    if (evictionCandidate == null) {
-      throw new PuppenclawError(
-        "MAX_SESSIONS_REACHED",
-        `Orchestrator is already tracking ${connectedSessions.length} connected sessions and none can be suspended.`
-      );
-    }
-
-    await this.suspendTrackedSession(
-      evictionCandidate,
-      `suspended by LRU eviction for ${incomingSessionName}`
+  private async ensureConnectedCapacity(incomingSessionName: string): Promise<boolean> {
+    return await this.withAdmissionLock(async () =>
+      await this.ensureConnectedCapacityWithAdmissionLock(incomingSessionName)
     );
+  }
+
+  private async ensureConnectedCapacityWithAdmissionLock(
+    incomingSessionName: string
+  ): Promise<boolean> {
+    while (true) {
+      const incoming = this.deps.store.getSession(incomingSessionName);
+      if (
+        incoming != null &&
+        isConnectedSession(incoming) &&
+        !this.usesOneShotRuntime(incoming)
+      ) {
+        return false;
+      }
+      if (this.capacityReservations.has(incomingSessionName)) {
+        this.addCapacityReservation(incomingSessionName);
+        return true;
+      }
+
+      const maxSessions = this.deps.config.maxSessions || DEFAULT_MAX_SESSIONS;
+      const connectedSessions = this.deps.store
+        .listSessions()
+        .filter(isConnectedSession)
+        .filter((session) => !this.usesOneShotRuntime(session));
+      const connectedNames = new Set(connectedSessions.map((session) => session.name));
+      const pendingReservations = [...this.capacityReservations.keys()].filter(
+        (name) => !connectedNames.has(name)
+      );
+      const admittedCount = connectedSessions.length + pendingReservations.length;
+      if (admittedCount < maxSessions) {
+        this.addCapacityReservation(incomingSessionName);
+        return true;
+      }
+
+      const evictionCandidate = connectedSessions
+        .filter((session) => session.name !== incomingSessionName)
+        .filter((session) => !this.isTurnActive(session))
+        .filter((session) => !isFocusLeaseActive(session))
+        .sort((left, right) => Date.parse(left.lastActivity) - Date.parse(right.lastActivity))
+        .at(0);
+
+      if (evictionCandidate == null) {
+        throw new PuppenclawError(
+          "MAX_SESSIONS_REACHED",
+          `Orchestrator has admitted ${admittedCount} persistent runtime sessions and none can be suspended.`
+        );
+      }
+
+      const suspended = await this.withLifecycleLock(evictionCandidate.name, async () => {
+        const current = this.deps.store.getSession(evictionCandidate.name);
+        if (
+          current == null ||
+          !isConnectedSession(current) ||
+          this.usesOneShotRuntime(current) ||
+          this.isTurnActive(current) ||
+          isFocusLeaseActive(current)
+        ) {
+          return false;
+        }
+        await this.suspendTrackedSession(
+          current,
+          `suspended by LRU eviction for ${incomingSessionName}`
+        );
+        return true;
+      });
+      if (!suspended) {
+        continue;
+      }
+      this.addCapacityReservation(incomingSessionName);
+      return true;
+    }
+  }
+
+  private addCapacityReservation(name: string): void {
+    this.capacityReservations.set(name, (this.capacityReservations.get(name) ?? 0) + 1);
+  }
+
+  private releaseCapacityReservation(name: string): void {
+    const reservations = this.capacityReservations.get(name);
+    if (reservations == null || reservations <= 1) {
+      this.capacityReservations.delete(name);
+      return;
+    }
+    this.capacityReservations.set(name, reservations - 1);
   }
 
   private async suspendTrackedSession(session: SessionInfo, reason: string): Promise<SessionInfo> {
@@ -4415,7 +4694,8 @@ export class AcpxSessionManager implements ISessionManager {
     state: ActiveTurnLifecycleState,
     buildSession: (
       current: SessionInfo,
-      activeTurn: ActiveTurnMetadata | undefined
+      activeTurn: ActiveTurnMetadata | undefined,
+      stoppedDuringTurn: boolean
     ) => SessionInfo,
     error?: string
   ): Promise<SessionInfo> {
@@ -4427,18 +4707,30 @@ export class AcpxSessionManager implements ISessionManager {
       if (current == null) {
         throw new PuppenclawError("NO_SESSION", `Unknown session ${sessionName}.`);
       }
+      const stoppedDuringTurn = current.state === "stopped" || this.stopRequests.has(sessionName);
+      const finalLifecycleState = stoppedDuringTurn ? "stopped" : state;
       const activeTurn =
         turnId != null && current.activeTurn?.id === turnId
           ? {
               ...current.activeTurn,
-              state,
+              state: finalLifecycleState,
               updatedAt: completedAt,
               completedAt,
               ...(error != null && error.trim().length > 0 ? { error } : {})
             }
           : current.activeTurn;
-      return buildSession(current, activeTurn);
+      const built = buildSession(current, activeTurn, stoppedDuringTurn);
+      if (!stoppedDuringTurn) {
+        return built;
+      }
+      return {
+        ...withoutRecoveryFence(withoutFocusLease(built)),
+        state: "stopped",
+        lastStopReason: current.lastStopReason ?? "stopped by user",
+        ...(activeTurn != null ? { activeTurn } : {})
+      };
     });
+    this.stopRequests.delete(sessionName);
     this.activeTurnIds.delete(sessionName);
     this.activeTurnCheckpointAt.delete(sessionName);
     if (nextSession == null) {

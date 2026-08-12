@@ -162,6 +162,197 @@ describe("SessionStore.open", () => {
     await invalidStore.close();
   });
 
+  it("requires recovery when persisted namespaces or lifecycle fences are inconsistent", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const timestamp = "2026-08-12T00:00:00.000Z";
+    const baseState = () => ({
+      version: 1,
+      sessions: {},
+      exposures: {},
+      quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
+    });
+    const session = (name: string) => ({
+      agent: "claude",
+      name,
+      directory: "/tmp/puppenclaw-semantic-state",
+      state: "idle",
+      createdAt: timestamp,
+      lastActivity: timestamp,
+      permissionMode: "approve-reads",
+      warnings: [],
+      transcript: []
+    });
+    const runningTurn = () => ({
+      id: "turn-semantic",
+      state: "running",
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      outputChars: 0
+    });
+    const damagedStates: unknown[] = [];
+
+    damagedStates.push({
+      ...baseState(),
+      sessions: { expected: session("different") }
+    });
+    damagedStates.push({
+      ...baseState(),
+      sessions: {
+        expected: {
+          ...session("expected"),
+          handle: {
+            runtimeSessionName: "different",
+            cwd: "/tmp/puppenclaw-semantic-state",
+            agent: "claude",
+            mode: "persistent"
+          }
+        }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      sessions: {
+        expected: { ...session("expected"), lastActivity: "not-a-timestamp" }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      sessions: {
+        expected: {
+          ...session("expected"),
+          activeTurn: { ...runningTurn(), completedAt: timestamp }
+        }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      sessions: {
+        expected: {
+          ...session("expected"),
+          activeTurn: { ...runningTurn(), state: "completed" }
+        }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      sessions: {
+        expected: {
+          ...session("expected"),
+          activeTurn: {
+            ...runningTurn(),
+            startedAt: "2026-08-12T00:00:01.000Z",
+            updatedAt: timestamp
+          }
+        }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      sessions: {
+        expected: {
+          ...session("expected"),
+          activeTurn: { ...runningTurn(), processGroupId: 1234 }
+        }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      exposures: {
+        expected: {
+          bindingId: "different",
+          conversation: {
+            channel: "test",
+            accountId: "account",
+            conversationId: "conversation"
+          },
+          allowPurePipe: false,
+          allowedAgents: ["claude"],
+          mode: "read-only",
+          allowedVerbs: [],
+          allowedProjectRoots: [],
+          updatedAt: timestamp
+        }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      quiescence: {
+        lastEpoch: 1,
+        active: {
+          expected: { name: "different", epoch: 1, purpose: "purge", updatedAt: timestamp }
+        },
+        latestByName: {}
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      quiescence: {
+        lastEpoch: 2,
+        active: {
+          expected: { name: "expected", epoch: 2, purpose: "external", updatedAt: timestamp }
+        },
+        latestByName: { expected: 1 }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      quiescence: {
+        lastEpoch: 1,
+        active: {},
+        latestByName: { expected: 2 }
+      }
+    });
+    damagedStates.push({
+      ...baseState(),
+      quiescence: {
+        lastEpoch: Number.MAX_SAFE_INTEGER + 1,
+        active: {},
+        latestByName: {}
+      }
+    });
+
+    for (const [index, damaged] of damagedStates.entries()) {
+      const dir = await createTempDir(`puppenclaw-durability-semantic-${index}-`);
+      await writeFile(join(dir, "state.json"), JSON.stringify(damaged), "utf8");
+
+      const store = await SessionStore.open(dir);
+      expect(store.getRecoveryStatus()).toMatchObject({ required: true, reason: "invalid" });
+      expect(store.listSessions()).toEqual([]);
+      await expect(store.reserveQuiescence("unsafe-reuse", "external")).rejects.toMatchObject({
+        code: "STATE_RECOVERY_REQUIRED"
+      });
+      await store.close();
+    }
+  });
+
+  it("refuses to persist a mutation that violates state identity invariants", async () => {
+    const dir = await createTempDir("puppenclaw-durability-invalid-mutation-");
+    const store = await SessionStore.open(dir);
+    const timestamp = new Date().toISOString();
+    await store.upsertSession({
+      agent: "claude",
+      name: "stable-name",
+      directory: dir,
+      state: "idle",
+      createdAt: timestamp,
+      lastActivity: timestamp,
+      permissionMode: "approve-reads",
+      warnings: [],
+      transcript: []
+    });
+
+    await expect(
+      store.patchSession("stable-name", (current) =>
+        current == null ? null : { ...current, name: "different-name" }
+      )
+    ).rejects.toMatchObject({ code: "INVALID_STATE_MUTATION" });
+    expect(store.getSession("stable-name")?.name).toBe("stable-name");
+    expect(
+      JSON.parse(await readFile(join(dir, "state.json"), "utf8")).sessions["stable-name"].name
+    ).toBe("stable-name");
+    await store.close();
+  });
+
   it("opens with the fallback state when no state file exists", async () => {
     const dir = await createTempDir("puppenclaw-durability-store-fresh-");
 
@@ -270,7 +461,7 @@ describe("startup reconciliation", () => {
     ).toMatchObject({ sessions: { "dead-turn": { state: "failed" } } });
   });
 
-  it("keeps sessions without running state or with quiescence fencing untouched", async () => {
+  it("keeps ordinary idle sessions untouched and adds a survivor fence behind quiescence", async () => {
     const workspaceDir = await createTempDir("puppenclaw-durability-startup-skip-");
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
     const timestamp = new Date().toISOString();
@@ -307,7 +498,10 @@ describe("startup reconciliation", () => {
     await manager.reconcilePersistedSessions();
 
     expect(store.getSession("idle-session")?.state).toBe("idle");
-    expect(store.getSession("fenced-session")?.state).toBe("running");
+    expect(store.getSession("fenced-session")).toMatchObject({
+      state: "running",
+      recoveryFence: { reason: "missing-turn-metadata" }
+    });
   });
 
   it("fences a running record without active-turn metadata until Stop proves closure", async () => {
@@ -386,9 +580,16 @@ describe("startup reconciliation", () => {
             startedAt: timestamp,
             updatedAt: timestamp,
             pid,
-            processGroupId: pid,
+            processGroupId: 999_999_998,
             processStartIdentity,
             outputChars: 0
+          },
+          recoveryFence: {
+            reason: "restart-survivor",
+            detectedAt: timestamp,
+            pid,
+            processGroupId: 999_999_998,
+            processStartIdentity
           }
         });
         const manager = new AcpxSessionManager({
@@ -403,6 +604,7 @@ describe("startup reconciliation", () => {
         expect(store.getSession("survivor")?.recoveryFence).toMatchObject({
           reason: "restart-survivor",
           pid,
+          processGroupId: 999_999_998,
           processStartIdentity
         });
         await expect(
@@ -414,6 +616,84 @@ describe("startup reconciliation", () => {
           activeTurn: { state: "stopped" }
         });
         expect(store.getSession("survivor")?.recoveryFence).toBeUndefined();
+        await expect(readFile(`/proc/${pid}/stat`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // The expected Stop path already terminated the detached group.
+        }
+      }
+    }
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "fences a live persisted turn even when its workflow state says idle",
+    async () => {
+      const workspaceDir = await createTempDir("puppenclaw-durability-idle-live-turn-");
+      const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: "ignore"
+      });
+      if (child.pid == null) {
+        throw new Error("Detached test process has no PID.");
+      }
+      const pid = child.pid;
+      child.unref();
+      try {
+        const timestamp = new Date().toISOString();
+        const processStartIdentity = await linuxProcessIdentity(pid);
+        await store.upsertSession({
+          agent: "codex",
+          name: "idle-survivor",
+          directory: workspaceDir,
+          state: "idle",
+          createdAt: timestamp,
+          lastActivity: timestamp,
+          permissionMode: "approve-reads",
+          model: "test-model",
+          modelProviderId: "test-provider",
+          modelProvider: {
+            id: "test-provider",
+            kind: "codex-openai",
+            model: "test-model"
+          },
+          warnings: [],
+          transcript: [],
+          activeTurn: {
+            id: "turn-idle-survivor",
+            state: "running",
+            startedAt: timestamp,
+            updatedAt: timestamp,
+            pid,
+            processGroupId: pid,
+            processStartIdentity,
+            outputChars: 0
+          }
+        });
+        const manager = new AcpxSessionManager({
+          config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+          logger: silentLogger,
+          store,
+          outputRouter
+        });
+
+        await manager.reconcilePersistedSessions();
+
+        expect(store.getSession("idle-survivor")).toMatchObject({
+          state: "idle",
+          activeTurn: { state: "running", pid },
+          recoveryFence: { reason: "restart-survivor", pid }
+        });
+        await expect(
+          manager.send({ name: "idle-survivor", message: "Must remain fenced.", contextFiles: [] })
+        ).rejects.toMatchObject({ code: "RECOVERY_FENCE_ACTIVE" });
+        await manager.stop({ name: "idle-survivor" });
+        expect(store.getSession("idle-survivor")).toMatchObject({
+          state: "stopped",
+          activeTurn: { state: "stopped" }
+        });
         await expect(readFile(`/proc/${pid}/stat`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
         try {
