@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -16,6 +17,22 @@ import {
   makeConfig,
   resolveFakeAcpxCommand
 } from "../helpers.js";
+
+async function linuxProcessIdentity(pid: number): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const raw = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => null);
+    if (raw != null) {
+      const commandEnd = raw.lastIndexOf(")");
+      const fields = raw.slice(commandEnd + 1).trim().split(/\s+/u);
+      const startTicks = fields[19];
+      if (startTicks != null) {
+        return `${pid}:${startTicks}`;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Unable to read process identity for ${pid}.`);
+}
 
 describe("writeJsonFileAtomic", () => {
   it("writes durable content and leaves no temporary files behind", async () => {
@@ -292,4 +309,119 @@ describe("startup reconciliation", () => {
     expect(store.getSession("idle-session")?.state).toBe("idle");
     expect(store.getSession("fenced-session")?.state).toBe("running");
   });
+
+  it("fences a running record without active-turn metadata until Stop proves closure", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-durability-missing-turn-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const timestamp = new Date().toISOString();
+    await store.upsertSession({
+      agent: "claude",
+      name: "missing-turn",
+      directory: workspaceDir,
+      state: "running",
+      createdAt: timestamp,
+      lastActivity: timestamp,
+      permissionMode: "approve-reads",
+      warnings: [],
+      transcript: []
+    });
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: silentLogger,
+      store,
+      outputRouter
+    });
+
+    await manager.reconcilePersistedSessions();
+
+    expect(store.getSession("missing-turn")?.recoveryFence).toMatchObject({
+      reason: "missing-turn-metadata"
+    });
+    await expect(
+      manager.send({ name: "missing-turn", message: "Must remain fenced.", contextFiles: [] })
+    ).rejects.toMatchObject({ code: "RECOVERY_FENCE_ACTIVE" });
+    await expect(manager.stop({ name: "missing-turn" })).resolves.toMatchObject({
+      details: { session: { state: "stopped" } }
+    });
+    expect(store.getSession("missing-turn")?.recoveryFence).toBeUndefined();
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "persists and terminates a restart-surviving detached turn before allowing reuse",
+    async () => {
+      const workspaceDir = await createTempDir("puppenclaw-durability-live-turn-");
+      const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: "ignore"
+      });
+      if (child.pid == null) {
+        throw new Error("Detached test process has no PID.");
+      }
+      const pid = child.pid;
+      child.unref();
+      try {
+        const timestamp = new Date().toISOString();
+        const processStartIdentity = await linuxProcessIdentity(pid);
+        await store.upsertSession({
+          agent: "codex",
+          name: "survivor",
+          directory: workspaceDir,
+          state: "running",
+          createdAt: timestamp,
+          lastActivity: timestamp,
+          permissionMode: "approve-reads",
+          model: "test-model",
+          modelProviderId: "test-provider",
+          modelProvider: {
+            id: "test-provider",
+            kind: "codex-openai",
+            model: "test-model"
+          },
+          warnings: [],
+          transcript: [],
+          activeTurn: {
+            id: "turn-survivor",
+            state: "running",
+            startedAt: timestamp,
+            updatedAt: timestamp,
+            pid,
+            processGroupId: pid,
+            processStartIdentity,
+            outputChars: 0
+          }
+        });
+        const manager = new AcpxSessionManager({
+          config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+          logger: silentLogger,
+          store,
+          outputRouter
+        });
+
+        await manager.reconcilePersistedSessions();
+
+        expect(store.getSession("survivor")?.recoveryFence).toMatchObject({
+          reason: "restart-survivor",
+          pid,
+          processStartIdentity
+        });
+        await expect(
+          manager.send({ name: "survivor", message: "Must not overlap.", contextFiles: [] })
+        ).rejects.toMatchObject({ code: "RECOVERY_FENCE_ACTIVE" });
+        await manager.stop({ name: "survivor" });
+        expect(store.getSession("survivor")).toMatchObject({
+          state: "stopped",
+          activeTurn: { state: "stopped" }
+        });
+        expect(store.getSession("survivor")?.recoveryFence).toBeUndefined();
+        await expect(readFile(`/proc/${pid}/stat`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // The expected Stop path already terminated the detached group.
+        }
+      }
+    }
+  );
 });

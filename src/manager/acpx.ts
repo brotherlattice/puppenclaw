@@ -39,6 +39,7 @@ import type {
   ResumeParams,
   SendParams,
   SessionInfo,
+  SessionRecoveryFence,
   SessionTranscriptEntry,
   StartParams,
   StatusParams,
@@ -171,6 +172,7 @@ const QUIESCENCE_CONTROL_TIMEOUT_MS = 1_000;
 const QUIESCENCE_DRAIN_TIMEOUT_MS = 4_000;
 const QUIESCENCE_POLL_MS = 25;
 const ACTIVE_TURN_CHECKPOINT_MS = 5_000;
+const RECOVERY_FENCE_TERMINATION_TIMEOUT_MS = 4_000;
 
 type LinuxProcessIdentity = {
   processGroupId: number;
@@ -262,6 +264,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function pidMayExist(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }
 
 function describeRuntimeStatus(status: RuntimeStatus): string {
@@ -1188,6 +1199,11 @@ function withoutFocusLease(session: SessionInfo): SessionInfo {
   return rest;
 }
 
+function withoutRecoveryFence(session: SessionInfo): SessionInfo {
+  const { recoveryFence: _recoveryFence, ...rest } = session;
+  return rest;
+}
+
 function resolveQuestionFromOutput(output: string): string | undefined {
   const trimmed = output.trim();
   if (!trimmed) {
@@ -1706,55 +1722,60 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   async stop(params: StopParams): Promise<ToolResult> {
-    this.deps.store.assertSessionMutable(params.name);
-    const session = this.requireSession(params.name);
-    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
-    this.stopRequests.add(params.name);
-    const hadActiveTurn = this.activeTurns.has(params.name);
-    await this.runControlCommand({
-      args: this.buildVerbArgs(session.agent, session.directory, [
-        "cancel",
-        "--session",
-        session.name
-      ]),
-      cwd: session.directory,
-      ...(runtimeEnv != null ? { env: runtimeEnv } : {})
-    }).catch(() => {
-      // best-effort cancel
-    });
-    const signalledChild = this.terminateActiveTurnProcess(params.name, "SIGTERM");
-    if (signalledChild != null) {
-      const forceKillTimer = setTimeout(() => {
-        // Identity-guarded: if the SIGTERM'd child exited quickly and a new
-        // turn already registered its own process under this session name,
-        // this delayed SIGKILL must not hit the new turn's process.
-        this.terminateActiveTurnProcess(params.name, "SIGKILL", signalledChild);
-      }, 2_000);
-      forceKillTimer.unref();
-    }
+    return await this.withLifecycleLock(params.name, async () => {
+      this.deps.store.assertSessionMutable(params.name);
+      const session = this.requireSession(params.name);
+      const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+      this.stopRequests.add(params.name);
+      const hadActiveTurn = this.activeTurns.has(params.name);
+      await this.runControlCommand({
+        args: this.buildVerbArgs(session.agent, session.directory, [
+          "cancel",
+          "--session",
+          session.name
+        ]),
+        cwd: session.directory,
+        ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+      }).catch(() => {
+        // best-effort cancel
+      });
+      if (session.recoveryFence != null) {
+        await this.resolveRecoveryFenceForStop(session);
+      }
+      const signalledChild = this.terminateActiveTurnProcess(params.name, "SIGTERM");
+      if (signalledChild != null) {
+        const forceKillTimer = setTimeout(() => {
+          // Identity-guarded: if the SIGTERM'd child exited quickly and a new
+          // turn already registered its own process under this session name,
+          // this delayed SIGKILL must not hit the new turn's process.
+          this.terminateActiveTurnProcess(params.name, "SIGKILL", signalledChild);
+        }, 2_000);
+        forceKillTimer.unref();
+      }
 
-    const nextSession: SessionInfo = {
-      ...withoutFocusLease(session),
-      state: "stopped",
-      lastActivity: nowIso(),
-      lastStopReason: "stopped by user",
-      ...(session.activeTurn != null
-        ? {
-            activeTurn: {
-              ...session.activeTurn,
-              state: "stopped",
-              updatedAt: nowIso(),
-              completedAt: nowIso()
+      const nextSession: SessionInfo = {
+        ...withoutRecoveryFence(withoutFocusLease(session)),
+        state: "stopped",
+        lastActivity: nowIso(),
+        lastStopReason: "stopped by user",
+        ...(session.activeTurn != null
+          ? {
+              activeTurn: {
+                ...session.activeTurn,
+                state: "stopped",
+                updatedAt: nowIso(),
+                completedAt: nowIso()
+              }
             }
-          }
-        : {})
-    };
-    await this.deps.store.upsertSession(nextSession);
-    if (!hadActiveTurn) {
-      this.stopRequests.delete(params.name);
-    }
-    return textToolResult(`Stopped session ${params.name}.`, {
-      session: nextSession
+          : {})
+      };
+      await this.deps.store.upsertSession(nextSession);
+      if (!hadActiveTurn) {
+        this.stopRequests.delete(params.name);
+      }
+      return textToolResult(`Stopped session ${params.name}.`, {
+        session: nextSession
+      });
     });
   }
 
@@ -2229,14 +2250,7 @@ export class AcpxSessionManager implements ISessionManager {
     }
   }
 
-  /**
-   * Startup sweep: classifies sessions persisted as running against the live
-   * process table. After a daemon restart the in-memory turn registries are
-   * empty, so a running session whose turn process died with the previous
-   * daemon would otherwise stay "running" in state.json until something
-   * re-reads it — and gc() never collects it because it only reaps terminal
-   * states. Classification only: no process is spawned or killed.
-   */
+  /** Reconcile persisted turns before accepting any new work. */
   async reconcilePersistedSessions(): Promise<void> {
     for (const stored of this.deps.store.listSessions()) {
       if (stored.state !== "running") {
@@ -2248,20 +2262,45 @@ export class AcpxSessionManager implements ISessionManager {
         continue;
       }
       const reconciled = await this.reconcileVisibleSession(stored);
-      if (reconciled.turn.classification !== "orphaned") {
-        continue;
-      }
       try {
+        if (reconciled.turn.classification === "orphaned") {
+          await this.deps.store.patchSession(stored.name, (current) =>
+            current == null || current.state !== "running"
+              ? current
+              : {
+                  ...withoutRecoveryFence(reconciled.session),
+                  lastStopReason: "Interrupted by daemon restart"
+                }
+          );
+          this.deps.logger.warn(
+            `Session ${stored.name} was persisted as running but its turn process is gone; marked failed at startup.`
+          );
+          continue;
+        }
+
+        const recoveryFence: SessionRecoveryFence = stored.recoveryFence ?? {
+          reason:
+            stored.activeTurn == null
+              ? "missing-turn-metadata"
+              : reconciled.turn.processAlive === true
+                ? "restart-survivor"
+                : "unverified-process",
+          detectedAt: nowIso(),
+          ...(reconciled.turn.pid != null ? { pid: reconciled.turn.pid } : {}),
+          ...(reconciled.turn.processGroupId != null
+            ? { processGroupId: reconciled.turn.processGroupId }
+            : {}),
+          ...(stored.activeTurn?.processStartIdentity != null
+            ? { processStartIdentity: stored.activeTurn.processStartIdentity }
+            : {})
+        };
         await this.deps.store.patchSession(stored.name, (current) =>
           current == null || current.state !== "running"
             ? current
-            : {
-                ...reconciled.session,
-                lastStopReason: "Interrupted by daemon restart"
-              }
+            : { ...current, recoveryFence }
         );
         this.deps.logger.warn(
-          `Session ${stored.name} was persisted as running but its turn process is gone; marked failed at startup.`
+          `Session ${stored.name} may still have restart-surviving work; fenced against new turns.`
         );
       } catch (error) {
         this.deps.logger.warn(
@@ -2283,6 +2322,7 @@ export class AcpxSessionManager implements ISessionManager {
           `Session ${name} is already running a turn.`
         );
       }
+      await this.assertRecoveryFenceReleased(name);
       await this.deps.store.enterLifecycleTurn(name, lifecycleEpoch);
       this.activeTurns.add(name);
       this.stopRequests.delete(name);
@@ -2307,6 +2347,146 @@ export class AcpxSessionManager implements ISessionManager {
     } finally {
       if (this.lifecycleTails.get(name) === tail) {
         this.lifecycleTails.delete(name);
+      }
+    }
+  }
+
+  private async assertRecoveryFenceReleased(name: string): Promise<void> {
+    const session = this.deps.store.getSession(name);
+    if (session?.recoveryFence == null) {
+      return;
+    }
+    if (await this.isRecoveredProcessDefinitelyGone(session.recoveryFence)) {
+      const warning = "Restart-surviving turn termination was proved before the next dispatch.";
+      await this.deps.store.patchSession(name, (current) =>
+        current?.recoveryFence == null
+          ? current
+          : {
+              ...withoutRecoveryFence(current),
+              state: current.state === "running" ? "failed" : current.state,
+              lastError: current.lastError ?? warning,
+              lastStopReason: current.lastStopReason ?? "Interrupted by daemon restart",
+              warnings: dedupeWarnings([...current.warnings, warning]),
+              ...(current.activeTurn?.state === "running"
+                ? {
+                    activeTurn: {
+                      ...current.activeTurn,
+                      state: "orphaned",
+                      updatedAt: nowIso(),
+                      completedAt: nowIso(),
+                      error: current.activeTurn.error ?? warning
+                    }
+                  }
+                : {})
+            }
+      );
+      return;
+    }
+    throw new PuppenclawError(
+      "RECOVERY_FENCE_ACTIVE",
+      `Session ${name} is fenced because work may have survived a manager restart. Stop the session and prove termination before starting another turn.`,
+      { name, recoveryFence: session.recoveryFence }
+    );
+  }
+
+  private async resolveRecoveryFenceForStop(session: SessionInfo): Promise<void> {
+    const fence = session.recoveryFence;
+    if (fence == null || (await this.isRecoveredProcessDefinitelyGone(fence))) {
+      return;
+    }
+
+    if (
+      process.platform === "linux" &&
+      fence.pid != null &&
+      fence.processStartIdentity != null
+    ) {
+      const deadline = Date.now() + RECOVERY_FENCE_TERMINATION_TIMEOUT_MS;
+      const escalationAt = Date.now() + Math.floor(RECOVERY_FENCE_TERMINATION_TIMEOUT_MS / 2);
+      while (Date.now() < deadline) {
+        if (await this.isRecoveredProcessDefinitelyGone(fence)) {
+          return;
+        }
+        await this.signalRecoveredProcess(
+          fence,
+          Date.now() >= escalationAt ? "SIGKILL" : "SIGTERM"
+        );
+        await sleep(QUIESCENCE_POLL_MS);
+      }
+      if (await this.isRecoveredProcessDefinitelyGone(fence)) {
+        return;
+      }
+    }
+
+    if (!this.usesOneShotRuntime(session)) {
+      const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+      await this.runControlCommand({
+        args: this.buildVerbArgs(session.agent, session.directory, [
+          "sessions",
+          "close",
+          session.name
+        ]),
+        cwd: session.directory,
+        allowNoSession: true,
+        timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS,
+        ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+      }).catch(() => undefined);
+      const deadline = Date.now() + RECOVERY_FENCE_TERMINATION_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const status = await this.getRuntimeStatus({
+          name: session.name,
+          agent: session.agent,
+          directory: session.directory,
+          timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS,
+          ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+        }).catch(() => ({ exists: true }));
+        if (!status.exists) {
+          return;
+        }
+        await sleep(QUIESCENCE_POLL_MS);
+      }
+    }
+
+    throw new PuppenclawError(
+      "RECOVERY_FENCE_ACTIVE",
+      `Termination of restart-surviving work for session ${session.name} could not be proved; the recovery fence remains active.`,
+      { name: session.name, recoveryFence: fence }
+    );
+  }
+
+  private async isRecoveredProcessDefinitelyGone(fence: SessionRecoveryFence): Promise<boolean> {
+    if (process.platform !== "linux" || fence.pid == null) {
+      return false;
+    }
+    const observed = await readLinuxProcessIdentity(fence.pid);
+    if (observed == null) {
+      return !pidMayExist(fence.pid);
+    }
+    return (
+      fence.processStartIdentity != null &&
+      observed.processStartIdentity !== fence.processStartIdentity
+    );
+  }
+
+  private async signalRecoveredProcess(
+    fence: SessionRecoveryFence,
+    signal: NodeJS.Signals
+  ): Promise<void> {
+    if (fence.pid == null || fence.processStartIdentity == null) {
+      return;
+    }
+    const observed = await readLinuxProcessIdentity(fence.pid);
+    if (observed?.processStartIdentity !== fence.processStartIdentity) {
+      return;
+    }
+    try {
+      process.kill(-(fence.processGroupId ?? observed.processGroupId), signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        try {
+          process.kill(fence.pid, signal);
+        } catch {
+          // The polling proof below decides whether the fence may be cleared.
+        }
       }
     }
   }
@@ -2416,7 +2596,7 @@ export class AcpxSessionManager implements ISessionManager {
 
   private async recordQuiescedSessionState(name: string, epoch: number): Promise<void> {
     await this.deps.store.patchQuiescedSession(name, epoch, (current) => ({
-      ...withoutFocusLease(current),
+      ...withoutRecoveryFence(withoutFocusLease(current)),
       state: "stopped",
       lastActivity: nowIso(),
       lastStopReason: `quiesced at lifecycle epoch ${epoch}`
@@ -2513,6 +2693,7 @@ export class AcpxSessionManager implements ISessionManager {
     const trackedChild = tracked != null;
     const pid = tracked?.child.pid ?? activeTurn?.pid ?? null;
     const observedIdentity = pid != null ? await readLinuxProcessIdentity(pid) : null;
+    const pidReachable = pid != null ? pidMayExist(pid) : null;
     const expectedIdentity = activeTurn?.processStartIdentity;
     const identityMatches =
       expectedIdentity == null
@@ -2520,7 +2701,9 @@ export class AcpxSessionManager implements ISessionManager {
           ? null
           : true
         : observedIdentity == null
-          ? false
+          ? pidReachable === false
+            ? false
+            : null
           : observedIdentity.processStartIdentity === expectedIdentity;
     const trackedChildRunning =
       tracked != null && tracked.child.exitCode == null && tracked.child.signalCode == null;
@@ -2528,7 +2711,11 @@ export class AcpxSessionManager implements ISessionManager {
       pid == null
         ? null
         : process.platform === "linux"
-          ? observedIdentity != null && identityMatches !== false
+          ? observedIdentity != null
+            ? identityMatches !== false
+            : pidReachable === false
+              ? false
+              : null
           : trackedChild
             ? trackedChildRunning
             : null;
@@ -2539,14 +2726,18 @@ export class AcpxSessionManager implements ISessionManager {
         classification = "running";
       } else if (pid == null && lockHeld) {
         classification = "starting";
+      } else if (pid == null) {
+        classification = "running";
+        conflict = "turn metadata says running but no process identity was recorded";
+      } else if (processAlive == null) {
+        classification = "running";
+        conflict = "turn process liveness cannot be proved after restart";
       } else {
         classification = "orphaned";
         conflict =
-          pid == null
-            ? "turn metadata says running but no process identity was recorded"
-            : identityMatches === false
-              ? "recorded PID is absent or belongs to a different process"
-              : "turn metadata says running but process liveness is unverified";
+          identityMatches === false
+            ? "recorded PID is absent or belongs to a different process"
+            : "turn metadata says running but process liveness is unverified";
       }
     } else if (activeTurn != null) {
       classification = activeTurn.state;

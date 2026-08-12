@@ -2,7 +2,7 @@
   "content": [
     {
       "type": "text",
-      "text": "Status for running\n{\n  \"session\": {\n    \"name\": \"running\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"running\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Task for running scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Answer for running scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"activeTurn\": {\n      \"id\": \"turn-running-1\",\n      \"state\": \"running\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"pid\": 431602,\n      \"processGroupId\": 431600,\n      \"processStartIdentity\": \"431602:8888888\",\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 42\n    }\n  },\n  \"runtime\": {\n    \"exists\": true,\n    \"status\": \"alive\",\n    \"raw\": {\n      \"status\": \"alive\",\n      \"acpxRecordId\": \"rec-running\",\n      \"acpxSessionId\": \"backend-running\",\n      \"agentSessionId\": \"agent-running\",\n      \"agent\": \"claude\",\n      \"modeState\": {\n        \"currentModeId\": \"default\",\n        \"availableModes\": [\n          {\n            \"id\": \"default\",\n            \"name\": \"Default\"\n          },\n          {\n            \"id\": \"plan\",\n            \"name\": \"Plan\"\n          }\n        ]\n      }\n    }\n  },\n  \"turn\": {\n    \"classification\": \"running\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": true,\n    \"identityMatches\": true,\n    \"pid\": 431602,\n    \"processGroupId\": 431600,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 42,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  }\n}"
+      "text": "Status for running\n{\n  \"session\": {\n    \"name\": \"running\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"running\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Task for running scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Answer for running scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"activeTurn\": {\n      \"id\": \"turn-running-1\",\n      \"state\": \"running\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"pid\": 431602,\n      \"processGroupId\": 431602,\n      \"processStartIdentity\": \"431602:8888888\",\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 42\n    },\n    \"recoveryFence\": {\n      \"reason\": \"restart-survivor\",\n      \"detectedAt\": \"2026-01-01T10:02:00.000Z\",\n      \"pid\": 431602,\n      \"processGroupId\": 431602,\n      \"processStartIdentity\": \"431602:8888888\"\n    }\n  },\n  \"runtime\": {\n    \"exists\": true,\n    \"status\": \"alive\",\n    \"raw\": {\n      \"status\": \"alive\",\n      \"acpxRecordId\": \"rec-running\",\n      \"acpxSessionId\": \"backend-running\",\n      \"agentSessionId\": \"agent-running\",\n      \"agent\": \"claude\",\n      \"modeState\": {\n        \"currentModeId\": \"default\",\n        \"availableModes\": [\n          {\n            \"id\": \"default\",\n            \"name\": \"Default\"\n          },\n          {\n            \"id\": \"plan\",\n            \"name\": \"Plan\"\n          }\n        ]\n      }\n    }\n  },\n  \"turn\": {\n    \"classification\": \"running\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": true,\n    \"identityMatches\": true,\n    \"pid\": 431602,\n    \"processGroupId\": 431602,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 42,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  }\n}"
     }
   ],
   "details": {
@@ -33,10 +33,17 @@
         "startedAt": "2026-01-01T10:01:00.000Z",
         "updatedAt": "2026-01-01T10:01:30.000Z",
         "pid": 431602,
-        "processGroupId": 431600,
+        "processGroupId": 431602,
         "processStartIdentity": "431602:8888888",
         "lastOutputAt": "2026-01-01T10:01:30.000Z",
         "outputChars": 42
+      },
+      "recoveryFence": {
+        "reason": "restart-survivor",
+        "detectedAt": "2026-01-01T10:02:00.000Z",
+        "pid": 431602,
+        "processGroupId": 431602,
+        "processStartIdentity": "431602:8888888"
       }
     },
     "runtime": {
@@ -70,7 +77,7 @@
       "processAlive": true,
       "identityMatches": true,
       "pid": 431602,
-      "processGroupId": 431600,
+      "processGroupId": 431602,
       "startedAt": "2026-01-01T10:01:00.000Z",
       "updatedAt": "2026-01-01T10:01:30.000Z",
       "lastOutputAt": "2026-01-01T10:01:30.000Z",

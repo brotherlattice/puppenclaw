@@ -651,6 +651,7 @@ function daemonStatusForError(code: string): number {
     case "LIFECYCLE_EPOCH_REQUIRED":
     case "STALE_LIFECYCLE_EPOCH":
     case "TURN_ALREADY_RUNNING":
+    case "RECOVERY_FENCE_ACTIVE":
       return 409;
     case "QUIESCENCE_UNAVAILABLE":
     case "ACP_CONTROL_TIMEOUT":

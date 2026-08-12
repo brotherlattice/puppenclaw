@@ -120,6 +120,16 @@ const sessionInfoZod = z
       .optional(),
     lastStopReason: z.string().optional(),
     activeTurn: activeTurnZod.optional(),
+    recoveryFence: z
+      .object({
+        reason: z.enum(["restart-survivor", "unverified-process", "missing-turn-metadata"]),
+        detectedAt: z.string().min(1),
+        pid: z.number().int().positive().optional(),
+        processGroupId: z.number().int().positive().optional(),
+        processStartIdentity: z.string().min(1).optional()
+      })
+      .strict()
+      .optional(),
     source: sessionSourceZod.optional(),
     origin: conversationScopeZod.optional()
   })
@@ -563,10 +573,11 @@ async function loadStoredState(statePath: string): Promise<{
     });
   }
 
-  const validated = storedStateZod.safeParse(upgradeCompatibleState(parsed));
+  const compatibleState = upgradeCompatibleState(parsed);
+  const validated = storedStateZod.safeParse(compatibleState);
   if (validated.success) {
     return {
-      state: validated.data as unknown as StoredState,
+      state: compatibleState as StoredState,
       recovery: { required: false }
     };
   }

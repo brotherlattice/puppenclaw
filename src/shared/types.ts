@@ -170,6 +170,14 @@ export type ActiveTurnMetadata = {
   error?: string;
 };
 
+export type SessionRecoveryFence = {
+  reason: "restart-survivor" | "unverified-process" | "missing-turn-metadata";
+  detectedAt: string;
+  pid?: number;
+  processGroupId?: number;
+  processStartIdentity?: string;
+};
+
 /**
  * Canonical four-bucket per-turn token usage, mirroring OpenClaw core's
  * NormalizedUsage. `total` is the sum of the four buckets.
@@ -256,6 +264,7 @@ export type SessionInfo = {
   handle?: AcpxSessionHandle;
   lastStopReason?: string;
   activeTurn?: ActiveTurnMetadata;
+  recoveryFence?: SessionRecoveryFence;
   source?: SessionSourceInfo;
   origin?: ConversationScope;
 };

@@ -61,7 +61,7 @@ export const CONTRACT_FIXTURES_DIR = join(
 
 const FIXED_WORKSPACE = "/workspace/project";
 const FIXED_PID = 431_602;
-const FIXED_PROCESS_GROUP_ID = 431_600;
+const FIXED_PROCESS_GROUP_ID = FIXED_PID;
 const FIXED_PROCESS_START_IDENTITY = "431602:8888888";
 const FIXED_AGE_MS = 61_000;
 const FIXED_OUTPUT_AGE_MS = 32_000;
@@ -194,6 +194,7 @@ function sanitizeBody(
       String(FIXED_PROCESS_GROUP_ID)
     )
     .replaceAll(workspaceDir, FIXED_WORKSPACE)
+    .replace(/(\\?"detectedAt\\?":\s*\\?")[^"\\]+(\\?")/gu, `$1${T_LAST_ACTIVITY}$2`)
     .replace(/(\\?"ageMs\\?":\s*)\d+/gu, `$1${FIXED_AGE_MS}`)
     .replace(/(\\?"outputAgeMs\\?":\s*)\d+/gu, `$1${FIXED_OUTPUT_AGE_MS}`);
   return JSON.parse(sanitized);
@@ -209,7 +210,8 @@ export async function generateContractFixtures(): Promise<
   const workspaceDir = join(rootDir, "workspace");
   const dataDir = join(rootDir, "daemon");
   const liveChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], {
-    stdio: "ignore"
+    stdio: "ignore",
+    detached: true
   });
   try {
     if (liveChild.pid == null) {
