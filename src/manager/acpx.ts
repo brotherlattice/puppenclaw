@@ -1600,7 +1600,8 @@ export class AcpxSessionManager implements ISessionManager {
           turn.state === "failed" ? "failed" : "completed",
           (current, activeTurn, stoppedDuringTurn) => ({
             ...current,
-            ...session,
+            ...withoutFocusLease(session),
+            ...(current.focusedUntil != null ? { focusedUntil: current.focusedUntil } : {}),
             permissionMode: permissionModes.baseline,
             state: stoppedDuringTurn ? "stopped" : turn.state,
             lastActivity: nowIso(),
@@ -1742,7 +1743,8 @@ export class AcpxSessionManager implements ISessionManager {
         turn.state === "failed" ? "failed" : "completed",
         (current, activeTurn, stoppedDuringTurn) => ({
           ...current,
-          ...effectiveSession,
+          ...withoutFocusLease(effectiveSession),
+          ...(current.focusedUntil != null ? { focusedUntil: current.focusedUntil } : {}),
           permissionMode:
             params.permissionMode == null ? effectivePermissionMode : session.permissionMode,
           state: stoppedDuringTurn ? "stopped" : turn.state,
@@ -1865,6 +1867,12 @@ export class AcpxSessionManager implements ISessionManager {
           async (): Promise<{ retry: true } | { result: ToolResult }> => {
             this.deps.store.assertSessionMutable(params.name);
             const storedSession = this.requireSession(params.name);
+            if (this.isTurnActive(storedSession) || storedSession.activeTurn?.state === "running") {
+              throw new PuppenclawError(
+                "TURN_ALREADY_RUNNING",
+                `Session ${params.name} is currently running a turn and cannot be resumed.`
+              );
+            }
             if (
               !capacityReserved &&
               !isConnectedSession(storedSession) &&

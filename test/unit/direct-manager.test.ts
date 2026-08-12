@@ -2113,6 +2113,97 @@ describe("AcpxSessionManager", () => {
     expect(persisted?.transcript.some((entry) => entry.text.includes("Handled:"))).toBe(true);
   });
 
+  it("rejects resume during a live turn and preserves a concurrent focus lease", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-resume-focus-race-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    const originalRunTurn = manager["runTurn"].bind(manager);
+    let releaseTurn!: () => void;
+    const turnGate = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    let signalTurnEntered!: () => void;
+    const turnEntered = new Promise<void>((resolve) => {
+      signalTurnEntered = resolve;
+    });
+    manager["runTurn"] = async (params) => {
+      signalTurnEntered();
+      await turnGate;
+      return await originalRunTurn(params);
+    };
+
+    const started = manager.start({
+      agent: "claude",
+      name: "resume-focus-race",
+      directory: workspaceDir,
+      task: "Finish after the lifecycle mutations.",
+      contextFiles: []
+    });
+    await turnEntered;
+
+    await expect(manager.resume({ name: "resume-focus-race" })).rejects.toMatchObject({
+      code: "TURN_ALREADY_RUNNING"
+    });
+    const focused = await manager.focus({ name: "resume-focus-race", ttlMs: 60_000 });
+    const focusedUntil = (focused.details as { session: SessionInfo }).session.focusedUntil;
+    releaseTurn();
+
+    const result = await started;
+    expect((result.details as { session: SessionInfo }).session.focusedUntil).toBe(focusedUntil);
+    expect(store.getSession("resume-focus-race")?.focusedUntil).toBe(focusedUntil);
+  });
+
+  it("preserves a concurrent focus-lease removal at terminal persistence", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-unfocus-race-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    await manager.start({
+      agent: "claude",
+      name: "unfocus-race",
+      directory: workspaceDir,
+      task: "Prime the focused session.",
+      contextFiles: []
+    });
+    await manager.focus({ name: "unfocus-race", ttlMs: 60_000 });
+
+    const originalRunTurn = manager["runTurn"].bind(manager);
+    let releaseTurn!: () => void;
+    const turnGate = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    let signalTurnEntered!: () => void;
+    const turnEntered = new Promise<void>((resolve) => {
+      signalTurnEntered = resolve;
+    });
+    manager["runTurn"] = async (params) => {
+      signalTurnEntered();
+      await turnGate;
+      return await originalRunTurn(params);
+    };
+    const sent = manager.send({
+      name: "unfocus-race",
+      message: "Finish after the focus lease is removed.",
+      contextFiles: []
+    });
+    await turnEntered;
+    await manager.unfocus({ name: "unfocus-race" });
+    releaseTurn();
+
+    const result = await sent;
+    expect((result.details as { session: SessionInfo }).session.focusedUntil).toBeUndefined();
+    expect(store.getSession("unfocus-race")?.focusedUntil).toBeUndefined();
+  });
+
   it("switches advertised Claude modes per turn, restores the baseline, and exposes native plan signals", async () => {
     const workspaceDir = await createTempDir("puppenclaw-native-plan-");
     const acpxCommand = await resolveFakeAcpxCommand();
