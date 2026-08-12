@@ -1922,11 +1922,55 @@ describe("AcpxSessionManager", () => {
       };
     };
     expect(sendDetails.session.state).toBe("waiting_input");
+    expect(sendDetails.session.activeTurn?.state).toBe("completed");
     expect(sendDetails.session.pendingQuestion).toBe("Which source should I use?");
     expect(sendDetails.turnSignals.inputRequest).toEqual({
       source: "claude-tool",
       toolName: "AskUserQuestion",
       text: "Which source should I use?"
+    });
+  });
+
+  it("persists terminal process telemetry atomically with the final workflow state", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-atomic-turn-state-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const terminalWorkflowStates: SessionInfo["state"][] = [];
+    const originalPatchSession = store.patchSession.bind(store);
+    store.patchSession = async (...args: Parameters<typeof store.patchSession>) => {
+      const result = await originalPatchSession(...args);
+      const current = store.getSession(args[0]);
+      if (current?.activeTurn != null && current.activeTurn.state !== "running") {
+        terminalWorkflowStates.push(current.state);
+      }
+      return result;
+    };
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+
+    const result = await manager.start({
+      agent: "claude",
+      name: "atomic-waiting-input",
+      directory: workspaceDir,
+      task: "ASK_USER",
+      contextFiles: []
+    });
+    const session = (result.details as { session: SessionInfo }).session;
+
+    expect(session).toMatchObject({
+      state: "waiting_input",
+      activeTurn: { state: "completed" }
+    });
+    expect(terminalWorkflowStates).toEqual(["waiting_input"]);
+    const persisted = JSON.parse(await readFile(join(workspaceDir, "state.json"), "utf8")) as {
+      sessions: Record<string, SessionInfo>;
+    };
+    expect(persisted.sessions["atomic-waiting-input"]).toMatchObject({
+      state: "waiting_input",
+      activeTurn: { state: "completed" }
     });
   });
 
@@ -1984,6 +2028,7 @@ describe("AcpxSessionManager", () => {
       };
     };
     expect(signalledDetails.session.state).toBe("idle");
+    expect(signalledDetails.session.activeTurn?.state).toBe("completed");
     expect(signalledDetails.turnSignals.nativeMode).toBe("plan");
     expect(signalledDetails.turnSignals.plan).toEqual({
       source: "claude-tool",

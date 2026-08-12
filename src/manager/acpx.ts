@@ -1535,51 +1535,56 @@ export class AcpxSessionManager implements ISessionManager {
             ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
           });
         } catch (error) {
-          await this.finalizeActiveTurnLifecycle(
+          await this.persistFinalTurnSession(
             params.name,
             "failed",
+            (current, activeTurn) => ({
+              ...current,
+              state: "failed",
+              lastActivity: nowIso(),
+              lastError: ensureError(error).message,
+              ...(activeTurn != null ? { activeTurn } : {})
+            }),
             ensureError(error).message
           );
           throw error;
         }
         const stoppedDuringTurn = this.stopRequests.delete(params.name);
-        const activeTurn = await this.finalizeActiveTurnLifecycle(
+        const nextSession = await this.persistFinalTurnSession(
           params.name,
           stoppedDuringTurn ? "stopped" : turn.state === "failed" ? "failed" : "completed",
+          (current, activeTurn) => ({
+            ...current,
+            ...session,
+            permissionMode: effectivePermissionMode,
+            state: stoppedDuringTurn ? "stopped" : turn.state,
+            lastActivity: nowIso(),
+            warnings: dedupeWarnings([...warnings, ...turn.warnings]),
+            ...(sessionSkills.length > 0 ? { skills: sessionSkills } : {}),
+            transcript: mergeTranscript(current.transcript, [
+              ...makeUserTranscript(promptText),
+              ...turn.transcript
+            ]),
+            ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
+            ...(turn.state === "failed"
+              ? { lastError: turn.output || current.lastError || "ACP turn failed." }
+              : {}),
+            ...(turn.tokenUsage != null
+              ? { tokenUsage: turn.tokenUsage }
+              : current.tokenUsage != null
+                ? { tokenUsage: current.tokenUsage }
+                : {}),
+            handle: {
+              runtimeSessionName: params.name,
+              cwd: directory,
+              agent: params.agent,
+              mode: "persistent"
+            },
+            ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {}),
+            ...(activeTurn != null ? { activeTurn } : {})
+          }),
           turn.state === "failed" ? turn.output : undefined
         );
-
-        const nextSession: SessionInfo = {
-          ...session,
-          permissionMode: effectivePermissionMode,
-          state: stoppedDuringTurn ? "stopped" : turn.state,
-          lastActivity: nowIso(),
-          warnings: dedupeWarnings([...warnings, ...turn.warnings]),
-          ...(sessionSkills.length > 0 ? { skills: sessionSkills } : {}),
-          transcript: mergeTranscript(session.transcript, [
-            ...makeUserTranscript(promptText),
-            ...turn.transcript
-          ]),
-          ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
-          ...(turn.state === "failed"
-            ? { lastError: turn.output || session.lastError || "ACP turn failed." }
-            : {}),
-          ...(turn.tokenUsage != null
-            ? { tokenUsage: turn.tokenUsage }
-            : session.tokenUsage != null
-              ? { tokenUsage: session.tokenUsage }
-              : {}),
-          handle: {
-            runtimeSessionName: params.name,
-            cwd: directory,
-            agent: params.agent,
-            mode: "persistent"
-          },
-          ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {}),
-          ...(activeTurn != null ? { activeTurn } : {})
-        };
-
-        await this.deps.store.upsertSession(nextSession);
         this.recordTurnUsage(nextSession, turn);
         return textToolResult(`Started session ${params.name}.`, {
           session: nextSession,
@@ -1591,11 +1596,16 @@ export class AcpxSessionManager implements ISessionManager {
         });
       } catch (error) {
         if (this.deps.store.getActiveQuiescenceEpoch(params.name) == null) {
-          await this.deps.store.upsertSession({
-            ...provisionalSession,
-            state: "failed",
-            lastActivity: nowIso(),
-            lastError: ensureError(error).message
+          await this.deps.store.patchSession(params.name, (current) => {
+            if (current?.state === "stopped" || current?.activeTurn?.state === "failed") {
+              return current;
+            }
+            return {
+              ...(current ?? provisionalSession),
+              state: "failed",
+              lastActivity: nowIso(),
+              lastError: ensureError(error).message
+            };
           });
         }
         throw error;
@@ -1667,49 +1677,54 @@ export class AcpxSessionManager implements ISessionManager {
           ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
         });
       } catch (error) {
-        await this.finalizeActiveTurnLifecycle(
+        await this.persistFinalTurnSession(
           params.name,
           "failed",
+          (current, activeTurn) => ({
+            ...current,
+            state: "failed",
+            lastActivity: nowIso(),
+            lastError: ensureError(error).message,
+            ...(activeTurn != null ? { activeTurn } : {})
+          }),
           ensureError(error).message
         );
         throw error;
       }
       const stoppedDuringTurn = this.stopRequests.delete(params.name);
-      const activeTurn = await this.finalizeActiveTurnLifecycle(
+      const nextSession = await this.persistFinalTurnSession(
         params.name,
         stoppedDuringTurn ? "stopped" : turn.state === "failed" ? "failed" : "completed",
+        (current, activeTurn) => ({
+          ...current,
+          ...effectiveSession,
+          permissionMode:
+            params.permissionMode == null ? effectivePermissionMode : session.permissionMode,
+          state: stoppedDuringTurn ? "stopped" : turn.state,
+          lastActivity: nowIso(),
+          warnings: dedupeWarnings([
+            ...current.warnings,
+            ...(reasoning.warning != null ? [reasoning.warning] : []),
+            ...turn.warnings
+          ]),
+          transcript: mergeTranscript(current.transcript, [
+            ...makeUserTranscript(promptText),
+            ...turn.transcript
+          ]),
+          ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
+          ...(turn.state === "failed"
+            ? { lastError: turn.output || current.lastError || "ACP turn failed." }
+            : {}),
+          ...(turn.tokenUsage != null
+            ? { tokenUsage: turn.tokenUsage }
+            : current.tokenUsage != null
+              ? { tokenUsage: current.tokenUsage }
+              : {}),
+          ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {}),
+          ...(activeTurn != null ? { activeTurn } : {})
+        }),
         turn.state === "failed" ? turn.output : undefined
       );
-
-      const nextSession: SessionInfo = {
-        ...effectiveSession,
-        permissionMode:
-          params.permissionMode == null ? effectivePermissionMode : session.permissionMode,
-        state: stoppedDuringTurn ? "stopped" : turn.state,
-        lastActivity: nowIso(),
-        warnings: dedupeWarnings([
-          ...session.warnings,
-          ...(reasoning.warning != null ? [reasoning.warning] : []),
-          ...turn.warnings
-        ]),
-        transcript: mergeTranscript(session.transcript, [
-          ...makeUserTranscript(promptText),
-          ...turn.transcript
-        ]),
-        ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
-        ...(turn.state === "failed"
-          ? { lastError: turn.output || session.lastError || "ACP turn failed." }
-          : {}),
-        ...(turn.tokenUsage != null
-          ? { tokenUsage: turn.tokenUsage }
-          : session.tokenUsage != null
-            ? { tokenUsage: session.tokenUsage }
-            : {}),
-        ...(stoppedDuringTurn ? { lastStopReason: "stopped by user" } : {}),
-        ...(activeTurn != null ? { activeTurn } : {})
-      };
-
-      await this.deps.store.upsertSession(nextSession);
       this.recordTurnUsage(nextSession, turn);
       return textToolResult(`Updated session ${params.name}.`, {
         session: nextSession,
@@ -4395,30 +4410,41 @@ export class AcpxSessionManager implements ISessionManager {
     return next;
   }
 
-  private async finalizeActiveTurnLifecycle(
+  private async persistFinalTurnSession(
     sessionName: string,
     state: ActiveTurnLifecycleState,
+    buildSession: (
+      current: SessionInfo,
+      activeTurn: ActiveTurnMetadata | undefined
+    ) => SessionInfo,
     error?: string
-  ): Promise<ActiveTurnMetadata | undefined> {
+  ): Promise<SessionInfo> {
     this.checkpointActiveTurnOutput(sessionName, true);
     await this.activeTurnPersistence.get(sessionName)?.catch(() => undefined);
     const turnId = this.activeTurnIds.get(sessionName);
-    if (turnId == null) {
-      return this.deps.store.getSession(sessionName)?.activeTurn;
-    }
     const completedAt = nowIso();
-    await this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
-      ...activeTurn,
-      state,
-      updatedAt: completedAt,
-      completedAt,
-      ...(error != null && error.trim().length > 0 ? { error } : {})
-    }));
-    await this.activeTurnPersistence.get(sessionName)?.catch(() => undefined);
-    const activeTurn = this.deps.store.getSession(sessionName)?.activeTurn;
+    const nextSession = await this.deps.store.patchSession(sessionName, (current) => {
+      if (current == null) {
+        throw new PuppenclawError("NO_SESSION", `Unknown session ${sessionName}.`);
+      }
+      const activeTurn =
+        turnId != null && current.activeTurn?.id === turnId
+          ? {
+              ...current.activeTurn,
+              state,
+              updatedAt: completedAt,
+              completedAt,
+              ...(error != null && error.trim().length > 0 ? { error } : {})
+            }
+          : current.activeTurn;
+      return buildSession(current, activeTurn);
+    });
     this.activeTurnIds.delete(sessionName);
     this.activeTurnCheckpointAt.delete(sessionName);
-    return activeTurn;
+    if (nextSession == null) {
+      throw new PuppenclawError("NO_SESSION", `Unknown session ${sessionName}.`);
+    }
+    return nextSession;
   }
 
   /**

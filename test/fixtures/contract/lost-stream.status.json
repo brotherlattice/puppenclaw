@@ -1,0 +1,98 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Status for lost-stream\n{\n  \"session\": {\n    \"name\": \"lost-stream\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"idle\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Successful turn whose client stream was lost.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Handled: Successful turn whose client stream was lost.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"handle\": {\n      \"runtimeSessionName\": \"lost-stream\",\n      \"cwd\": \"/workspace/project\",\n      \"agent\": \"claude\",\n      \"mode\": \"persistent\"\n    },\n    \"reasoningProfile\": \"claude\",\n    \"activeTurn\": {\n      \"id\": \"turn-lost-stream-1\",\n      \"state\": \"completed\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 54,\n      \"exitCode\": 0,\n      \"signal\": null,\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"completedAt\": \"2026-01-01T10:01:30.000Z\"\n    },\n    \"tokenUsage\": {\n      \"used\": 45,\n      \"size\": 4096,\n      \"input\": 45,\n      \"output\": 12,\n      \"cacheRead\": 5,\n      \"cacheWrite\": 3\n    }\n  },\n  \"runtime\": {\n    \"exists\": true,\n    \"status\": \"alive\",\n    \"raw\": {\n      \"status\": \"alive\",\n      \"acpxRecordId\": \"rec-lost-stream\",\n      \"acpxSessionId\": \"backend-lost-stream\",\n      \"agentSessionId\": \"agent-lost-stream\",\n      \"agent\": \"claude\",\n      \"modeState\": {\n        \"currentModeId\": \"default\",\n        \"availableModes\": [\n          {\n            \"id\": \"default\",\n            \"name\": \"Default\"\n          },\n          {\n            \"id\": \"plan\",\n            \"name\": \"Plan\"\n          }\n        ]\n      }\n    }\n  },\n  \"turn\": {\n    \"classification\": \"completed\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": null,\n    \"identityMatches\": null,\n    \"pid\": null,\n    \"processGroupId\": null,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 54,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  }\n}"
+    }
+  ],
+  "details": {
+    "session": {
+      "name": "lost-stream",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "idle",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "transcript": [
+        {
+          "role": "user",
+          "text": "Successful turn whose client stream was lost.",
+          "createdAt": "2026-01-01T10:00:05.000Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Handled: Successful turn whose client stream was lost.",
+          "createdAt": "2026-01-01T10:00:20.000Z"
+        }
+      ],
+      "handle": {
+        "runtimeSessionName": "lost-stream",
+        "cwd": "/workspace/project",
+        "agent": "claude",
+        "mode": "persistent"
+      },
+      "reasoningProfile": "claude",
+      "activeTurn": {
+        "id": "turn-lost-stream-1",
+        "state": "completed",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 54,
+        "exitCode": 0,
+        "signal": null,
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "completedAt": "2026-01-01T10:01:30.000Z"
+      },
+      "tokenUsage": {
+        "used": 45,
+        "size": 4096,
+        "input": 45,
+        "output": 12,
+        "cacheRead": 5,
+        "cacheWrite": 3
+      }
+    },
+    "runtime": {
+      "exists": true,
+      "status": "alive",
+      "raw": {
+        "status": "alive",
+        "acpxRecordId": "rec-lost-stream",
+        "acpxSessionId": "backend-lost-stream",
+        "agentSessionId": "agent-lost-stream",
+        "agent": "claude",
+        "modeState": {
+          "currentModeId": "default",
+          "availableModes": [
+            {
+              "id": "default",
+              "name": "Default"
+            },
+            {
+              "id": "plan",
+              "name": "Plan"
+            }
+          ]
+        }
+      }
+    },
+    "turn": {
+      "classification": "completed",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": null,
+      "identityMatches": null,
+      "pid": null,
+      "processGroupId": null,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 54,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
+      "conflict": null
+    }
+  }
+}

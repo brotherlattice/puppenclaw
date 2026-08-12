@@ -87,15 +87,7 @@ export function createPuppenclawService(): OpenClawPluginService {
         clearInterval(state.gcTimer);
         state.gcTimer = null;
       }
-      state.orchestratorStore?.close();
-      state.usageLedger?.close();
-      await state.store?.close();
-      state.store = null;
-      state.orchestratorStore = null;
-      state.usageLedger = null;
-      state.manager = null;
-      state.orchestrator = null;
-      state.outputRouter = null;
+      await cleanupInitializedState();
     }
   };
 }
@@ -217,7 +209,47 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
   })();
   try {
     await state.initPromise;
+  } catch (error) {
+    await cleanupInitializedState();
+    throw error;
   } finally {
     state.initPromise = null;
   }
+}
+
+async function cleanupInitializedState(): Promise<void> {
+  const store = state.store;
+  const orchestratorStore = state.orchestratorStore;
+  const usageLedger = state.usageLedger;
+  state.store = null;
+  state.orchestratorStore = null;
+  state.usageLedger = null;
+  state.manager = null;
+  state.orchestrator = null;
+  state.outputRouter = null;
+  try {
+    orchestratorStore?.close();
+  } catch (error) {
+    state.logger?.warn(
+      `Unable to close partially initialized Orchestrator state: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+  try {
+    usageLedger?.close();
+  } catch (error) {
+    state.logger?.warn(
+      `Unable to close partially initialized usage state: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+  await store?.close().catch((error) => {
+    state.logger?.warn(
+      `Unable to release the session-state owner lease: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  });
 }

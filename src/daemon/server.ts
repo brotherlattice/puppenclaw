@@ -45,7 +45,7 @@ import {
   unfocusParamsZod,
   workerManifestZod
 } from "../shared/schema.js";
-import type { ParsedPluginConfig, ToolResult } from "../shared/types.js";
+import type { ParsedPluginConfig, StateRecoveryStatus, ToolResult } from "../shared/types.js";
 import { ensureDir } from "../shared/utils.js";
 
 export async function createDaemonServer(params: {
@@ -122,44 +122,77 @@ export async function createDaemonServer(params: {
       );
     }
   });
-  const orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
-  const usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
-  const computeRuntime = await ComputeRuntime.open({
-    dataDir: params.dataDir,
-    config: params.config
-  });
-  const resourceMonitor = await ResourceMonitor.open({
-    dataDir: params.dataDir,
-    config: params.config,
-    logger,
-    sessionStore: store,
-    computeJobs: {
-      listActive: (sessionName?: string) => computeRuntime.listActiveJobs(sessionName)
+  const initialized = await (async () => {
+    let orchestratorStore: OrchestratorStore | undefined;
+    let usageLedger: UsageLedgerStore | undefined;
+    let computeRuntime: ComputeRuntime | undefined;
+    let resourceMonitor: ResourceMonitor | undefined;
+    try {
+      orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
+      usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
+      computeRuntime = await ComputeRuntime.open({
+        dataDir: params.dataDir,
+        config: params.config
+      });
+      resourceMonitor = await ResourceMonitor.open({
+        dataDir: params.dataDir,
+        config: params.config,
+        logger,
+        sessionStore: store,
+        computeJobs: {
+          listActive: (sessionName?: string) => computeRuntime?.listActiveJobs(sessionName) ?? []
+        }
+      });
+      resourceMonitor.start();
+      const outputRouter = new OutputRouter(logger);
+      const manager = new AcpxSessionManager({
+        config: {
+          ...params.config,
+          backend: "local"
+        },
+        logger,
+        store,
+        outputRouter,
+        ledger: usageLedger
+      });
+      await manager.reconcilePersistedSessions();
+      const orchestrator = new OrchestratorRuntime({
+        config: {
+          ...params.config,
+          backend: "local"
+        },
+        logger,
+        store: orchestratorStore,
+        sessionStore: store,
+        sessionManager: manager
+      });
+      return {
+        orchestratorStore,
+        usageLedger,
+        computeRuntime,
+        resourceMonitor,
+        outputRouter,
+        manager,
+        orchestrator
+      };
+    } catch (error) {
+      resourceMonitor?.close();
+      computeRuntime?.close();
+      usageLedger?.close();
+      orchestratorStore?.close();
+      await store.close();
+      throw error;
     }
-  });
-  resourceMonitor.start();
-  const outputRouter = new OutputRouter(logger);
-  const manager = new AcpxSessionManager({
-    config: {
-      ...params.config,
-      backend: "local"
-    },
-    logger,
-    store,
+  })();
+  const {
+    orchestratorStore,
+    usageLedger,
+    computeRuntime,
+    resourceMonitor,
     outputRouter,
-    ledger: usageLedger
-  });
-  await manager.reconcilePersistedSessions();
-  const orchestrator = new OrchestratorRuntime({
-    config: {
-      ...params.config,
-      backend: "local"
-    },
-    logger,
-    store: orchestratorStore,
-    sessionStore: store,
-    sessionManager: manager
-  });
+    manager,
+    orchestrator
+  } = initialized;
 
   const ok = (result: ToolResult) => result;
 
@@ -168,7 +201,7 @@ export async function createDaemonServer(params: {
     return {
       ok: !recovery.required,
       sessions: store.listSessions().length,
-      stateRecovery: recovery
+      stateRecovery: publicRecoveryStatus(recovery)
     };
   });
 
@@ -208,7 +241,7 @@ export async function createDaemonServer(params: {
     sessionSkills: true,
     stateRecovery: {
       version: 1,
-      status: store.getRecoveryStatus(),
+      status: publicRecoveryStatus(store.getRecoveryStatus()),
       explicitReset: true,
       readOnlyWhenRequired: true,
       ownerLease: true
@@ -638,6 +671,18 @@ export async function createDaemonServer(params: {
   });
 
   return { app };
+}
+
+function publicRecoveryStatus(status: StateRecoveryStatus): Record<string, unknown> {
+  if (!status.required) {
+    return { required: false };
+  }
+  return {
+    required: true,
+    reason: status.reason,
+    detectedAt: status.detectedAt,
+    message: "Persisted daemon state requires an explicit operator reset."
+  };
 }
 
 function daemonStatusForError(code: string): number {

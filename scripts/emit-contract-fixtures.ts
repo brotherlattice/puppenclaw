@@ -30,13 +30,19 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createDaemonServer } from "../src/daemon/server.js";
-import { SESSION_STORE_VERSION } from "../src/shared/schema.js";
-import type { SessionInfo, StoredState } from "../src/shared/types.js";
-import { writeJsonFileAtomic } from "../src/shared/utils.js";
-import { makeConfig, resolveFakeAcpxCommand } from "../test/helpers.js";
+import { AcpxSessionManager } from "../src/manager/acpx.js";
+import type { ActiveTurnMetadata, SessionInfo } from "../src/shared/types.js";
+import {
+  createStoreAndRouter,
+  makeConfig,
+  resolveFakeAcpxCommand
+} from "../test/helpers.js";
 
 export const CONTRACT_SCENARIOS = [
   "idle",
+  "plan",
+  "waiting-input",
+  "lost-stream",
   "running",
   "orphaned",
   "legacy-no-turn",
@@ -97,7 +103,7 @@ async function readProcIdentity(pid: number): Promise<LiveTurnProcess> {
   };
 }
 
-function baseSession(name: string, workspaceDir: string): SessionInfo {
+function baseSeededSession(name: string, workspaceDir: string): SessionInfo {
   return {
     name,
     agent: "claude",
@@ -114,14 +120,13 @@ function baseSession(name: string, workspaceDir: string): SessionInfo {
   };
 }
 
-function buildScenarioSessions(
+function buildRestartScenarioSessions(
   workspaceDir: string,
   liveTurn: LiveTurnProcess
-): Record<ContractScenario, SessionInfo> {
+): Record<"running" | "orphaned" | "legacy-no-turn", SessionInfo> {
   return {
-    idle: baseSession("idle", workspaceDir),
     running: {
-      ...baseSession("running", workspaceDir),
+      ...baseSeededSession("running", workspaceDir),
       state: "running",
       transcript: [
         { role: "user", text: "Task for running scenario.", createdAt: T_USER },
@@ -140,7 +145,7 @@ function buildScenarioSessions(
       }
     },
     orphaned: {
-      ...baseSession("orphaned", workspaceDir),
+      ...baseSeededSession("orphaned", workspaceDir),
       state: "running",
       activeTurn: {
         id: "turn-orphaned-1",
@@ -155,30 +160,118 @@ function buildScenarioSessions(
       }
     },
     "legacy-no-turn": {
-      ...baseSession("legacy-no-turn", workspaceDir),
+      ...baseSeededSession("legacy-no-turn", workspaceDir),
       state: "running"
-    },
-    failed: {
-      ...baseSession("failed", workspaceDir),
-      state: "failed",
-      lastError: "Simulated turn failure",
-      activeTurn: {
-        id: "turn-failed-1",
-        state: "failed",
-        startedAt: T_TURN_STARTED,
-        updatedAt: T_TURN_OUTPUT,
-        completedAt: T_TURN_OUTPUT,
-        outputChars: 0,
-        exitCode: 1,
-        error: "Simulated turn failure"
-      }
-    },
-    quiesced: {
-      ...baseSession("quiesced", workspaceDir),
-      state: "stopped",
-      lastStopReason: "quiesced at lifecycle epoch 1"
     }
   };
+}
+
+function normalizedTerminalTurn(name: string, activeTurn: ActiveTurnMetadata): ActiveTurnMetadata {
+  const {
+    pid: _pid,
+    processGroupId: _processGroupId,
+    processStartIdentity: _processStartIdentity,
+    ...stable
+  } = activeTurn;
+  return {
+    ...stable,
+    id: `turn-${name}-1`,
+    startedAt: T_TURN_STARTED,
+    updatedAt: T_TURN_OUTPUT,
+    ...(activeTurn.completedAt != null ? { completedAt: T_TURN_OUTPUT } : {}),
+    ...(activeTurn.lastOutputAt != null ? { lastOutputAt: T_TURN_OUTPUT } : {})
+  };
+}
+
+async function normalizeRealScenario(store: Awaited<ReturnType<typeof createStoreAndRouter>>["store"], name: string): Promise<void> {
+  const normalize = (current: SessionInfo): SessionInfo => ({
+      ...current,
+      createdAt: T_CREATED,
+      lastActivity: T_LAST_ACTIVITY,
+      transcript: current.transcript.map((entry) => ({
+        ...entry,
+        createdAt: entry.role === "user" ? T_USER : T_ASSISTANT
+      })),
+      ...(current.activeTurn != null
+        ? { activeTurn: normalizedTerminalTurn(name, current.activeTurn) }
+        : {})
+    });
+  const epoch = store.getActiveQuiescenceEpoch(name);
+  if (epoch != null) {
+    await store.patchQuiescedSession(name, epoch, normalize);
+    return;
+  }
+  await store.patchSession(name, (current) => {
+    if (current == null) {
+      throw new Error(`Missing generated scenario ${name}.`);
+    }
+    return normalize(current);
+  });
+}
+
+async function generateRealScenarios(params: {
+  dataDir: string;
+  workspaceDir: string;
+  acpxCommand: string;
+}): Promise<void> {
+  const { store, outputRouter } = await createStoreAndRouter(params.dataDir);
+  const manager = new AcpxSessionManager({
+    config: makeConfig({ acpxCommand: params.acpxCommand, maxSessions: 20 }),
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    store,
+    outputRouter
+  });
+  try {
+    await manager.start({
+      agent: "claude",
+      name: "idle",
+      directory: params.workspaceDir,
+      task: "Successful idle fixture.",
+      contextFiles: []
+    });
+    await manager.start({
+      agent: "claude",
+      name: "plan",
+      directory: params.workspaceDir,
+      task: "EXIT_PLAN_MODE",
+      interactionMode: "plan",
+      contextFiles: []
+    });
+    await manager.start({
+      agent: "claude",
+      name: "waiting-input",
+      directory: params.workspaceDir,
+      task: "ASK_USER",
+      contextFiles: []
+    });
+    await manager.start({
+      agent: "claude",
+      name: "lost-stream",
+      directory: params.workspaceDir,
+      task: "Successful turn whose client stream was lost.",
+      contextFiles: []
+    });
+    await manager.start({
+      agent: "claude",
+      name: "failed",
+      directory: params.workspaceDir,
+      task: "FAIL_TURN",
+      contextFiles: []
+    });
+    await manager.start({
+      agent: "claude",
+      name: "quiesced",
+      directory: params.workspaceDir,
+      task: "Prime the quiesced fixture.",
+      contextFiles: []
+    });
+    await manager.quiesce({ name: "quiesced" });
+    for (const name of ["idle", "plan", "waiting-input", "lost-stream", "failed", "quiesced"]) {
+      await normalizeRealScenario(store, name);
+    }
+  } finally {
+    await store.close();
+  }
 }
 
 function sanitizeBody(
@@ -218,39 +311,28 @@ export async function generateContractFixtures(): Promise<
       throw new Error("Unable to spawn the live turn placeholder process.");
     }
     const liveTurn = await readProcIdentity(liveChild.pid);
-    const sessions = buildScenarioSessions(workspaceDir, liveTurn);
-
-    const storedState: StoredState = {
-      version: SESSION_STORE_VERSION,
-      sessions: Object.fromEntries(
-        Object.values(sessions).map((session) => [session.name, session])
-      ),
-      exposures: {},
-      quiescence: {
-        lastEpoch: 1,
-        active: {
-          quiesced: {
-            name: "quiesced",
-            epoch: 1,
-            purpose: "external",
-            updatedAt: T_LAST_ACTIVITY
-          }
-        },
-        latestByName: { quiesced: 1 }
+    const acpxCommand = await resolveFakeAcpxCommand();
+    await mkdir(workspaceDir, { recursive: true });
+    await generateRealScenarios({ dataDir, workspaceDir, acpxCommand });
+    const restartScenarios = buildRestartScenarioSessions(workspaceDir, liveTurn);
+    const restartStore = (await createStoreAndRouter(dataDir)).store;
+    try {
+      for (const session of Object.values(restartScenarios)) {
+        await restartStore.upsertSession(session);
       }
-    };
-    await writeJsonFileAtomic(join(dataDir, "state.json"), storedState);
-
-    // Fake acpx runtime markers: the idle and running sessions have a live
-    // persistent ACP runtime; every other scenario reports no runtime.
-    const fakeStateDir = join(workspaceDir, ".fake-acpx-state");
-    await mkdir(fakeStateDir, { recursive: true });
-    for (const name of ["idle", "running"]) {
-      await writeFile(join(fakeStateDir, `${name}.session`), "alive\nclaude\n", "utf8");
+    } finally {
+      await restartStore.close();
     }
 
+    // Preserve a live runtime only where the scenario calls for one. The real
+    // start/send calls above create these markers through the fake ACP adapter.
+    const fakeStateDir = join(workspaceDir, ".fake-acpx-state");
+    await mkdir(fakeStateDir, { recursive: true });
+    await writeFile(join(fakeStateDir, "running.session"), "alive\nclaude\n", "utf8");
+    await rm(join(fakeStateDir, "failed.session"), { force: true });
+
     const { app } = await createDaemonServer({
-      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      config: makeConfig({ acpxCommand, maxSessions: 20 }),
       dataDir,
       logger: {
         info() {},

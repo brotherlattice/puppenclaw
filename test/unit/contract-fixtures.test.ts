@@ -41,4 +41,26 @@ describe.runIf(process.platform === "linux")("contract fixtures", () => {
     ]).sort();
     expect(committed).toEqual(expected);
   });
+
+  it("keeps process completion separate from final workflow state", async () => {
+    const expected = {
+      idle: "idle",
+      plan: "idle",
+      "waiting-input": "waiting_input",
+      "lost-stream": "idle"
+    } as const;
+    for (const [scenario, workflowState] of Object.entries(expected)) {
+      const fixture = JSON.parse(
+        await readFile(join(CONTRACT_FIXTURES_DIR, `${scenario}.status.json`), "utf8")
+      ) as {
+        details: {
+          session: { state: string; activeTurn?: { state: string } };
+          turn: { classification: string };
+        };
+      };
+      expect(fixture.details.session.state).toBe(workflowState);
+      expect(fixture.details.session.activeTurn?.state).toBe("completed");
+      expect(fixture.details.turn.classification).toBe("completed");
+    }
+  });
 });

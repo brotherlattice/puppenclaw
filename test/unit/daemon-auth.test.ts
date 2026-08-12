@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -149,6 +149,9 @@ describe("daemon auth", () => {
         ok: false,
         stateRecovery: { required: true, reason: "corrupt" }
       });
+      expect(health.body).not.toContain(workspaceDir);
+      const capabilities = await app.inject({ method: "GET", url: "/capabilities" });
+      expect(capabilities.body).not.toContain(workspaceDir);
       const blockedMutation = await app.inject({
         method: "POST",
         url: "/gc",
@@ -190,5 +193,20 @@ describe("daemon auth", () => {
     } finally {
       await app.close();
     }
+  });
+
+  it("releases the state-owner lease after partial daemon initialization fails", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-daemon-partial-init-");
+    await writeFile(join(workspaceDir, "orchestrator"), "blocks directory creation", "utf8");
+    const config = makeConfig({ acpxCommand: await resolveFakeAcpxCommand() });
+
+    await expect(createDaemonServer({ config, dataDir: workspaceDir })).rejects.toBeTruthy();
+    await expect(readFile(join(workspaceDir, ".state-owner.json"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+
+    await rm(join(workspaceDir, "orchestrator"), { force: true });
+    const { app } = await createDaemonServer({ config, dataDir: workspaceDir });
+    await app.close();
   });
 });

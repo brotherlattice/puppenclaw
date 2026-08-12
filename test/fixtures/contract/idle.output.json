@@ -2,7 +2,7 @@
   "content": [
     {
       "type": "text",
-      "text": "Output for idle\n{\n  \"session\": {\n    \"name\": \"idle\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"idle\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Task for idle scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Answer for idle scenario.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ]\n  },\n  \"turn\": {\n    \"classification\": \"inactive\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": null,\n    \"identityMatches\": null,\n    \"pid\": null,\n    \"processGroupId\": null,\n    \"startedAt\": null,\n    \"updatedAt\": null,\n    \"lastOutputAt\": null,\n    \"outputChars\": 0,\n    \"ageMs\": null,\n    \"outputAgeMs\": null,\n    \"conflict\": null\n  },\n  \"output\": {\n    \"text\": \"Answer for idle scenario.\",\n    \"chars\": 25,\n    \"source\": \"transcript\",\n    \"startedAt\": null,\n    \"updatedAt\": \"2026-01-01T10:00:20.000Z\",\n    \"complete\": true\n  }\n}"
+      "text": "Output for idle\n{\n  \"session\": {\n    \"name\": \"idle\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"idle\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"Successful idle fixture.\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"Handled: Successful idle fixture.\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"handle\": {\n      \"runtimeSessionName\": \"idle\",\n      \"cwd\": \"/workspace/project\",\n      \"agent\": \"claude\",\n      \"mode\": \"persistent\"\n    },\n    \"reasoningProfile\": \"claude\",\n    \"activeTurn\": {\n      \"id\": \"turn-idle-1\",\n      \"state\": \"completed\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 33,\n      \"exitCode\": 0,\n      \"signal\": null,\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"completedAt\": \"2026-01-01T10:01:30.000Z\"\n    },\n    \"tokenUsage\": {\n      \"used\": 24,\n      \"size\": 4096,\n      \"input\": 24,\n      \"output\": 12,\n      \"cacheRead\": 5,\n      \"cacheWrite\": 3\n    }\n  },\n  \"turn\": {\n    \"classification\": \"completed\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": null,\n    \"identityMatches\": null,\n    \"pid\": null,\n    \"processGroupId\": null,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 33,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  },\n  \"output\": {\n    \"text\": \"Handled: Successful idle fixture.\",\n    \"chars\": 33,\n    \"source\": \"transcript\",\n    \"startedAt\": null,\n    \"updatedAt\": \"2026-01-01T10:00:20.000Z\",\n    \"complete\": true\n  }\n}"
     }
   ],
   "details": {
@@ -18,35 +18,61 @@
       "transcript": [
         {
           "role": "user",
-          "text": "Task for idle scenario.",
+          "text": "Successful idle fixture.",
           "createdAt": "2026-01-01T10:00:05.000Z"
         },
         {
           "role": "assistant",
-          "text": "Answer for idle scenario.",
+          "text": "Handled: Successful idle fixture.",
           "createdAt": "2026-01-01T10:00:20.000Z"
         }
-      ]
+      ],
+      "handle": {
+        "runtimeSessionName": "idle",
+        "cwd": "/workspace/project",
+        "agent": "claude",
+        "mode": "persistent"
+      },
+      "reasoningProfile": "claude",
+      "activeTurn": {
+        "id": "turn-idle-1",
+        "state": "completed",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 33,
+        "exitCode": 0,
+        "signal": null,
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "completedAt": "2026-01-01T10:01:30.000Z"
+      },
+      "tokenUsage": {
+        "used": 24,
+        "size": 4096,
+        "input": 24,
+        "output": 12,
+        "cacheRead": 5,
+        "cacheWrite": 3
+      }
     },
     "turn": {
-      "classification": "inactive",
+      "classification": "completed",
       "lockHeld": false,
       "trackedChild": false,
       "processAlive": null,
       "identityMatches": null,
       "pid": null,
       "processGroupId": null,
-      "startedAt": null,
-      "updatedAt": null,
-      "lastOutputAt": null,
-      "outputChars": 0,
-      "ageMs": null,
-      "outputAgeMs": null,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 33,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
       "conflict": null
     },
     "output": {
-      "text": "Answer for idle scenario.",
-      "chars": 25,
+      "text": "Handled: Successful idle fixture.",
+      "chars": 33,
       "source": "transcript",
       "startedAt": null,
       "updatedAt": "2026-01-01T10:00:20.000Z",
