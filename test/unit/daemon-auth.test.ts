@@ -1,3 +1,6 @@
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { createDaemonServer } from "../../src/daemon/server.js";
@@ -126,6 +129,64 @@ describe("daemon auth", () => {
     try {
       const sessions = await app.inject({ method: "GET", url: "/sessions" });
       expect(sessions.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("exposes damaged state read-only and requires an authenticated explicit reset", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-daemon-recovery-");
+    await writeFile(join(workspaceDir, "state.json"), "{damaged", "utf8");
+    const config = makeConfig({
+      acpxCommand: await resolveFakeAcpxCommand(),
+      daemonAuthToken: "operator-token"
+    });
+    const { app } = await createDaemonServer({ config, dataDir: workspaceDir });
+
+    try {
+      const health = await app.inject({ method: "GET", url: "/health" });
+      expect(JSON.parse(health.body)).toMatchObject({
+        ok: false,
+        stateRecovery: { required: true, reason: "corrupt" }
+      });
+      const blockedMutation = await app.inject({
+        method: "POST",
+        url: "/gc",
+        headers: { authorization: "Bearer operator-token" }
+      });
+      expect(blockedMutation.statusCode).toBe(503);
+      expect(JSON.parse(blockedMutation.body)).toMatchObject({
+        code: "STATE_RECOVERY_REQUIRED"
+      });
+      const unauthenticated = await app.inject({
+        method: "POST",
+        url: "/recovery/reset",
+        payload: { confirm: "reset-session-state" }
+      });
+      expect(unauthenticated.statusCode).toBe(401);
+      const unconfirmed = await app.inject({
+        method: "POST",
+        url: "/recovery/reset",
+        headers: { authorization: "Bearer operator-token" },
+        payload: {}
+      });
+      expect(unconfirmed.statusCode).toBe(400);
+      const reset = await app.inject({
+        method: "POST",
+        url: "/recovery/reset",
+        headers: { authorization: "Bearer operator-token" },
+        payload: { confirm: "reset-session-state" }
+      });
+      expect(reset.statusCode).toBe(200);
+      expect(JSON.parse(reset.body)).toEqual({
+        ok: true,
+        stateRecovery: { required: false }
+      });
+      const recoveredHealth = await app.inject({ method: "GET", url: "/health" });
+      expect(JSON.parse(recoveredHealth.body)).toMatchObject({
+        ok: true,
+        stateRecovery: { required: false }
+      });
     } finally {
       await app.close();
     }

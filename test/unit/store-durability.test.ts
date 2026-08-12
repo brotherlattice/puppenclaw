@@ -1,4 +1,4 @@
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -73,10 +73,11 @@ describe("readJsonFileResilient", () => {
 
 describe("SessionStore.open", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
-  it("opens with fresh state and quarantines a corrupt state file", async () => {
+  it("opens corrupt state in recovery-required mode until an explicit reset", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const dir = await createTempDir("puppenclaw-durability-store-corrupt-");
     await writeFile(join(dir, "state.json"), "not json at all", "utf8");
@@ -84,13 +85,33 @@ describe("SessionStore.open", () => {
     const store = await SessionStore.open(dir);
 
     expect(store.listSessions()).toEqual([]);
-    const entries = await readdir(dir);
-    expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatch(/^state\.json\.corrupt-/u);
+    expect(store.getRecoveryStatus()).toMatchObject({ required: true, reason: "corrupt" });
+    await expect(
+      store.upsertSession({
+        agent: "claude",
+        name: "must-not-reuse",
+        directory: dir,
+        state: "idle",
+        createdAt: new Date().toISOString(),
+        lastActivity: new Date().toISOString(),
+        permissionMode: "approve-reads",
+        warnings: [],
+        transcript: []
+      })
+    ).rejects.toMatchObject({ code: "STATE_RECOVERY_REQUIRED" });
+    expect((await readdir(dir)).some((entry) => /^state\.json\.corrupt-/u.test(entry))).toBe(true);
+
+    await expect(store.resetRecovery()).resolves.toEqual({ required: false });
+    await expect(store.flush()).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(join(dir, "state.json"), "utf8"))).toMatchObject({
+      version: 1,
+      sessions: {}
+    });
+    await store.close();
   });
 
-  it("quarantines a version-mismatched state file and resets with a warning", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("requires recovery for version-mismatched and structurally invalid state", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
     const dir = await createTempDir("puppenclaw-durability-store-version-");
     await writeFile(
       join(dir, "state.json"),
@@ -102,11 +123,26 @@ describe("SessionStore.open", () => {
 
     expect(store.listSessions()).toEqual([]);
     expect(store.getSession("legacy")).toBeNull();
-    const entries = await readdir(dir);
-    expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatch(/^state\.json\.corrupt-/u);
-    expect(warnSpy).toHaveBeenCalledOnce();
-    expect(warnSpy.mock.calls[0]?.[0]).toContain("version 999");
+    expect(store.getRecoveryStatus()).toMatchObject({
+      required: true,
+      reason: "incompatible"
+    });
+    await store.close();
+
+    const invalidDir = await createTempDir("puppenclaw-durability-store-invalid-");
+    await writeFile(
+      join(invalidDir, "state.json"),
+      JSON.stringify({
+        version: 1,
+        sessions: { damaged: { name: "damaged", state: "running" } },
+        exposures: {},
+        quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
+      }),
+      "utf8"
+    );
+    const invalidStore = await SessionStore.open(invalidDir);
+    expect(invalidStore.getRecoveryStatus()).toMatchObject({ required: true, reason: "invalid" });
+    await invalidStore.close();
   });
 
   it("opens with the fallback state when no state file exists", async () => {
@@ -115,7 +151,55 @@ describe("SessionStore.open", () => {
     const store = await SessionStore.open(dir);
 
     expect(store.listSessions()).toEqual([]);
+    expect(store.getRecoveryStatus()).toEqual({ required: false });
+    expect(await readdir(dir)).toEqual([".state-owner.json"]);
+    await store.close();
     expect(await readdir(dir)).toEqual([]);
+  });
+
+  it("stays read-only when corrupt state cannot be quarantined", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-12T01:02:03.004Z"));
+    const dir = await createTempDir("puppenclaw-durability-unquarantinable-");
+    await writeFile(join(dir, "state.json"), "{broken", "utf8");
+    await mkdir(join(dir, "state.json.corrupt-2026-08-12T01-02-03.004Z"));
+
+    const store = await SessionStore.open(dir);
+
+    expect(store.getRecoveryStatus()).toMatchObject({ required: true, reason: "corrupt" });
+    expect(await readFile(join(dir, "state.json"), "utf8")).toBe("{broken");
+    await expect(store.reserveQuiescence("unsafe", "external")).rejects.toMatchObject({
+      code: "STATE_RECOVERY_REQUIRED"
+    });
+    await store.close();
+    vi.useRealTimers();
+  });
+
+  it("allows only one live owner and safely takes over a stale owner lease", async () => {
+    const dir = await createTempDir("puppenclaw-durability-owner-");
+    const owner = await SessionStore.open(dir);
+
+    await expect(SessionStore.open(dir)).rejects.toMatchObject({ code: "STATE_ROOT_IN_USE" });
+    await owner.close();
+
+    await writeFile(
+      join(dir, ".state-owner.json"),
+      JSON.stringify({
+        version: 1,
+        ownerId: "stale-owner",
+        pid: 999_999_999,
+        processStartIdentity: "999999999:1",
+        acquiredAt: "2026-08-12T00:00:00.000Z"
+      }),
+      "utf8"
+    );
+    const replacement = await SessionStore.open(dir);
+    expect(replacement.getRecoveryStatus()).toEqual({ required: false });
+    expect((await readdir(dir)).some((entry) => entry.startsWith(".state-owner.json.stale-"))).toBe(
+      true
+    );
+    await replacement.close();
   });
 });
 

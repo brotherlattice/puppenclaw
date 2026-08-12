@@ -105,6 +105,23 @@ export async function createDaemonServer(params: {
   }
 
   const store = await SessionStore.open(params.dataDir);
+  app.addHook("onRequest", async (request) => {
+    if (
+      request.method === "GET" ||
+      request.url.split("?")[0] === "/recovery/reset" ||
+      request.url.split("?")[0] === "/shutdown"
+    ) {
+      return;
+    }
+    const recovery = store.getRecoveryStatus();
+    if (recovery.required) {
+      throw new PuppenclawError(
+        "STATE_RECOVERY_REQUIRED",
+        `Daemon state is read-only until an operator reset is performed: ${recovery.message}`,
+        recovery
+      );
+    }
+  });
   const orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
   const usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
   const computeRuntime = await ComputeRuntime.open({
@@ -146,10 +163,14 @@ export async function createDaemonServer(params: {
 
   const ok = (result: ToolResult) => result;
 
-  app.get("/health", async () => ({
-    ok: true,
-    sessions: store.listSessions().length
-  }));
+  app.get("/health", async () => {
+    const recovery = store.getRecoveryStatus();
+    return {
+      ok: !recovery.required,
+      sessions: store.listSessions().length,
+      stateRecovery: recovery
+    };
+  });
 
   app.get("/capabilities", async () => ({
     ok: true,
@@ -185,6 +206,13 @@ export async function createDaemonServer(params: {
     sessionFocus: true,
     sessionFork: true,
     sessionSkills: true,
+    stateRecovery: {
+      version: 1,
+      status: store.getRecoveryStatus(),
+      explicitReset: true,
+      readOnlyWhenRequired: true,
+      ownerLease: true
+    },
     reasoning: REASONING_CAPABILITIES,
     maxSessions: {
       min: 1,
@@ -230,6 +258,22 @@ export async function createDaemonServer(params: {
     computeRuntime.close();
     orchestratorStore.close();
     usageLedger.close();
+    await store.close();
+  });
+
+  app.post("/recovery/reset", async (request, reply) => {
+    const confirmation = (request.body as { confirm?: unknown } | null)?.confirm;
+    if (confirmation !== "reset-session-state") {
+      return reply.code(400).send({
+        ok: false,
+        code: "RESET_CONFIRMATION_REQUIRED",
+        error: 'Recovery reset requires {"confirm":"reset-session-state"}.'
+      });
+    }
+    return {
+      ok: true,
+      stateRecovery: await store.resetRecovery()
+    };
   });
 
   app.get("/sessions", async () => ok(await manager.status(statusParamsZod.parse({}))));
@@ -610,6 +654,7 @@ function daemonStatusForError(code: string): number {
       return 409;
     case "QUIESCENCE_UNAVAILABLE":
     case "ACP_CONTROL_TIMEOUT":
+    case "STATE_RECOVERY_REQUIRED":
       return 503;
     default:
       return 500;

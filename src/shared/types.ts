@@ -404,6 +404,18 @@ export type StoredState = {
   quiescence: SessionQuiescenceState;
 };
 
+export type StateRecoveryStatus =
+  | {
+      required: false;
+    }
+  | {
+      required: true;
+      reason: "corrupt" | "incompatible" | "invalid" | "unreadable";
+      message: string;
+      detectedAt: string;
+      quarantinePath?: string;
+    };
+
 export type PromptEvent =
   | {
       type: "text_delta";

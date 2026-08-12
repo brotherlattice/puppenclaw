@@ -87,6 +87,15 @@ export function createPuppenclawService(): OpenClawPluginService {
         clearInterval(state.gcTimer);
         state.gcTimer = null;
       }
+      state.orchestratorStore?.close();
+      state.usageLedger?.close();
+      await state.store?.close();
+      state.store = null;
+      state.orchestratorStore = null;
+      state.usageLedger = null;
+      state.manager = null;
+      state.orchestrator = null;
+      state.outputRouter = null;
     }
   };
 }

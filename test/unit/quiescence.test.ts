@@ -93,6 +93,7 @@ describe("session quiescence", () => {
       })
     ).rejects.toMatchObject({ code: "SESSION_QUIESCED" });
 
+    await firstState.store.close();
     const reopenedStore = await SessionStore.open(workspaceDir);
     const reopenedState = await createStoreAndRouter(await createTempDir("puppenclaw-router-"));
     const reopenedManager = new AcpxSessionManager({
@@ -241,6 +242,7 @@ describe("session quiescence", () => {
       await store.releaseQuiescence(`transient-${index}`, reservation.epoch);
     }
     const interrupted = await store.reserveQuiescence("interrupted-purge", "purge");
+    await store.close();
     const reopened = await SessionStore.open(workspaceDir);
     expect(reopened.getActiveQuiescenceEpoch("interrupted-purge")).toBe(interrupted.epoch);
     expect(reopened.getLatestLifecycleEpoch("interrupted-purge")).toBeNull();
@@ -263,6 +265,7 @@ describe("session quiescence", () => {
     const firstStore = await SessionStore.open(workspaceDir);
     const transient = await firstStore.reserveQuiescence("interrupted-purge", "purge");
 
+    await firstStore.close();
     const reopenedStore = await SessionStore.open(workspaceDir);
     const reopenedState = await createStoreAndRouter(await createTempDir("puppenclaw-router-"));
     const manager = new AcpxSessionManager({
@@ -324,6 +327,7 @@ describe("session quiescence", () => {
     expect(upgraded.getLatestLifecycleEpoch("legacy")).toBe(7);
     await upgraded.releaseQuiescence("legacy", 7);
 
+    await upgraded.close();
     const reopened = await SessionStore.open(workspaceDir);
     expect(reopened.getLatestLifecycleEpoch("legacy")).toBe(7);
     await expect(reopened.enterLifecycleTurn("legacy")).rejects.toMatchObject({
@@ -678,6 +682,7 @@ describe("session quiescence", () => {
       })
     ).rejects.toMatchObject({ code: "SESSION_QUIESCED" });
 
+    await firstState.store.close();
     const reopenedStore = await SessionStore.open(workspaceDir);
     const reopenedState = await createStoreAndRouter(await createTempDir("puppenclaw-router-"));
     const reopenedManager = new AcpxSessionManager({
