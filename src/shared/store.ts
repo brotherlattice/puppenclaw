@@ -1427,9 +1427,14 @@ async function loadStoredState(statePath: string): Promise<{
   if (validated.success) {
     return {
       // Zod defaults are part of the compatible-state upgrade. Returning the
-      // unparsed input here would validate a legacy file successfully while
-      // leaving newly defaulted namespaces undefined in memory.
-      state: validated.data as StoredState,
+      // unparsed input unchanged would leave newly defaulted namespaces
+      // undefined. Preserve the persisted session objects' insertion order,
+      // which is observable in the daemon's legacy text status envelope.
+      state: {
+        ...(compatibleState as StoredState),
+        sessionOwners: validated.data.sessionOwners,
+        ownerCleanup: validated.data.ownerCleanup
+      },
       recovery: { required: false }
     };
   }
