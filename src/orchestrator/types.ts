@@ -216,6 +216,9 @@ export type RunRecord = {
   exitCode?: number;
   command?: string;
   sessionName?: string;
+  pid?: number;
+  processGroupId?: number;
+  processStartIdentity?: string;
   attempts: number;
   failureCode?: string;
   failureCategory?: "timeout" | "execution" | "validation" | "unknown";

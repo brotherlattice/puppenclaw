@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -96,6 +97,8 @@ type ShellCommandResult = {
   outputText: string;
 };
 
+type RecoveryDisposition = "gone" | "terminated" | "ambiguous";
+
 type StepAttemptOutcome =
   | {
       ok: true;
@@ -185,6 +188,59 @@ function summarizeText(value: string, max = 220): string {
 
 function normalizeArtifactContent(content: string): string {
   return `${content.trimEnd()}\n`;
+}
+
+async function readLinuxProcessStartIdentity(pid: number): Promise<string | null> {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  const raw = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => null);
+  if (raw == null) {
+    return null;
+  }
+  const closeParen = raw.lastIndexOf(")");
+  if (closeParen < 0) {
+    return null;
+  }
+  const fields = raw.slice(closeParen + 2).trim().split(/\s+/u);
+  const startTicks = fields[19];
+  return startTicks != null ? `${pid}:${startTicks}` : null;
+}
+
+function readLinuxProcessStartIdentitySync(pid: number): string | null {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const closeParen = raw.lastIndexOf(")");
+    if (closeParen < 0) {
+      return null;
+    }
+    const fields = raw.slice(closeParen + 2).trim().split(/\s+/u);
+    const startTicks = fields[19];
+    return startTicks != null ? `${pid}:${startTicks}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function pidMayExist(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function processGroupMayExist(processGroupId: number): boolean {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function hashTextContent(content: string): string {
@@ -326,6 +382,7 @@ export class OrchestratorRuntime implements IOrchestrator {
   private readonly activeCommands = new Map<string, Set<ChildProcessWithoutNullStreams>>();
   private readonly activeAcpSessions = new Map<string, Set<string>>();
   private readonly activeStepExecutions = new Map<string, number>();
+  private interruptedCampaignsRecovered = false;
 
   constructor(
     private readonly deps: {
@@ -336,6 +393,149 @@ export class OrchestratorRuntime implements IOrchestrator {
       logger: PluginLogger;
     }
   ) {}
+
+  async recoverInterruptedCampaigns(): Promise<void> {
+    if (this.interruptedCampaignsRecovered) {
+      return;
+    }
+    for (const campaign of this.deps.store.listCampaigns()) {
+      if (campaign.state !== "running" && campaign.state !== "cancelling") {
+        continue;
+      }
+      const activeRuns = this.deps.store
+        .listRuns(campaign.id)
+        .filter((run) => ["pending", "queued", "running", "waiting_approval"].includes(run.state));
+      const outcomes: RecoveryDisposition[] = [];
+      for (const run of activeRuns) {
+        outcomes.push(
+          run.executor === "command"
+            ? await this.recoverPersistedCommand(run)
+            : await this.recoverPersistedAcpSession(campaign, run)
+        );
+      }
+      if (outcomes.includes("ambiguous")) {
+        const detectedAt = nowIso();
+        this.deps.store.upsertCampaign({
+          ...campaign,
+          state: "recovery_required",
+          failureCode: "CAMPAIGN_RECOVERY_REQUIRED",
+          lastError: "Interrupted campaign work could not be proven terminated.",
+          lastProgressAt: detectedAt,
+          updatedAt: detectedAt
+        });
+        this.deps.logger.warn(
+          `Campaign ${campaign.id} is fenced because interrupted work could not be proven terminated.`
+        );
+        continue;
+      }
+      if (campaign.state === "cancelling") {
+        this.deps.store.finalizeCampaignCancellation(campaign.id, nowIso());
+        continue;
+      }
+      this.deps.store.finalizeCampaignFailure({
+        campaignId: campaign.id,
+        failedAt: nowIso(),
+        failureCode: "CAMPAIGN_INTERRUPTED",
+        message: "Campaign execution was interrupted by a daemon restart."
+      });
+    }
+    this.interruptedCampaignsRecovered = true;
+  }
+
+  private async recoverPersistedAcpSession(
+    campaign: CampaignSpecRecord,
+    run: RunRecord
+  ): Promise<RecoveryDisposition> {
+    const step = campaign.steps[run.stepIndex];
+    const sessionName =
+      run.sessionName ??
+      (step?.sessionScope === "step"
+        ? `${slug(campaign.name)}-${run.stepId}-${campaign.id.slice(-6)}`
+        : campaign.acpSessionName ?? `${slug(campaign.name)}-${campaign.id.slice(-8)}`);
+    const session = this.deps.sessionStore.getSession(sessionName);
+    if (session == null) {
+      return "gone";
+    }
+    const mayBeActive =
+      session.state === "running" ||
+      session.activeTurn?.state === "running" ||
+      session.recoveryFence != null;
+    if (!mayBeActive) {
+      return "gone";
+    }
+    try {
+      await this.deps.sessionManager.stop({ name: sessionName });
+    } catch (error) {
+      this.deps.logger.warn(
+        `Unable to stop interrupted ACP session ${sessionName}: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`
+      );
+      return "ambiguous";
+    }
+    const latest = this.deps.sessionStore.getSession(sessionName);
+    return latest == null ||
+      (latest.state !== "running" &&
+        latest.activeTurn?.state !== "running" &&
+        latest.recoveryFence == null)
+      ? "terminated"
+      : "ambiguous";
+  }
+
+  private async recoverPersistedCommand(run: RunRecord): Promise<RecoveryDisposition> {
+    if (run.pid == null) {
+      return "ambiguous";
+    }
+    const observed = await readLinuxProcessStartIdentity(run.pid);
+    if (observed == null) {
+      return pidMayExist(run.pid) ? "ambiguous" : "gone";
+    }
+    if (run.processStartIdentity == null || observed !== run.processStartIdentity) {
+      return "gone";
+    }
+    if (
+      process.platform !== "linux" ||
+      run.pid === process.pid ||
+      (run.processGroupId != null && run.processGroupId !== run.pid)
+    ) {
+      return "ambiguous";
+    }
+    const processGroupId = run.processGroupId ?? run.pid;
+    this.signalPersistedProcessGroup(processGroupId, "SIGTERM");
+    if (await this.waitForPersistedProcessExit(run, processGroupId, PROCESS_KILL_ESCALATION_MS)) {
+      return "terminated";
+    }
+    this.signalPersistedProcessGroup(processGroupId, "SIGKILL");
+    return (await this.waitForPersistedProcessExit(run, processGroupId, PROCESS_STREAM_CLOSE_GRACE_MS))
+      ? "terminated"
+      : "ambiguous";
+  }
+
+  private signalPersistedProcessGroup(processGroupId: number, signal: NodeJS.Signals): void {
+    try {
+      process.kill(-processGroupId, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        this.deps.logger.warn(
+          `Unable to signal interrupted campaign process group: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`
+        );
+      }
+    }
+  }
+
+  private async waitForPersistedProcessExit(
+    run: RunRecord,
+    processGroupId: number,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    do {
+      const observed = run.pid != null ? await readLinuxProcessStartIdentity(run.pid) : null;
+      if (observed !== run.processStartIdentity && !processGroupMayExist(processGroupId)) {
+        return true;
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 25));
+    } while (Date.now() < deadline);
+    return false;
+  }
 
   async ensureDefaultWorker(): Promise<void> {
     if (!this.deps.config.orchestration.enabled) {
@@ -628,6 +828,12 @@ export class OrchestratorRuntime implements IOrchestrator {
     if (["completed", "failed", "cancelled"].includes(campaign.state)) {
       return textToolResult(`Campaign ${campaign.name} is already ${campaign.state}.`, {
         campaign
+      });
+    }
+    if (campaign.state === "recovery_required") {
+      return textToolResult(`Campaign ${campaign.name} remains fenced for operator recovery.`, {
+        campaign,
+        recoveryRequired: true
       });
     }
     if (campaign.state !== "cancelling") {
@@ -984,8 +1190,10 @@ export class OrchestratorRuntime implements IOrchestrator {
     const protectedCampaignIds = new Set(
       this.deps.store
         .listCampaigns()
-        .filter(
-          (campaign) => campaign.state === "running" || campaign.state === "waiting_approval"
+        .filter((campaign) =>
+          ["running", "cancelling", "recovery_required", "waiting_approval"].includes(
+            campaign.state
+          )
         )
         .map((campaign) => campaign.id)
     );
@@ -1230,6 +1438,8 @@ export class OrchestratorRuntime implements IOrchestrator {
       .filter((campaign) =>
         campaign.state === "draft" ||
         campaign.state === "running" ||
+        campaign.state === "cancelling" ||
+        campaign.state === "recovery_required" ||
         campaign.state === "waiting_approval"
       );
     if (active.length >= this.deps.config.orchestration.maxCampaigns) {
@@ -1263,6 +1473,8 @@ export class OrchestratorRuntime implements IOrchestrator {
         campaign.workerId === worker.id &&
         (campaign.state === "draft" ||
           campaign.state === "running" ||
+          campaign.state === "cancelling" ||
+          campaign.state === "recovery_required" ||
           campaign.state === "waiting_approval")
       ).length;
     if (activeRuns >= worker.maxConcurrentRuns) {
@@ -1847,8 +2059,9 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
     if (!attempt.ok) {
       const failedAt = nowIso();
+      const storedRun = this.deps.store.getRun(baseRun.id) ?? baseRun;
       const run: RunRecord = {
-        ...baseRun,
+        ...storedRun,
         state: "failed",
         updatedAt: failedAt,
         lastProgressAt: failedAt,
@@ -1905,8 +2118,9 @@ export class OrchestratorRuntime implements IOrchestrator {
         return { ok: false, run, cancelled: true };
       }
     }
+    const storedRun = this.deps.store.getRun(baseRun.id) ?? baseRun;
     const run: RunRecord = {
-      ...baseRun,
+      ...storedRun,
       state: "completed",
       updatedAt: artifact.createdAt,
       lastProgressAt: artifact.createdAt,
@@ -1959,7 +2173,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         return {
           ok: true,
           attempts,
-          result: await this.executeStep(campaign, project, step)
+          result: await this.executeStep(campaign, project, step, baseRun.id)
         };
       } catch (error) {
         const failure = this.describeStepFailure(error);
@@ -1999,18 +2213,19 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async executeStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    runId: string
   ): Promise<StepExecutionResult> {
     if (campaign.template === "puppenfusion" && step.fusion?.role === "integration") {
       return this.executeFusionIntegrationStep(campaign, step);
     }
     if (step.kind === "research" && this.deps.config.orchestration.gptResearcherCommand != null) {
-      return this.executeResearchCommandStep(campaign, project, step);
+      return this.executeResearchCommandStep(campaign, project, step, runId);
     }
     if (step.executor === "acp") {
-      return this.executeAcpStep(campaign, project, step);
+      return this.executeAcpStep(campaign, project, step, runId);
     }
-    return this.executeCommandStep(campaign, project, step);
+    return this.executeCommandStep(campaign, project, step, runId);
   }
 
   private markCampaignRunActive(
@@ -2681,7 +2896,8 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async executeAcpStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    runId: string
   ): Promise<StepExecutionResult> {
     const stepDirectory = this.resolveStepWorkingDirectory(project, step);
     const sessionScope = step.sessionScope ?? "campaign";
@@ -2691,6 +2907,10 @@ export class OrchestratorRuntime implements IOrchestrator {
     const selectedAgent = step.agent ?? project.defaultAgent ?? this.deps.config.defaultAgent;
     const prompt = await this.buildStepPrompt(project, campaign, step, selectedAgent);
     const startFresh = sessionScope === "step" || campaign.acpSessionName == null;
+    const storedRun = this.deps.store.getRun(runId);
+    if (storedRun != null && storedRun.state === "running") {
+      this.deps.store.upsertRun({ ...storedRun, sessionName, updatedAt: nowIso() });
+    }
     const activeSessions = this.activeAcpSessions.get(campaign.id) ?? new Set<string>();
     activeSessions.add(sessionName);
     this.activeAcpSessions.set(campaign.id, activeSessions);
@@ -2878,7 +3098,8 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async executeCommandStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    runId: string
   ): Promise<StepExecutionResult> {
     if (!this.deps.config.orchestration.allowLocalCommandExecution) {
       throw new PuppenclawError(
@@ -2893,6 +3114,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         : undefined;
     const result = await this.runShellCommand({
       campaignId: campaign.id,
+      runId,
       command: step.command ?? "",
       cwd,
       env: step.env,
@@ -2922,7 +3144,8 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async executeResearchCommandStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    runId: string
   ): Promise<StepExecutionResult> {
     const command = this.deps.config.orchestration.gptResearcherCommand;
     if (command == null) {
@@ -2930,6 +3153,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
     const result = await this.runShellCommand({
       campaignId: campaign.id,
+      runId,
       command,
       cwd: project.rootDir,
       env: {
@@ -3742,6 +3966,7 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   private async runShellCommand(params: {
     campaignId: string;
+    runId?: string;
     command: string;
     cwd: string;
     env?: Record<string, string>;
@@ -3751,6 +3976,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     if (process.platform === "win32") {
       return this.runProcess({
         campaignId: params.campaignId,
+        ...(params.runId != null ? { runId: params.runId } : {}),
         command: "cmd.exe",
         args: ["/d", "/s", "/c", params.command],
         cwd: params.cwd,
@@ -3761,6 +3987,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
     return this.runProcess({
       campaignId: params.campaignId,
+      ...(params.runId != null ? { runId: params.runId } : {}),
       command: "bash",
       args: ["-lc", params.command],
       cwd: params.cwd,
@@ -3772,6 +3999,7 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   private async runProcess(params: {
     campaignId: string;
+    runId?: string;
     command: string;
     args: string[];
     cwd: string;
@@ -3792,6 +4020,19 @@ export class OrchestratorRuntime implements IOrchestrator {
     const children = this.activeCommands.get(params.campaignId) ?? new Set<ChildProcessWithoutNullStreams>();
     children.add(child);
     this.activeCommands.set(params.campaignId, children);
+    if (params.runId != null && child.pid != null) {
+      const storedRun = this.deps.store.getRun(params.runId);
+      if (storedRun != null && storedRun.state === "running") {
+        const processStartIdentity = readLinuxProcessStartIdentitySync(child.pid);
+        this.deps.store.upsertRun({
+          ...storedRun,
+          pid: child.pid,
+          ...(process.platform !== "win32" ? { processGroupId: child.pid } : {}),
+          ...(processStartIdentity != null ? { processStartIdentity } : {}),
+          updatedAt: nowIso()
+        });
+      }
+    }
     const stdout = createCappedOutputCollector(MAX_PROCESS_OUTPUT_BYTES);
     const stderr = createCappedOutputCollector(MAX_PROCESS_OUTPUT_BYTES);
     child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
@@ -3907,6 +4148,8 @@ export class OrchestratorRuntime implements IOrchestrator {
         active: campaigns.filter((campaign) =>
           campaign.state === "draft" ||
           campaign.state === "running" ||
+          campaign.state === "cancelling" ||
+          campaign.state === "recovery_required" ||
           campaign.state === "waiting_approval"
         ).length,
         ...(params.verbose
@@ -3939,6 +4182,8 @@ export class OrchestratorRuntime implements IOrchestrator {
           campaign.workerId === worker.id &&
           (campaign.state === "draft" ||
             campaign.state === "running" ||
+            campaign.state === "cancelling" ||
+            campaign.state === "recovery_required" ||
             campaign.state === "waiting_approval")
         ).length
       })),

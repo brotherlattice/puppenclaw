@@ -181,6 +181,7 @@ export async function createDaemonServer(params: {
         sessionStore: store,
         sessionManager: manager
       });
+      await orchestrator.recoverInterruptedCampaigns();
       return {
         orchestratorStore,
         usageLedger,

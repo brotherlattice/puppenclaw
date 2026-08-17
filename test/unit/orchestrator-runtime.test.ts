@@ -1,5 +1,5 @@
-import { spawnSync } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
 import { OrchestratorRuntime } from "../../src/orchestrator/runtime.js";
 import { OrchestratorStore } from "../../src/orchestrator/store.js";
+import type { CampaignSpecRecord, RunRecord } from "../../src/orchestrator/types.js";
 import { OutputRouter } from "../../src/plugin/output-router.js";
 import {
   createTempDir,
@@ -37,6 +38,136 @@ function runGit(cwd: string, args: string[]): string {
 }
 
 describe("OrchestratorRuntime", () => {
+  it("reconciles dead, surviving, cancelling, and ambiguous command runs on restart", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-recovery-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const config = makeConfig({ acpxCommand });
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store: sessionStore,
+      outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+    });
+    const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+    const runtime = new OrchestratorRuntime({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      sessionStore,
+      store,
+      sessionManager: manager
+    });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore"
+    });
+    expect(child.pid).toBeTruthy();
+    const childPid = child.pid as number;
+    let childIdentity: string | null = null;
+    const identityDeadline = Date.now() + 2_000;
+    while (childIdentity == null && Date.now() < identityDeadline) {
+      const stat = await readFile(`/proc/${childPid}/stat`, "utf8").catch(() => null);
+      if (stat != null) {
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+        childIdentity = fields[19] != null ? `${childPid}:${fields[19]}` : null;
+      }
+      if (childIdentity == null) {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+      }
+    }
+    expect(childIdentity).toBeTruthy();
+
+    const seed = (
+      id: string,
+      state: CampaignSpecRecord["state"],
+      process?: Pick<RunRecord, "pid" | "processGroupId" | "processStartIdentity">
+    ) => {
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      const runId = `run-${id}`;
+      store.upsertCampaign({
+        id,
+        projectId: "recovery-project",
+        workerId: "local",
+        name: id,
+        template: "custom",
+        experimentCommands: [],
+        experimentParallelism: 1,
+        iterations: 1,
+        steps: [
+          {
+            id: "step-1",
+            title: "Interrupted command",
+            kind: "experiment",
+            executor: "command",
+            command: "long-running-command",
+            contextFiles: [],
+            approvalRequired: false,
+            sessionScope: "campaign",
+            env: {},
+            retryLimit: 0
+          }
+        ],
+        currentStepIndex: 0,
+        currentRunId: runId,
+        lastProgressAt: timestamp,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        state
+      });
+      store.upsertRun({
+        id: runId,
+        campaignId: id,
+        projectId: "recovery-project",
+        workerId: "local",
+        stepId: "step-1",
+        stepTitle: "Interrupted command",
+        stepIndex: 0,
+        kind: "experiment",
+        executor: "command",
+        state: "running",
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        lastProgressAt: timestamp,
+        attempts: 1,
+        ...(process ?? {})
+      });
+    };
+    seed("dead-campaign", "running", {
+      pid: 999_999_999,
+      processGroupId: 999_999_999,
+      processStartIdentity: "999999999:1"
+    });
+    seed("cancelling-campaign", "cancelling", {
+      pid: 999_999_998,
+      processGroupId: 999_999_998,
+      processStartIdentity: "999999998:1"
+    });
+    seed("ambiguous-campaign", "running");
+    seed("surviving-campaign", "running", {
+      pid: childPid,
+      processGroupId: childPid,
+      processStartIdentity: childIdentity as string
+    });
+
+    try {
+      await runtime.recoverInterruptedCampaigns();
+      expect(store.getCampaign("dead-campaign")?.state).toBe("failed");
+      expect(store.getRun("run-dead-campaign")?.failureCode).toBe("CAMPAIGN_INTERRUPTED");
+      expect(store.getCampaign("cancelling-campaign")?.state).toBe("cancelled");
+      expect(store.getRun("run-cancelling-campaign")?.state).toBe("cancelled");
+      expect(store.getCampaign("ambiguous-campaign")?.state).toBe("recovery_required");
+      expect(store.getCampaign("surviving-campaign")?.state).toBe("failed");
+      expect(store.getRun("run-surviving-campaign")?.failureCode).toBe("CAMPAIGN_INTERRUPTED");
+      expect(() => process.kill(childPid, 0)).toThrow();
+    } finally {
+      try {
+        process.kill(-childPid, "SIGKILL");
+      } catch {
+        // The recovery sweep normally terminated it already.
+      }
+    }
+  });
+
   it("keeps cancellation terminal when a command exits concurrently", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-cancel-");
     const startedFile = join(workspaceDir, "started.txt");
