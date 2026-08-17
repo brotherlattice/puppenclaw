@@ -117,6 +117,65 @@ describe("OrchestratorRuntime", () => {
     expect(snapshot.artifacts).toHaveLength(0);
   });
 
+  it("terminalizes the campaign and active run when artifact persistence fails", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-artifact-failure-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const config = makeConfig({ acpxCommand });
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store: sessionStore,
+      outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+    });
+    const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+    const runtime = new OrchestratorRuntime({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      sessionStore,
+      store,
+      sessionManager: manager
+    });
+    await runtime.createProject({ name: "artifact-failure-project", rootDir: workspaceDir });
+    const writableStore = store as OrchestratorStore & {
+      upsertArtifact: OrchestratorStore["upsertArtifact"];
+    };
+    writableStore.upsertArtifact = () => {
+      throw new Error("injected artifact persistence failure");
+    };
+
+    await expect(
+      runtime.runCampaign({
+        projectId: "artifact-failure-project",
+        workerId: "local",
+        name: "artifact-failure",
+        template: "custom",
+        experimentCommands: [],
+        experimentParallelism: 1,
+        iterations: 1,
+        steps: [
+          {
+            title: "Successful command",
+            kind: "experiment",
+            executor: "command",
+            command: nodePrintCommand("command succeeded\\n"),
+            contextFiles: [],
+            approvalRequired: false,
+            env: {},
+            retryLimit: 0
+          }
+        ]
+      })
+    ).rejects.toThrow("injected artifact persistence failure");
+
+    const snapshot = store.getCampaignSnapshot(store.listCampaigns()[0]!.id)!;
+    expect(snapshot.campaign.state).toBe("failed");
+    expect(snapshot.campaign.failureCode).toBe("CAMPAIGN_EXECUTION_ERROR");
+    expect(snapshot.runs).toHaveLength(1);
+    expect(snapshot.runs[0]?.state).toBe("failed");
+    expect(snapshot.artifacts).toHaveLength(0);
+  });
+
   it("creates projects, syncs context, and runs a baseline campaign", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-");
     await writeFile(join(workspaceDir, "AGENTS.md"), "Follow the repo conventions.\n", "utf8");

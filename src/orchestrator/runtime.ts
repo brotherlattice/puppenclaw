@@ -35,7 +35,14 @@ import type {
   ToolResult,
   WorkerManifestInput
 } from "../shared/types.js";
-import { confineToRoot, ensureDir, loadContextFiles, nowIso, pathExists } from "../shared/utils.js";
+import {
+  confineToRoot,
+  ensureDir,
+  loadContextFiles,
+  nowIso,
+  pathExists,
+  redactSensitiveText
+} from "../shared/utils.js";
 import { importReassessmentSessions } from "./reassessment.js";
 import { OrchestratorStore } from "./store.js";
 import type {
@@ -511,7 +518,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       ...(preparedFusion != null ? { fusion: preparedFusion.fusion } : {})
     };
     this.deps.store.upsertCampaign(campaign);
-    const snapshot = await this.executeCampaign(campaign);
+    const snapshot = await this.driveCampaign(campaign);
     return textToolResult(describeCampaign(snapshot), snapshot);
   }
 
@@ -611,7 +618,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     };
     delete resumed.waitingApprovalStepId;
     this.deps.store.upsertCampaign(resumed);
-    const snapshot = await this.executeCampaign(resumed, approvedStepId);
+    const snapshot = await this.driveCampaign(resumed, approvedStepId);
     return textToolResult(`Approved campaign ${snapshot.campaign.name}.`, snapshot);
   }
 
@@ -1697,6 +1704,32 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
 
     return this.requireSnapshot(current.id);
+  }
+
+  private async driveCampaign(
+    campaign: CampaignSpecRecord,
+    approvedStepId?: string
+  ): Promise<CampaignStatusSnapshot> {
+    try {
+      return await this.executeCampaign(campaign, approvedStepId);
+    } catch (error) {
+      const current = this.deps.store.getCampaign(campaign.id);
+      if (current?.state === "cancelling" || current?.state === "cancelled") {
+        return this.waitForCancellationSnapshot(campaign.id);
+      }
+      const message = redactSensitiveText(
+        summarizeText(error instanceof Error ? error.message : String(error), 2_000)
+      );
+      const failureCode =
+        error instanceof PuppenclawError ? error.code : "CAMPAIGN_EXECUTION_ERROR";
+      this.deps.store.finalizeCampaignFailure({
+        campaignId: campaign.id,
+        failedAt: nowIso(),
+        failureCode,
+        message
+      });
+      throw error;
+    }
   }
 
   private async waitForCancellationSnapshot(campaignId: string): Promise<CampaignStatusSnapshot> {
@@ -3698,7 +3731,12 @@ export class OrchestratorRuntime implements IOrchestrator {
         }
       ]
     };
-    this.deps.store.upsertArtifact(artifact);
+    try {
+      this.deps.store.upsertArtifact(artifact);
+    } catch (error) {
+      await rm(join(this.deps.store.resolveArtifactsDir(), params.relativePath), { force: true });
+      throw error;
+    }
     return artifact;
   }
 
