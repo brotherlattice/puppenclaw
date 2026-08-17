@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
+import { ZodError } from "zod";
 
 import { AcpxSessionManager } from "../manager/acpx.js";
 import { OrchestratorRuntime } from "../orchestrator/runtime.js";
@@ -67,11 +68,22 @@ export async function createDaemonServer(params: {
   });
 
   app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof ZodError) {
+      const summary = error.issues
+        .map((issue) => `${issue.path.map(String).join(".") || "(params)"}: ${issue.message}`)
+        .join("; ");
+      return reply.code(400).send({
+        ok: false,
+        code: "INVALID_PARAMS",
+        error: redactSensitiveText(`Invalid parameters: ${summary}`)
+      });
+    }
     if (!(error instanceof PuppenclawError)) {
-      if (error instanceof Error) {
-        error.message = redactSensitiveText(error.message);
-      }
-      return reply.send(error);
+      return reply.code(500).send({
+        ok: false,
+        code: "INTERNAL_ERROR",
+        error: redactSensitiveText(error instanceof Error ? error.message : String(error))
+      });
     }
     const details = daemonLifecycleErrorDetails(error);
     return reply.code(daemonStatusForError(error.code)).send({
@@ -701,6 +713,7 @@ function publicRecoveryStatus(status: StateRecoveryStatus): Record<string, unkno
 
 function daemonStatusForError(code: string): number {
   switch (code) {
+    case "INVALID_PARAMS":
     case "MODEL_UNAVAILABLE":
       return 400;
     case "NO_SESSION":

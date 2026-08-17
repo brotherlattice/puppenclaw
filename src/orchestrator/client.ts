@@ -212,16 +212,35 @@ export class DaemonOrchestratorClient implements IOrchestrator {
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
         ...(init.body != null ? { body: JSON.stringify(init.body) } : {})
       });
-      const payload = (await response.json()) as ToolResult | { error: string };
+      const payload = (await response.json().catch(() => null)) as
+        | ToolResult
+        | { error?: unknown; code?: unknown; details?: unknown }
+        | null;
       if (!response.ok) {
+        const body = payload != null && typeof payload === "object" ? payload : null;
         const message =
-          payload != null &&
-          typeof payload === "object" &&
-          "error" in payload &&
-          typeof payload.error === "string"
-            ? payload.error
+          body != null && "error" in body && typeof body.error === "string"
+            ? body.error
             : `daemon request failed with ${response.status}`;
-        throw new PuppenclawError("DAEMON_REQUEST_FAILED", message);
+        const code =
+          body != null && "code" in body && typeof body.code === "string" && body.code.length > 0
+            ? body.code
+            : "DAEMON_REQUEST_FAILED";
+        const details =
+          body != null &&
+          "details" in body &&
+          body.details != null &&
+          typeof body.details === "object" &&
+          !Array.isArray(body.details)
+            ? (body.details as Record<string, unknown>)
+            : undefined;
+        throw new PuppenclawError(code, message, details);
+      }
+      if (payload == null || typeof payload !== "object") {
+        throw new PuppenclawError(
+          "DAEMON_REQUEST_FAILED",
+          `daemon returned an invalid JSON response with ${response.status}`
+        );
       }
       return payload as ToolResult;
     } catch (error) {
