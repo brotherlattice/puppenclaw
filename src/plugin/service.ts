@@ -193,19 +193,22 @@ async function ensureInitialized(ctx?: OpenClawPluginServiceContext): Promise<vo
       ledger: state.usageLedger
     });
     await state.manager.reconcilePersistedSessions?.();
-    state.orchestrator =
-      getConfiguredPluginConfig().backend === "daemon"
-        ? new DaemonOrchestratorClient({
-            config: getConfiguredPluginConfig(),
-            logger
-          })
-        : new OrchestratorRuntime({
-            config: getConfiguredPluginConfig(),
-            logger,
-            store: state.orchestratorStore,
-            sessionStore: state.store,
-            sessionManager: state.manager
-          });
+    if (getConfiguredPluginConfig().backend === "daemon") {
+      state.orchestrator = new DaemonOrchestratorClient({
+        config: getConfiguredPluginConfig(),
+        logger
+      });
+    } else {
+      const orchestrator = new OrchestratorRuntime({
+        config: getConfiguredPluginConfig(),
+        logger,
+        store: state.orchestratorStore,
+        sessionStore: state.store,
+        sessionManager: state.manager
+      });
+      await orchestrator.recoverInterruptedCampaigns();
+      state.orchestrator = orchestrator;
+    }
   })();
   try {
     await state.initPromise;
