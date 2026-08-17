@@ -493,7 +493,10 @@ export class OrchestratorRuntime implements IOrchestrator {
         ? "ambiguous"
         : "gone";
     }
-    if (run.processStartIdentity == null || observed !== run.processStartIdentity) {
+    if (run.processStartIdentity == null) {
+      return "ambiguous";
+    }
+    if (observed !== run.processStartIdentity) {
       return "gone";
     }
     if (

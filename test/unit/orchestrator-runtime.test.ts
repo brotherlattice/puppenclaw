@@ -47,7 +47,7 @@ function processMayExist(pid: number): boolean {
 }
 
 describe("OrchestratorRuntime", () => {
-  it("reconciles dead, surviving, cancelling, and ambiguous command runs on restart", async () => {
+  it("reconciles dead, verified, unidentified, cancelling, and ambiguous command runs on restart", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-recovery-");
     const acpxCommand = await resolveFakeAcpxCommand();
     const sessionStore = await SessionStore.open(workspaceDir);
@@ -72,6 +72,12 @@ describe("OrchestratorRuntime", () => {
     });
     expect(child.pid).toBeTruthy();
     const childPid = child.pid as number;
+    const unidentifiedChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore"
+    });
+    expect(unidentifiedChild.pid).toBeTruthy();
+    const unidentifiedChildPid = unidentifiedChild.pid as number;
     let childIdentity: string | null = null;
     const identityDeadline = Date.now() + 2_000;
     while (childIdentity == null && Date.now() < identityDeadline) {
@@ -157,6 +163,10 @@ describe("OrchestratorRuntime", () => {
       processGroupId: childPid,
       processStartIdentity: childIdentity as string
     });
+    seed("unidentified-surviving-campaign", "running", {
+      pid: unidentifiedChildPid,
+      processGroupId: unidentifiedChildPid
+    });
 
     try {
       await runtime.recoverInterruptedCampaigns();
@@ -168,11 +178,24 @@ describe("OrchestratorRuntime", () => {
       expect(store.getCampaign("surviving-campaign")?.state).toBe("failed");
       expect(store.getRun("run-surviving-campaign")?.failureCode).toBe("CAMPAIGN_INTERRUPTED");
       expect(() => process.kill(childPid, 0)).toThrow();
+      expect(store.getCampaign("unidentified-surviving-campaign")?.state).toBe(
+        "recovery_required"
+      );
+      expect(store.getCampaign("unidentified-surviving-campaign")?.failureCode).toBe(
+        "CAMPAIGN_RECOVERY_REQUIRED"
+      );
+      expect(store.getRun("run-unidentified-surviving-campaign")?.state).toBe("running");
+      expect(processMayExist(unidentifiedChildPid)).toBe(true);
     } finally {
       try {
         process.kill(-childPid, "SIGKILL");
       } catch {
         // The recovery sweep normally terminated it already.
+      }
+      try {
+        process.kill(-unidentifiedChildPid, "SIGKILL");
+      } catch {
+        // The unidentified survivor must remain untouched until operator recovery.
       }
     }
   });
