@@ -669,7 +669,7 @@ Examples:
 
 Use the orchestration surface first when the work is project-shaped. Use raw sessions when the operator explicitly wants direct ACP control.
 
-Session HTTP/SSE results expose provider failures without forwarding raw credential diagnostics. `PROVIDER_AUTHENTICATION_REQUIRED` is terminal and non-retryable until an operator refreshes the provider login; `PROVIDER_CONNECTION_FAILED` is retryable. The code and `retryable` flag are retained in session status, active-turn metadata, keyed turn receipts, and replayed results. `/capabilities` advertises this as `providerFailureContracts` version 1.
+Session HTTP/SSE results expose provider failures without forwarding raw credential diagnostics. `PROVIDER_AUTHENTICATION_REQUIRED` is terminal and non-retryable until an operator refreshes the provider login; `PROVIDER_CONNECTION_FAILED` is retryable. A provider-rejected model turn is a terminal session result rather than an HTTP request failure: JSON returns 200 with the failed session, safe message, code, and retryability, while SSE emits the same typed `error` followed by that terminal `result`. Initial keyed execution and every keyed replay preserve this exact shape. The code and `retryable` flag are also retained in session status, active-turn metadata, and durable turn receipts. `/capabilities` advertises this as `providerFailureContracts` version 1.
 
 ## ACP Verification
 

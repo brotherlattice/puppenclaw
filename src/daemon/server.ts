@@ -1010,6 +1010,7 @@ async function streamToolResult(params: {
   run: () => Promise<ToolResult>;
 }): Promise<FastifyReply> {
   let closed = false;
+  let emittedProviderFailureCode: string | null = null;
   params.reply.raw.on("close", () => {
     closed = true;
   });
@@ -1042,6 +1043,9 @@ async function streamToolResult(params: {
     params.subscribeToSessionOutput === false
       ? null
       : params.outputRouter.attach(params.sessionName, (event) => {
+          if (event.kind === "error" && isProviderFailureCode(event.code)) {
+            emittedProviderFailureCode = event.code;
+          }
           write(event);
         });
 
@@ -1054,6 +1058,13 @@ async function streamToolResult(params: {
       });
     }
     const result = await params.run();
+    const providerFailure = providerFailureEventFromResult(params.sessionName, result);
+    if (
+      providerFailure != null &&
+      emittedProviderFailureCode !== providerFailure.code
+    ) {
+      write(providerFailure);
+    }
     write({ kind: "result", result });
     write({ kind: "done" });
   } catch (error) {
@@ -1085,4 +1096,30 @@ async function streamToolResult(params: {
   }
 
   return params.reply;
+}
+
+function isProviderFailureCode(code: unknown): code is string {
+  return (
+    code === "PROVIDER_AUTHENTICATION_REQUIRED" || code === "PROVIDER_CONNECTION_FAILED"
+  );
+}
+
+function providerFailureEventFromResult(
+  sessionName: string,
+  result: ToolResult
+): Extract<OutputRouteEvent, { kind: "error" }> | null {
+  const failureCode = result.details.failureCode;
+  if (!isProviderFailureCode(failureCode)) {
+    return null;
+  }
+  const retryable = result.details.retryable;
+  const output = result.details.output;
+  const fallback = result.content.find((block) => block.type === "text")?.text ?? "Provider failure.";
+  return {
+    kind: "error",
+    sessionName,
+    text: redactSensitiveText(typeof output === "string" ? output : fallback),
+    code: failureCode,
+    ...(typeof retryable === "boolean" ? { retryable } : {})
+  };
 }
