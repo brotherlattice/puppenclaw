@@ -255,14 +255,18 @@ export async function createDaemonServer(params: {
       retryability: true,
       durableReplay: true
     },
-    sessionOwnerCleanup: {
-      version: 1,
-      authenticated: true,
-      opaqueOwnerKey: true,
-      durableFence: true,
-      authoritativeNameAdoption: true,
-      operations: ["list", "quiesce", "purge"]
-    },
+    ...(authToken.length > 0
+      ? {
+          sessionOwnerCleanup: {
+            version: 1,
+            authenticated: true,
+            opaqueOwnerKey: true,
+            durableFence: true,
+            authoritativeNameAdoption: true,
+            operations: ["list", "quiesce", "purge"]
+          }
+        }
+      : {}),
     sessionOutput: true,
     sessionPurge: true,
     sessionPurgeTransientFencing: true,

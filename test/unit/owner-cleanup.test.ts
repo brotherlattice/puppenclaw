@@ -70,6 +70,13 @@ describe("account-scoped daemon cleanup", () => {
     });
 
     try {
+      const capabilities = await app.inject({
+        method: "GET",
+        url: "/capabilities"
+      });
+      expect(capabilities.statusCode).toBe(200);
+      expect(JSON.parse(capabilities.body)).not.toHaveProperty("sessionOwnerCleanup");
+
       const listed = await app.inject({
         method: "POST",
         url: "/sessions/owner/list",

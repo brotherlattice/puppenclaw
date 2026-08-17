@@ -241,6 +241,7 @@ describe("DaemonSessionManager", () => {
     const config = makeConfig({
       backend: "daemon",
       acpxCommand,
+      daemonAuthToken: "capability-test-token",
       maxSessions: 7
     });
 
