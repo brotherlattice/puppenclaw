@@ -4,7 +4,11 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { buildProcessTreeKillPlan, killProcessTree } from "../../src/shared/process-tree.js";
+import {
+  buildProcessTreeKillPlan,
+  killProcessTree,
+  killProcessTreeWithEscalation
+} from "../../src/shared/process-tree.js";
 import { createTempDir } from "../helpers.js";
 
 function isProcessAlive(pid: number): boolean {
@@ -73,6 +77,62 @@ describe("buildProcessTreeKillPlan", () => {
 });
 
 describe("killProcessTree", () => {
+  it.skipIf(process.platform === "win32")(
+    "escalates after the group leader exits while a grandchild ignores SIGTERM",
+    async () => {
+      const workspaceDir = await createTempDir("puppenclaw-tree-escalation-");
+      const parentPath = join(workspaceDir, "tree-escalation-parent.mjs");
+      const pidFile = join(workspaceDir, "grandchild.pid");
+      await writeFile(
+        parentPath,
+        [
+          'import { spawn } from "node:child_process";',
+          'import { writeFileSync } from "node:fs";',
+          "const grandchild = spawn(process.execPath, [\"-e\", \"process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);\"], { stdio: \"ignore\" });",
+          'writeFileSync(process.argv[2], String(grandchild.pid), "utf8");',
+          'process.on("SIGTERM", () => process.exit(0));',
+          "setInterval(() => {}, 1000);"
+        ].join("\n"),
+        "utf8"
+      );
+
+      const child = spawn(process.execPath, [parentPath, pidFile], {
+        stdio: "ignore",
+        detached: true
+      });
+      let grandchildPid: number | null = null;
+      try {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline && grandchildPid == null) {
+          const raw = await readFile(pidFile, "utf8").catch(() => "");
+          const parsed = Number.parseInt(raw.trim(), 10);
+          if (Number.isInteger(parsed) && parsed > 0) {
+            grandchildPid = parsed;
+            break;
+          }
+          await sleep(25);
+        }
+        expect(grandchildPid).not.toBeNull();
+
+        killProcessTreeWithEscalation(child, 100);
+        expect(await waitFor(() => child.exitCode != null || child.signalCode != null, 2_000)).toBe(
+          true
+        );
+        expect(await waitFor(() => !isProcessAlive(grandchildPid as number), 5_000)).toBe(true);
+      } finally {
+        killProcessTree(child, "SIGKILL");
+        if (grandchildPid != null) {
+          try {
+            process.kill(grandchildPid, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+      }
+    },
+    15_000
+  );
+
   it("kills grandchildren that would outlive a wrapper-only kill", async () => {
     const workspaceDir = await createTempDir("puppenclaw-tree-kill-");
     const parentPath = join(workspaceDir, "tree-parent.mjs");

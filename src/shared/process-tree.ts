@@ -97,9 +97,15 @@ export function killProcessTreeWithEscalation(
     killProcessTree(child, "SIGKILL", onError);
   }, escalationMs);
   forceKillTimer.unref();
-  child.once("exit", () => {
-    clearTimeout(forceKillTimer);
-  });
+  // A detached POSIX leader can exit while grandchildren keep its process
+  // group alive. Keep the escalation armed for process-group kills; direct
+  // child exit is not proof that the tree is gone.
+  const plan = buildProcessTreeKillPlan(child.pid, "SIGKILL");
+  if (plan.method !== "process-group") {
+    child.once("exit", () => {
+      clearTimeout(forceKillTimer);
+    });
+  }
 }
 
 function fallbackDirectKill(

@@ -486,7 +486,12 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
     const observed = await readLinuxProcessStartIdentity(run.pid);
     if (observed == null) {
-      return pidMayExist(run.pid) ? "ambiguous" : "gone";
+      if (pidMayExist(run.pid)) {
+        return "ambiguous";
+      }
+      return run.processGroupId != null && processGroupMayExist(run.processGroupId)
+        ? "ambiguous"
+        : "gone";
     }
     if (run.processStartIdentity == null || observed !== run.processStartIdentity) {
       return "gone";
@@ -910,20 +915,21 @@ export class OrchestratorRuntime implements IOrchestrator {
   }
 
   private async waitForCommandExit(child: ChildProcessWithoutNullStreams): Promise<boolean> {
-    if (child.exitCode != null || child.signalCode != null) {
-      return true;
-    }
-    return new Promise<boolean>((resolveExit) => {
-      const timer = setTimeout(
-        () => resolveExit(child.exitCode != null || child.signalCode != null),
-        PROCESS_KILL_ESCALATION_MS + PROCESS_STREAM_CLOSE_GRACE_MS
-      );
-      timer.unref();
-      child.once("exit", () => {
-        clearTimeout(timer);
-        resolveExit(true);
-      });
-    });
+    const processGroupId = process.platform === "win32" ? null : (child.pid ?? null);
+    const deadline = Date.now() + PROCESS_KILL_ESCALATION_MS + PROCESS_STREAM_CLOSE_GRACE_MS;
+    do {
+      const childExited = child.exitCode != null || child.signalCode != null;
+      const processGroupExited =
+        processGroupId == null || !processGroupMayExist(processGroupId);
+      if (childExited && processGroupExited) {
+        return true;
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 25));
+    } while (Date.now() < deadline);
+    return (
+      (child.exitCode != null || child.signalCode != null) &&
+      (processGroupId == null || !processGroupMayExist(processGroupId))
+    );
   }
 
   private async waitForStepExecutions(campaignId: string): Promise<boolean> {

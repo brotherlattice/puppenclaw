@@ -37,6 +37,15 @@ function runGit(cwd: string, args: string[]): string {
   return result.stdout.trim();
 }
 
+function processMayExist(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 describe("OrchestratorRuntime", () => {
   it("reconciles dead, surviving, cancelling, and ambiguous command runs on restart", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-recovery-");
@@ -168,6 +177,145 @@ describe("OrchestratorRuntime", () => {
     }
   });
 
+  it.skipIf(process.platform !== "linux")(
+    "fences a persisted process group whose recorded leader exited before restart",
+    async () => {
+      const workspaceDir = await createTempDir("puppenclaw-orch-leader-exited-");
+      const processFile = join(workspaceDir, "surviving-process.json");
+      const leaderScript = join(workspaceDir, "exited-leader.cjs");
+      await writeFile(
+        leaderScript,
+        [
+          'const { spawn } = require("node:child_process");',
+          'const { readFileSync, writeFileSync } = require("node:fs");',
+          'const raw = readFileSync(`/proc/${process.pid}/stat`, "utf8");',
+          'const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\\s+/u);',
+          'const grandchild = spawn(process.execPath, ["-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000);"], { stdio: "ignore" });',
+          'writeFileSync(process.argv[2], JSON.stringify({ leaderPid: process.pid, processStartIdentity: `${process.pid}:${fields[19]}`, grandchildPid: grandchild.pid }));',
+          "setTimeout(() => process.exit(0), 100);"
+        ].join("\n"),
+        "utf8"
+      );
+      const leader = spawn(process.execPath, [leaderScript, processFile], {
+        detached: true,
+        stdio: "ignore"
+      });
+      let processRecord:
+        | { leaderPid: number; processStartIdentity: string; grandchildPid: number }
+        | undefined;
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && processRecord == null) {
+        const raw = await readFile(processFile, "utf8").catch(() => "");
+        if (raw.length > 0) {
+          processRecord = JSON.parse(raw) as typeof processRecord;
+          break;
+        }
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 20));
+      }
+      expect(processRecord).toBeDefined();
+      const recorded = processRecord as NonNullable<typeof processRecord>;
+      while (Date.now() < deadline && processMayExist(recorded.leaderPid)) {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 20));
+      }
+      expect(processMayExist(recorded.leaderPid)).toBe(false);
+      expect(processMayExist(recorded.grandchildPid)).toBe(true);
+
+      const sessionStore = await SessionStore.open(workspaceDir);
+      const config = makeConfig({ acpxCommand: await resolveFakeAcpxCommand() });
+      const manager = new AcpxSessionManager({
+        config,
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        store: sessionStore,
+        outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+      });
+      const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+      const runtime = new OrchestratorRuntime({
+        config,
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        sessionStore,
+        store,
+        sessionManager: manager
+      });
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      store.upsertCampaign({
+        id: "leader-exited-campaign",
+        projectId: "recovery-project",
+        workerId: "local",
+        name: "leader-exited-campaign",
+        template: "custom",
+        experimentCommands: [],
+        experimentParallelism: 1,
+        iterations: 1,
+        steps: [
+          {
+            id: "step-1",
+            title: "Detached survivor",
+            kind: "experiment",
+            executor: "command",
+            command: "detached-survivor",
+            contextFiles: [],
+            approvalRequired: false,
+            sessionScope: "campaign",
+            env: {},
+            retryLimit: 0
+          }
+        ],
+        currentStepIndex: 0,
+        currentRunId: "run-leader-exited",
+        lastProgressAt: timestamp,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        state: "running"
+      });
+      store.upsertRun({
+        id: "run-leader-exited",
+        campaignId: "leader-exited-campaign",
+        projectId: "recovery-project",
+        workerId: "local",
+        stepId: "step-1",
+        stepTitle: "Detached survivor",
+        stepIndex: 0,
+        kind: "experiment",
+        executor: "command",
+        state: "running",
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        lastProgressAt: timestamp,
+        attempts: 1,
+        pid: recorded.leaderPid,
+        processGroupId: recorded.leaderPid,
+        processStartIdentity: recorded.processStartIdentity
+      });
+
+      try {
+        await runtime.recoverInterruptedCampaigns();
+        expect(store.getCampaign("leader-exited-campaign")?.state).toBe("recovery_required");
+        expect(store.getCampaign("leader-exited-campaign")?.failureCode).toBe(
+          "CAMPAIGN_RECOVERY_REQUIRED"
+        );
+        expect(processMayExist(recorded.grandchildPid)).toBe(true);
+      } finally {
+        try {
+          process.kill(-recorded.leaderPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+        try {
+          process.kill(recorded.grandchildPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+        try {
+          leader.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+        store.close();
+        await sessionStore.close();
+      }
+    }
+  );
+
   it("keeps cancellation terminal when a command exits concurrently", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-cancel-");
     const startedFile = join(workspaceDir, "started.txt");
@@ -175,7 +323,9 @@ describe("OrchestratorRuntime", () => {
     await writeFile(
       commandFile,
       [
-        'require("node:fs").writeFileSync(process.argv[2], "started\\n");',
+        'const { spawn } = require("node:child_process");',
+        'const grandchild = spawn(process.execPath, ["-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000);"], { stdio: "ignore" });',
+        'require("node:fs").writeFileSync(process.argv[2], String(grandchild.pid));',
         'process.on("SIGTERM", () => process.exit(0));',
         "setInterval(() => {}, 1000);"
       ].join("\n"),
@@ -234,18 +384,31 @@ describe("OrchestratorRuntime", () => {
       await new Promise((resolveSleep) => setTimeout(resolveSleep, 20));
     }
     expect(campaignId).toBeTruthy();
+    const grandchildPid = Number.parseInt(await readFile(startedFile, "utf8"), 10);
+    expect(grandchildPid).toBeGreaterThan(0);
 
-    const cancellation = await runtime.cancel({ campaignId: campaignId as string });
-    const finished = await execution;
-    expect((cancellation.details as { campaign: { state: string } }).campaign.state).toBe(
-      "cancelled"
-    );
-    expect((finished.details as { campaign: { state: string } }).campaign.state).toBe("cancelled");
-    const snapshot = store.getCampaignSnapshot(campaignId as string)!;
-    expect(snapshot.campaign.state).toBe("cancelled");
-    expect(snapshot.runs).toHaveLength(1);
-    expect(snapshot.runs[0]?.state).toBe("cancelled");
-    expect(snapshot.artifacts).toHaveLength(0);
+    try {
+      const cancellation = await runtime.cancel({ campaignId: campaignId as string });
+      const finished = await execution;
+      expect((cancellation.details as { campaign: { state: string } }).campaign.state).toBe(
+        "cancelled"
+      );
+      expect((finished.details as { campaign: { state: string } }).campaign.state).toBe(
+        "cancelled"
+      );
+      expect(processMayExist(grandchildPid)).toBe(false);
+      const snapshot = store.getCampaignSnapshot(campaignId as string)!;
+      expect(snapshot.campaign.state).toBe("cancelled");
+      expect(snapshot.runs).toHaveLength(1);
+      expect(snapshot.runs[0]?.state).toBe("cancelled");
+      expect(snapshot.artifacts).toHaveLength(0);
+    } finally {
+      try {
+        process.kill(grandchildPid, "SIGKILL");
+      } catch {
+        // The cancellation escalation normally terminated it already.
+      }
+    }
   });
 
   it("terminalizes the campaign and active run when artifact persistence fails", async () => {
