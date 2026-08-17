@@ -105,6 +105,7 @@ export const campaignTemplateZod = z.enum([
 export const campaignStateZod = z.enum([
   "draft",
   "running",
+  "cancelling",
   "waiting_approval",
   "completed",
   "failed",

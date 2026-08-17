@@ -188,6 +188,7 @@ export type CampaignSpecRecord = {
   currentRunId?: string;
   waitingApprovalStepId?: string;
   lastError?: string;
+  failureCode?: string;
   lastProgressAt: string;
   createdAt: string;
   updatedAt: string;

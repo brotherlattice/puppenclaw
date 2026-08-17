@@ -37,6 +37,86 @@ function runGit(cwd: string, args: string[]): string {
 }
 
 describe("OrchestratorRuntime", () => {
+  it("keeps cancellation terminal when a command exits concurrently", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-cancel-");
+    const startedFile = join(workspaceDir, "started.txt");
+    const commandFile = join(workspaceDir, "cancel-command.cjs");
+    await writeFile(
+      commandFile,
+      [
+        'require("node:fs").writeFileSync(process.argv[2], "started\\n");',
+        'process.on("SIGTERM", () => process.exit(0));',
+        "setInterval(() => {}, 1000);"
+      ].join("\n"),
+      "utf8"
+    );
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const config = makeConfig({ acpxCommand });
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store: sessionStore,
+      outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+    });
+    const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+    const runtime = new OrchestratorRuntime({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      sessionStore,
+      store,
+      sessionManager: manager
+    });
+    await runtime.createProject({ name: "cancel-project", rootDir: workspaceDir });
+
+    const execution = runtime.runCampaign({
+      projectId: "cancel-project",
+      workerId: "local",
+      name: "cancel-race",
+      template: "custom",
+      experimentCommands: [],
+      experimentParallelism: 1,
+      iterations: 1,
+      steps: [
+        {
+          title: "Cancellable command",
+          kind: "experiment",
+          executor: "command",
+          command: `node ${JSON.stringify(commandFile)} ${JSON.stringify(startedFile)}`,
+          contextFiles: [],
+          approvalRequired: false,
+          env: {},
+          retryLimit: 0
+        }
+      ]
+    });
+    const deadline = Date.now() + 5_000;
+    let campaignId: string | undefined;
+    while (Date.now() < deadline) {
+      campaignId = store.listCampaigns().find((campaign) => campaign.name === "cancel-race")?.id;
+      const started = await import("node:fs/promises").then(({ stat }) =>
+        stat(startedFile).then(() => true, () => false)
+      );
+      if (campaignId != null && started) {
+        break;
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 20));
+    }
+    expect(campaignId).toBeTruthy();
+
+    const cancellation = await runtime.cancel({ campaignId: campaignId as string });
+    const finished = await execution;
+    expect((cancellation.details as { campaign: { state: string } }).campaign.state).toBe(
+      "cancelled"
+    );
+    expect((finished.details as { campaign: { state: string } }).campaign.state).toBe("cancelled");
+    const snapshot = store.getCampaignSnapshot(campaignId as string)!;
+    expect(snapshot.campaign.state).toBe("cancelled");
+    expect(snapshot.runs).toHaveLength(1);
+    expect(snapshot.runs[0]?.state).toBe("cancelled");
+    expect(snapshot.artifacts).toHaveLength(0);
+  });
+
   it("creates projects, syncs context, and runs a baseline campaign", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-");
     await writeFile(join(workspaceDir, "AGENTS.md"), "Follow the repo conventions.\n", "utf8");

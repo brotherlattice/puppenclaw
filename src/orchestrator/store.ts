@@ -131,6 +131,50 @@ export class OrchestratorStore {
       .run(campaign.id, campaign.projectId, JSON.stringify(campaign));
   }
 
+  finalizeCampaignCancellation(campaignId: string, cancelledAt: string): CampaignSpecRecord | null {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const campaign = this.getCampaign(campaignId);
+      if (campaign == null) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      if (campaign.state !== "cancelling" && campaign.state !== "cancelled") {
+        this.db.exec("COMMIT");
+        return campaign;
+      }
+      for (const run of this.listRuns(campaignId)) {
+        if (["pending", "queued", "running", "waiting_approval"].includes(run.state)) {
+          this.upsertRun({
+            ...run,
+            state: "cancelled",
+            failureCode: "CAMPAIGN_CANCELLED",
+            summary: "Cancelled by campaign cancellation.",
+            updatedAt: cancelledAt,
+            lastProgressAt: cancelledAt,
+            finishedAt: cancelledAt
+          });
+        }
+      }
+      const cancelled: CampaignSpecRecord = {
+        ...campaign,
+        state: "cancelled",
+        failureCode: "CAMPAIGN_CANCELLED",
+        lastProgressAt: cancelledAt,
+        updatedAt: cancelledAt
+      };
+      delete cancelled.lastError;
+      delete cancelled.waitingApprovalStepId;
+      delete cancelled.currentRunId;
+      this.upsertCampaign(cancelled);
+      this.db.exec("COMMIT");
+      return cancelled;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getCampaign(campaignId: string): CampaignSpecRecord | null {
     const row = this.db.prepare("SELECT payload FROM campaigns WHERE id = ?").get(campaignId) as
       | { payload: string }
