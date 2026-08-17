@@ -40,7 +40,7 @@ function fingerprint(value: CanonicalObject): string {
 }
 
 export function fingerprintStartRequest(params: StartParams): string {
-  return fingerprint({
+  const legacyRequest: CanonicalObject = {
     version: 1,
     operation: "start",
     sessionName: params.name.trim(),
@@ -56,6 +56,17 @@ export function fingerprintStartRequest(params: StartParams): string {
     modelProvider: canonicalProvider(params.modelProvider),
     contextFiles: (params.contextFiles ?? []).map((entry) => entry.trim()),
     skills: [...new Set((params.skills ?? []).map((entry) => entry.trim()))].sort()
+  };
+  if (params.ownerKey == null) {
+    // This is the exact v1 shape used before account-scoped ownership existed.
+    // Its digest is durable protocol state and must keep replaying after an
+    // upgrade instead of becoming a different request.
+    return fingerprint(legacyRequest);
+  }
+  return fingerprint({
+    ...legacyRequest,
+    version: 2,
+    ownerKey: params.ownerKey
   });
 }
 

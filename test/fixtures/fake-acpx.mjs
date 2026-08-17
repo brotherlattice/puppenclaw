@@ -277,7 +277,19 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
     );
   }
   let reply;
-  if (normalizedInput.includes("SECRET_ERROR")) {
+  if (normalizedInput.includes("CLAUDE_OAUTH_EXPIRED")) {
+    emitError(
+      "AUTHENTICATION_ERROR",
+      "OAuth access token expired; run claude login again. token=must-not-survive"
+    );
+    process.exit(0);
+  } else if (normalizedInput.includes("PROVIDER_CONNECTION_FAILED")) {
+    emitError("CONNECTION_FAILED", "upstream connection reset");
+    process.exit(0);
+  } else if (normalizedInput.includes("PROVIDER_RATE_LIMITED")) {
+    emitJson('{"type":"error","code":"RATE_LIMITED","message":"rate limit exceeded","retryable":true}');
+    process.exit(0);
+  } else if (normalizedInput.includes("SECRET_ERROR")) {
     emitError(
       "SIM_SECRET",
       "authorization: Bearer bearer-secret at https://user:pass@example.test/path?token=query-secret OPENAI_API_KEY=sk-proj-rawsecret PUPPENCLAW_DAEMON_TOKEN=raw-token Incorrect API key provided: sk-proj-anotherraw"

@@ -2463,6 +2463,67 @@ describe("AcpxSessionManager", () => {
     expect(details.outputRole).toBe("status");
   });
 
+  it("persists and replays typed Claude OAuth failures", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-claude-oauth-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const events: Array<{ kind: string; code?: string; retryable?: boolean; text?: string }> = [];
+    outputRouter.attach("oauth-expired-demo", (event) => {
+      if (event.kind === "error") {
+        events.push(event);
+      }
+    });
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store,
+      outputRouter
+    });
+    const request = {
+      agent: "claude" as const,
+      name: "oauth-expired-demo",
+      directory: workspaceDir,
+      task: "CLAUDE_OAUTH_EXPIRED",
+      contextFiles: [],
+      turnKey: "oauth:expired"
+    };
+
+    const started = await manager.start(request);
+    const replayed = await manager.start(request);
+    for (const result of [started, replayed]) {
+      expect(result.details).toMatchObject({
+        session: {
+          state: "failed",
+          failureCode: "PROVIDER_AUTHENTICATION_REQUIRED",
+          retryable: false,
+          activeTurn: {
+            state: "failed",
+            failureCode: "PROVIDER_AUTHENTICATION_REQUIRED",
+            retryable: false
+          }
+        },
+        outputRole: "status",
+        failureCode: "PROVIDER_AUTHENTICATION_REQUIRED",
+        retryable: false
+      });
+      expect(JSON.stringify(result.details)).not.toContain("must-not-survive");
+    }
+    expect(started.details).toMatchObject({ turnReceipt: { state: "accepted" } });
+    expect(replayed.details).toMatchObject({ turnReceipt: { state: "replayed" } });
+    expect(store.getTurnRequest(request.name, request.turnKey)?.outcome).toMatchObject({
+      kind: "success",
+      failureCode: "PROVIDER_AUTHENTICATION_REQUIRED",
+      retryable: false
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        code: "PROVIDER_AUTHENTICATION_REQUIRED",
+        retryable: false
+      })
+    );
+  });
+
   it("creates a runtime session when acpx status reports no-session", async () => {
     const workspaceDir = await createTempDir("puppenclaw-no-session-");
     const acpxCommand = await resolveFakeAcpxCommand();

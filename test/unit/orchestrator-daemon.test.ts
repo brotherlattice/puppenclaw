@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { createDaemonServer } from "../../src/daemon/server.js";
 import { DaemonOrchestratorClient } from "../../src/orchestrator/client.js";
+import { PuppenclawError } from "../../src/shared/errors.js";
 import { createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
 
 describe("DaemonOrchestratorClient", () => {
@@ -90,6 +91,23 @@ describe("DaemonOrchestratorClient", () => {
         };
       };
       expect(details.campaign.state).toBe("completed");
+
+      const invalid = await client
+        .runCampaign({ projectId: "daemon-project" } as never)
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+      expect(invalid).toBeInstanceOf(PuppenclawError);
+      expect((invalid as PuppenclawError).code).toBe("INVALID_PARAMS");
+      expect((invalid as PuppenclawError).message).toContain("Invalid parameters");
+
+      const missing = await client.status({ campaignId: "missing-campaign" }).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(missing).toBeInstanceOf(PuppenclawError);
+      expect((missing as PuppenclawError).code).toBe("UNKNOWN_CAMPAIGN");
     } finally {
       globalThis.fetch = originalFetch;
       await app.close();

@@ -36,6 +36,8 @@ import type {
   focusParamsZod,
   suspendParamsZod,
   modelProviderConfigZod,
+  ownerSessionCleanupParamsZod,
+  ownerSessionListParamsZod,
   runStateZod,
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -71,6 +73,8 @@ export type OrchestrationConfig = z.infer<typeof orchestrationConfigZod>;
 export type StartParams = Omit<z.infer<typeof startParamsZod>, "skills"> & {
   skills?: z.infer<typeof startParamsZod>["skills"];
 };
+export type OwnerSessionListParams = z.infer<typeof ownerSessionListParamsZod>;
+export type OwnerSessionCleanupParams = z.infer<typeof ownerSessionCleanupParamsZod>;
 export type SendParams = z.infer<typeof sendParamsZod>;
 export type StopParams = z.infer<typeof stopParamsZod>;
 export type QuiesceParams = z.infer<typeof quiesceParamsZod>;
@@ -170,6 +174,8 @@ export type ActiveTurnMetadata = {
   exitCode?: number | null;
   signal?: string | null;
   error?: string;
+  failureCode?: string;
+  retryable?: boolean;
 };
 
 export type SessionRecoveryFence = {
@@ -249,11 +255,15 @@ export type TurnRequestSuccessOutcome = {
     lastActivity: string;
     pendingQuestion?: string;
     lastError?: string;
+    failureCode?: string;
+    retryable?: boolean;
     activeTurn?: ActiveTurnMetadata;
     tokenUsage?: TokenUsage;
   };
   output: string;
   outputRole: TurnOutputRole;
+  failureCode?: string;
+  retryable?: boolean;
   turnSignals?: TurnSignals;
   contextFiles: Array<Omit<ContextFileEntry, "resolvedPath">>;
   skills?: Array<Pick<InstalledSkillReceipt, "name">>;
@@ -264,6 +274,7 @@ export type TurnRequestErrorOutcome = {
   kind: "error";
   code: string;
   message: string;
+  retryable?: boolean;
   details?: Record<string, string | number | boolean | null>;
   session?: TurnRequestSuccessOutcome["session"];
 };
@@ -315,6 +326,8 @@ export type SessionInfo = {
   tokenUsage?: TokenUsage;
   pendingQuestion?: string;
   lastError?: string;
+  failureCode?: string;
+  retryable?: boolean;
   warnings: string[];
   transcript: SessionTranscriptEntry[];
   handle?: AcpxSessionHandle;
@@ -351,6 +364,20 @@ export type SessionQuiescenceState = {
   lastEpoch: number;
   active: Record<string, SessionQuiescenceReservation>;
   latestByName: Record<string, number>;
+};
+
+export type OwnerCleanupLifecycleState = "quiesced" | "purging" | "purged";
+
+export type OwnerCleanupReservation = {
+  epoch: number;
+  operationKey: string;
+  state: OwnerCleanupLifecycleState;
+  updatedAt: string;
+};
+
+export type OwnerCleanupState = {
+  lastEpoch: number;
+  scopes: Record<string, OwnerCleanupReservation>;
 };
 
 export type ExposureRecord = {
@@ -469,6 +496,8 @@ export type StoredState = {
   turnGenerations: Record<string, number>;
   exposures: Record<string, ExposureRecord>;
   quiescence: SessionQuiescenceState;
+  sessionOwners: Record<string, string>;
+  ownerCleanup: OwnerCleanupState;
 };
 
 export type StateRecoveryStatus =

@@ -18,6 +18,8 @@ import {
 import { PuppenclawError } from "./errors.js";
 import type {
   ExposureRecord,
+  OwnerCleanupLifecycleState,
+  OwnerCleanupReservation,
   SessionInfo,
   SessionQuiescenceReservation,
   StateRecoveryStatus,
@@ -69,7 +71,9 @@ const activeTurnZod = z
     outputChars: z.number().int().nonnegative(),
     exitCode: z.number().int().nullable().optional(),
     signal: z.string().nullable().optional(),
-    error: z.string().optional()
+    error: z.string().optional(),
+    failureCode: z.string().min(1).optional(),
+    retryable: z.boolean().optional()
   })
   .strict()
   .superRefine((turn, context) => {
@@ -212,6 +216,8 @@ const sessionInfoZod = z
     tokenUsage: tokenUsageZod.optional(),
     pendingQuestion: z.string().optional(),
     lastError: z.string().optional(),
+    failureCode: z.string().min(1).optional(),
+    retryable: z.boolean().optional(),
     warnings: z.array(z.string()),
     transcript: z.array(transcriptEntryZod),
     handle: z
@@ -238,6 +244,8 @@ const replaySessionZod = z
     lastActivity: persistedTimestampZod,
     pendingQuestion: z.string().optional(),
     lastError: z.string().optional(),
+    failureCode: z.string().min(1).optional(),
+    retryable: z.boolean().optional(),
     activeTurn: activeTurnZod.optional(),
     tokenUsage: tokenUsageZod.optional()
   })
@@ -306,6 +314,8 @@ const turnRequestOutcomeZod = z.discriminatedUnion("kind", [
       session: replaySessionZod,
       output: z.string().max(MAX_TURN_REPLAY_OUTPUT_CHARS),
       outputRole: z.enum(["assistant", "status"]),
+      failureCode: z.string().min(1).optional(),
+      retryable: z.boolean().optional(),
       turnSignals: turnSignalsZod.optional(),
       contextFiles: z.array(contextFileEntryZod.omit({ resolvedPath: true }).strict()),
       skills: z.array(installedSkillReceiptZod.pick({ name: true }).strict()).optional()
@@ -317,6 +327,7 @@ const turnRequestOutcomeZod = z.discriminatedUnion("kind", [
       version: z.literal(1),
       code: z.string().min(1),
       message: z.string(),
+      retryable: z.boolean().optional(),
       details: safeErrorDetailsZod.optional(),
       session: replaySessionZod.optional()
     })
@@ -403,6 +414,17 @@ const quiescenceReservationZod = z
   })
   .strict();
 
+const ownerKeyZod = z.string().min(16).max(128).regex(/^[a-zA-Z0-9._:-]+$/u);
+
+const ownerCleanupReservationZod = z
+  .object({
+    epoch: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    operationKey: z.string().min(1).max(128).regex(/^[a-zA-Z0-9._:-]+$/u),
+    state: z.enum(["quiesced", "purging", "purged"]),
+    updatedAt: persistedTimestampZod
+  })
+  .strict();
+
 const storedStateZod = z
   .object({
     version: z.literal(SESSION_STORE_VERSION),
@@ -425,7 +447,15 @@ const storedStateZod = z
           z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
         )
       })
+      .strict(),
+    sessionOwners: z.record(z.string().min(1), ownerKeyZod).default({}),
+    ownerCleanup: z
+      .object({
+        lastEpoch: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        scopes: z.record(ownerKeyZod, ownerCleanupReservationZod)
+      })
       .strict()
+      .default({ lastEpoch: 0, scopes: {} })
   })
   .strict()
   .superRefine((state, context) => {
@@ -636,6 +666,16 @@ const storedStateZod = z
         });
       }
     }
+
+    for (const [ownerKey, reservation] of Object.entries(state.ownerCleanup.scopes)) {
+      if (reservation.epoch > state.ownerCleanup.lastEpoch) {
+        context.addIssue({
+          code: "custom",
+          path: ["ownerCleanup", "scopes", ownerKey, "epoch"],
+          message: "Owner-cleanup epoch exceeds the durable epoch high-water mark."
+        });
+      }
+    }
   });
 
 const ownerLeaseZod = z
@@ -657,7 +697,9 @@ function freshState(): StoredState {
     turnRequests: {},
     turnGenerations: {},
     exposures: {},
-    quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
+    quiescence: { lastEpoch: 0, active: {}, latestByName: {} },
+    sessionOwners: {},
+    ownerCleanup: { lastEpoch: 0, scopes: {} }
   };
 }
 
@@ -728,6 +770,14 @@ export class SessionStore {
     return Object.values(this.state.sessions).sort((left, right) =>
       right.lastActivity.localeCompare(left.lastActivity)
     );
+  }
+
+  listSessionsByOwner(ownerKey: string): SessionInfo[] {
+    return this.listSessions().filter((session) => this.state.sessionOwners[session.name] === ownerKey);
+  }
+
+  getSessionOwner(name: string): string | null {
+    return this.state.sessionOwners[name] ?? null;
   }
 
   getSession(name: string): SessionInfo | null {
@@ -926,9 +976,33 @@ export class SessionStore {
     });
   }
 
-  async upsertSession(session: SessionInfo): Promise<void> {
+  async upsertSession(session: SessionInfo, ownerKey?: string): Promise<void> {
     await this.mutate((state) => {
       assertSessionMutable(state, session.name);
+      const current = state.sessions[session.name];
+      const currentOwner = state.sessionOwners[session.name];
+      if (current == null) {
+        if (currentOwner != null && currentOwner !== ownerKey) {
+          throw new PuppenclawError(
+            "SESSION_OWNER_CONFLICT",
+            `Session ${session.name} belongs to a different account scope.`
+          );
+        }
+        if (ownerKey != null && state.ownerCleanup.scopes[ownerKey] != null) {
+          throw new PuppenclawError(
+            "OWNER_SCOPE_QUIESCED",
+            "This account scope is fenced from creating new sessions."
+          );
+        }
+        if (ownerKey != null) {
+          state.sessionOwners[session.name] = ownerKey;
+        }
+      } else if (ownerKey != null && currentOwner !== ownerKey) {
+        throw new PuppenclawError(
+          "SESSION_OWNER_CONFLICT",
+          `Session ${session.name} belongs to a different account scope.`
+        );
+      }
       state.sessions[session.name] = session;
     });
   }
@@ -1027,6 +1101,97 @@ export class SessionStore {
 
   getQuiescence(name: string): SessionQuiescenceReservation | null {
     return this.state.quiescence.active[name] ?? null;
+  }
+
+  getOwnerCleanup(ownerKey: string): OwnerCleanupReservation | null {
+    return this.state.ownerCleanup.scopes[ownerKey] ?? null;
+  }
+
+  async reserveOwnerCleanup(
+    ownerKey: string,
+    operationKey: string,
+    sessionNames: string[] = []
+  ): Promise<OwnerCleanupReservation> {
+    return await this.mutate((state) => {
+      const current = state.ownerCleanup.scopes[ownerKey];
+      if (current != null) {
+        if (current.operationKey !== operationKey) {
+          throw new PuppenclawError(
+            "OWNER_CLEANUP_CONFLICT",
+            "A different cleanup operation already owns this account scope."
+          );
+        }
+      }
+      const authoritativeNames = [...new Set(sessionNames)];
+      for (const name of authoritativeNames) {
+        const claimedOwner = state.sessionOwners[name];
+        if (claimedOwner != null && claimedOwner !== ownerKey) {
+          throw new PuppenclawError(
+            "SESSION_OWNER_CONFLICT",
+            "An authoritative legacy session belongs to a different account scope."
+          );
+        }
+        if (claimedOwner == null && state.sessions[name] == null) {
+          throw new PuppenclawError(
+            "OWNER_ADOPTION_UNPROVEN",
+            "An authoritative legacy session is neither present nor durably owned by this account scope."
+          );
+        }
+      }
+      for (const name of authoritativeNames) {
+        state.sessionOwners[name] = ownerKey;
+      }
+      if (current != null) {
+        return current;
+      }
+      const lastEpoch = state.ownerCleanup.lastEpoch;
+      if (!Number.isSafeInteger(lastEpoch) || lastEpoch >= Number.MAX_SAFE_INTEGER) {
+        throw new PuppenclawError(
+          "OWNER_CLEANUP_EPOCH_EXHAUSTED",
+          "The account-cleanup lifecycle cannot allocate another epoch."
+        );
+      }
+      const reservation: OwnerCleanupReservation = {
+        epoch: lastEpoch + 1,
+        operationKey,
+        state: "quiesced",
+        updatedAt: nowIso()
+      };
+      state.ownerCleanup.lastEpoch = reservation.epoch;
+      state.ownerCleanup.scopes[ownerKey] = reservation;
+      return reservation;
+    });
+  }
+
+  async promoteOwnerCleanup(
+    ownerKey: string,
+    operationKey: string,
+    nextState: OwnerCleanupLifecycleState
+  ): Promise<OwnerCleanupReservation> {
+    return await this.mutate((state) => {
+      const current = state.ownerCleanup.scopes[ownerKey];
+      if (current == null || current.operationKey !== operationKey) {
+        throw new PuppenclawError(
+          "OWNER_CLEANUP_CONFLICT",
+          "This cleanup operation does not own the account scope."
+        );
+      }
+      const order: Record<OwnerCleanupLifecycleState, number> = {
+        quiesced: 0,
+        purging: 1,
+        purged: 2
+      };
+      if (order[nextState] < order[current.state]) {
+        return current;
+      }
+      const next: OwnerCleanupReservation = {
+        ...current,
+        state: nextState,
+        updatedAt: nowIso()
+      };
+      state.ownerCleanup.scopes[ownerKey] = next;
+      return next;
+    });
   }
 
   getActiveQuiescenceEpoch(name: string): number | null {
@@ -1261,7 +1426,15 @@ async function loadStoredState(statePath: string): Promise<{
   const validated = storedStateZod.safeParse(compatibleState);
   if (validated.success) {
     return {
-      state: compatibleState as StoredState,
+      // Zod defaults are part of the compatible-state upgrade. Returning the
+      // unparsed input unchanged would leave newly defaulted namespaces
+      // undefined. Preserve the persisted session objects' insertion order,
+      // which is observable in the daemon's legacy text status envelope.
+      state: {
+        ...(compatibleState as StoredState),
+        sessionOwners: validated.data.sessionOwners,
+        ownerCleanup: validated.data.ownerCleanup
+      },
       recovery: { required: false }
     };
   }
@@ -1515,6 +1688,8 @@ function replaySessionSnapshot(
       ? { pendingQuestion: redactSensitiveText(session.pendingQuestion) }
       : {}),
     ...(session.lastError != null ? { lastError: redactSensitiveText(session.lastError) } : {}),
+    ...(session.failureCode != null ? { failureCode: session.failureCode } : {}),
+    ...(session.retryable != null ? { retryable: session.retryable } : {}),
     ...(session.activeTurn != null
       ? {
           activeTurn: {

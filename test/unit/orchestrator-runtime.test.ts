@@ -1,12 +1,13 @@
-import { spawnSync } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
 import { OrchestratorRuntime } from "../../src/orchestrator/runtime.js";
 import { OrchestratorStore } from "../../src/orchestrator/store.js";
+import type { CampaignSpecRecord, RunRecord } from "../../src/orchestrator/types.js";
 import { OutputRouter } from "../../src/plugin/output-router.js";
 import {
   createTempDir,
@@ -36,7 +37,572 @@ function runGit(cwd: string, args: string[]): string {
   return result.stdout.trim();
 }
 
+function processMayExist(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 describe("OrchestratorRuntime", () => {
+  it("reconciles dead, verified, unidentified, cancelling, and ambiguous command runs on restart", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-recovery-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const config = makeConfig({ acpxCommand });
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store: sessionStore,
+      outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+    });
+    const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+    const runtime = new OrchestratorRuntime({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      sessionStore,
+      store,
+      sessionManager: manager
+    });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore"
+    });
+    expect(child.pid).toBeTruthy();
+    const childPid = child.pid as number;
+    const unidentifiedChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore"
+    });
+    expect(unidentifiedChild.pid).toBeTruthy();
+    const unidentifiedChildPid = unidentifiedChild.pid as number;
+    let childIdentity: string | null = null;
+    const identityDeadline = Date.now() + 2_000;
+    while (childIdentity == null && Date.now() < identityDeadline) {
+      const stat = await readFile(`/proc/${childPid}/stat`, "utf8").catch(() => null);
+      if (stat != null) {
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+        childIdentity = fields[19] != null ? `${childPid}:${fields[19]}` : null;
+      }
+      if (childIdentity == null) {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+      }
+    }
+    expect(childIdentity).toBeTruthy();
+
+    const seed = (
+      id: string,
+      state: CampaignSpecRecord["state"],
+      process?: Pick<RunRecord, "pid" | "processGroupId" | "processStartIdentity">
+    ) => {
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      const runId = `run-${id}`;
+      store.upsertCampaign({
+        id,
+        projectId: "recovery-project",
+        workerId: "local",
+        name: id,
+        template: "custom",
+        experimentCommands: [],
+        experimentParallelism: 1,
+        iterations: 1,
+        steps: [
+          {
+            id: "step-1",
+            title: "Interrupted command",
+            kind: "experiment",
+            executor: "command",
+            command: "long-running-command",
+            contextFiles: [],
+            approvalRequired: false,
+            sessionScope: "campaign",
+            env: {},
+            retryLimit: 0
+          }
+        ],
+        currentStepIndex: 0,
+        currentRunId: runId,
+        lastProgressAt: timestamp,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        state
+      });
+      store.upsertRun({
+        id: runId,
+        campaignId: id,
+        projectId: "recovery-project",
+        workerId: "local",
+        stepId: "step-1",
+        stepTitle: "Interrupted command",
+        stepIndex: 0,
+        kind: "experiment",
+        executor: "command",
+        state: "running",
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        lastProgressAt: timestamp,
+        attempts: 1,
+        ...(process ?? {})
+      });
+    };
+    seed("dead-campaign", "running", {
+      pid: 999_999_999,
+      processGroupId: 999_999_999,
+      processStartIdentity: "999999999:1"
+    });
+    seed("cancelling-campaign", "cancelling", {
+      pid: 999_999_998,
+      processGroupId: 999_999_998,
+      processStartIdentity: "999999998:1"
+    });
+    seed("ambiguous-campaign", "running");
+    seed("surviving-campaign", "running", {
+      pid: childPid,
+      processGroupId: childPid,
+      processStartIdentity: childIdentity as string
+    });
+    seed("unidentified-surviving-campaign", "running", {
+      pid: unidentifiedChildPid,
+      processGroupId: unidentifiedChildPid
+    });
+
+    try {
+      await runtime.recoverInterruptedCampaigns();
+      expect(store.getCampaign("dead-campaign")?.state).toBe("failed");
+      expect(store.getRun("run-dead-campaign")?.failureCode).toBe("CAMPAIGN_INTERRUPTED");
+      expect(store.getCampaign("cancelling-campaign")?.state).toBe("cancelled");
+      expect(store.getRun("run-cancelling-campaign")?.state).toBe("cancelled");
+      expect(store.getCampaign("ambiguous-campaign")?.state).toBe("recovery_required");
+      expect(store.getCampaign("surviving-campaign")?.state).toBe("failed");
+      expect(store.getRun("run-surviving-campaign")?.failureCode).toBe("CAMPAIGN_INTERRUPTED");
+      expect(() => process.kill(childPid, 0)).toThrow();
+      expect(store.getCampaign("unidentified-surviving-campaign")?.state).toBe(
+        "recovery_required"
+      );
+      expect(store.getCampaign("unidentified-surviving-campaign")?.failureCode).toBe(
+        "CAMPAIGN_RECOVERY_REQUIRED"
+      );
+      expect(store.getRun("run-unidentified-surviving-campaign")?.state).toBe("running");
+      expect(processMayExist(unidentifiedChildPid)).toBe(true);
+    } finally {
+      try {
+        process.kill(-childPid, "SIGKILL");
+      } catch {
+        // The recovery sweep normally terminated it already.
+      }
+      try {
+        process.kill(-unidentifiedChildPid, "SIGKILL");
+      } catch {
+        // The unidentified survivor must remain untouched until operator recovery.
+      }
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "fences a persisted process group whose recorded leader exited before restart",
+    async () => {
+      const workspaceDir = await createTempDir("puppenclaw-orch-leader-exited-");
+      const processFile = join(workspaceDir, "surviving-process.json");
+      const leaderScript = join(workspaceDir, "exited-leader.cjs");
+      await writeFile(
+        leaderScript,
+        [
+          'const { spawn } = require("node:child_process");',
+          'const { readFileSync, writeFileSync } = require("node:fs");',
+          'const raw = readFileSync(`/proc/${process.pid}/stat`, "utf8");',
+          'const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\\s+/u);',
+          'const grandchild = spawn(process.execPath, ["-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000);"], { stdio: "ignore" });',
+          'writeFileSync(process.argv[2], JSON.stringify({ leaderPid: process.pid, processStartIdentity: `${process.pid}:${fields[19]}`, grandchildPid: grandchild.pid }));',
+          "setTimeout(() => process.exit(0), 100);"
+        ].join("\n"),
+        "utf8"
+      );
+      const leader = spawn(process.execPath, [leaderScript, processFile], {
+        detached: true,
+        stdio: "ignore"
+      });
+      let processRecord:
+        | { leaderPid: number; processStartIdentity: string; grandchildPid: number }
+        | undefined;
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && processRecord == null) {
+        const raw = await readFile(processFile, "utf8").catch(() => "");
+        if (raw.length > 0) {
+          processRecord = JSON.parse(raw) as typeof processRecord;
+          break;
+        }
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 20));
+      }
+      expect(processRecord).toBeDefined();
+      const recorded = processRecord as NonNullable<typeof processRecord>;
+      while (Date.now() < deadline && processMayExist(recorded.leaderPid)) {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 20));
+      }
+      expect(processMayExist(recorded.leaderPid)).toBe(false);
+      expect(processMayExist(recorded.grandchildPid)).toBe(true);
+
+      const sessionStore = await SessionStore.open(workspaceDir);
+      const config = makeConfig({ acpxCommand: await resolveFakeAcpxCommand() });
+      const manager = new AcpxSessionManager({
+        config,
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        store: sessionStore,
+        outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+      });
+      const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+      const runtime = new OrchestratorRuntime({
+        config,
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        sessionStore,
+        store,
+        sessionManager: manager
+      });
+      const timestamp = "2026-01-01T00:00:00.000Z";
+      store.upsertCampaign({
+        id: "leader-exited-campaign",
+        projectId: "recovery-project",
+        workerId: "local",
+        name: "leader-exited-campaign",
+        template: "custom",
+        experimentCommands: [],
+        experimentParallelism: 1,
+        iterations: 1,
+        steps: [
+          {
+            id: "step-1",
+            title: "Detached survivor",
+            kind: "experiment",
+            executor: "command",
+            command: "detached-survivor",
+            contextFiles: [],
+            approvalRequired: false,
+            sessionScope: "campaign",
+            env: {},
+            retryLimit: 0
+          }
+        ],
+        currentStepIndex: 0,
+        currentRunId: "run-leader-exited",
+        lastProgressAt: timestamp,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        state: "running"
+      });
+      store.upsertRun({
+        id: "run-leader-exited",
+        campaignId: "leader-exited-campaign",
+        projectId: "recovery-project",
+        workerId: "local",
+        stepId: "step-1",
+        stepTitle: "Detached survivor",
+        stepIndex: 0,
+        kind: "experiment",
+        executor: "command",
+        state: "running",
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        lastProgressAt: timestamp,
+        attempts: 1,
+        pid: recorded.leaderPid,
+        processGroupId: recorded.leaderPid,
+        processStartIdentity: recorded.processStartIdentity
+      });
+
+      try {
+        await runtime.recoverInterruptedCampaigns();
+        expect(store.getCampaign("leader-exited-campaign")?.state).toBe("recovery_required");
+        expect(store.getCampaign("leader-exited-campaign")?.failureCode).toBe(
+          "CAMPAIGN_RECOVERY_REQUIRED"
+        );
+        expect(processMayExist(recorded.grandchildPid)).toBe(true);
+      } finally {
+        try {
+          process.kill(-recorded.leaderPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+        try {
+          process.kill(recorded.grandchildPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+        try {
+          leader.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+        store.close();
+        await sessionStore.close();
+      }
+    }
+  );
+
+  it("keeps cancellation terminal when a command exits concurrently", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-cancel-");
+    const startedFile = join(workspaceDir, "started.txt");
+    const commandFile = join(workspaceDir, "cancel-command.cjs");
+    await writeFile(
+      commandFile,
+      [
+        'const { spawn } = require("node:child_process");',
+        'const grandchild = spawn(process.execPath, ["-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000);"], { stdio: "ignore" });',
+        'require("node:fs").writeFileSync(process.argv[2], String(grandchild.pid));',
+        'process.on("SIGTERM", () => process.exit(0));',
+        "setInterval(() => {}, 1000);"
+      ].join("\n"),
+      "utf8"
+    );
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const config = makeConfig({ acpxCommand });
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store: sessionStore,
+      outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+    });
+    const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+    const runtime = new OrchestratorRuntime({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      sessionStore,
+      store,
+      sessionManager: manager
+    });
+    await runtime.createProject({ name: "cancel-project", rootDir: workspaceDir });
+
+    const execution = runtime.runCampaign({
+      projectId: "cancel-project",
+      workerId: "local",
+      name: "cancel-race",
+      template: "custom",
+      experimentCommands: [],
+      experimentParallelism: 1,
+      iterations: 1,
+      steps: [
+        {
+          title: "Cancellable command",
+          kind: "experiment",
+          executor: "command",
+          command: `node ${JSON.stringify(commandFile)} ${JSON.stringify(startedFile)}`,
+          contextFiles: [],
+          approvalRequired: false,
+          env: {},
+          retryLimit: 0
+        }
+      ]
+    });
+    const deadline = Date.now() + 5_000;
+    let campaignId: string | undefined;
+    while (Date.now() < deadline) {
+      campaignId = store.listCampaigns().find((campaign) => campaign.name === "cancel-race")?.id;
+      const started = await import("node:fs/promises").then(({ stat }) =>
+        stat(startedFile).then(() => true, () => false)
+      );
+      if (campaignId != null && started) {
+        break;
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 20));
+    }
+    expect(campaignId).toBeTruthy();
+    const grandchildPid = Number.parseInt(await readFile(startedFile, "utf8"), 10);
+    expect(grandchildPid).toBeGreaterThan(0);
+
+    try {
+      const cancellation = await runtime.cancel({ campaignId: campaignId as string });
+      const finished = await execution;
+      expect((cancellation.details as { campaign: { state: string } }).campaign.state).toBe(
+        "cancelled"
+      );
+      expect((finished.details as { campaign: { state: string } }).campaign.state).toBe(
+        "cancelled"
+      );
+      expect(processMayExist(grandchildPid)).toBe(false);
+      const snapshot = store.getCampaignSnapshot(campaignId as string)!;
+      expect(snapshot.campaign.state).toBe("cancelled");
+      expect(snapshot.runs).toHaveLength(1);
+      expect(snapshot.runs[0]?.state).toBe("cancelled");
+      expect(snapshot.artifacts).toHaveLength(0);
+    } finally {
+      try {
+        process.kill(grandchildPid, "SIGKILL");
+      } catch {
+        // The cancellation escalation normally terminated it already.
+      }
+    }
+  });
+
+  it("keeps approval and cancellation monotonic in both orderings", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-approval-cancel-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const config = makeConfig({ acpxCommand });
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store: sessionStore,
+      outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+    });
+    const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+    const runtime = new OrchestratorRuntime({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      sessionStore,
+      store,
+      sessionManager: manager
+    });
+    const startSpy = vi.spyOn(manager, "start");
+    await runtime.createProject({ name: "approval-cancel-project", rootDir: workspaceDir });
+
+    const startWaitingCampaign = async (name: string): Promise<string> => {
+      const result = await runtime.runCampaign({
+        projectId: "approval-cancel-project",
+        workerId: "local",
+        name,
+        template: "custom",
+        experimentCommands: [],
+        experimentParallelism: 1,
+        iterations: 1,
+        steps: [
+          {
+            title: "Approved launch",
+            kind: "plan",
+            executor: "acp",
+            instruction: "Do not launch after cancellation.",
+            approvalRequired: true,
+            contextFiles: [],
+            env: {},
+            retryLimit: 0
+          }
+        ]
+      });
+      const campaign = (result.details as { campaign: { id: string; state: string } }).campaign;
+      expect(campaign.state).toBe("waiting_approval");
+      return campaign.id;
+    };
+
+    try {
+      const cancelledFirstId = await startWaitingCampaign("cancel-before-approval");
+      const cancelledFirst = await runtime.cancel({ campaignId: cancelledFirstId });
+      expect(
+        (cancelledFirst.details as { campaign: { state: string } }).campaign.state
+      ).toBe("cancelled");
+      await expect(runtime.approve({ campaignId: cancelledFirstId })).rejects.toMatchObject({
+        code: "CAMPAIGN_NOT_WAITING_APPROVAL"
+      });
+      expect(startSpy).not.toHaveBeenCalled();
+
+      const approvedFirstId = await startWaitingCampaign("approval-before-cancel");
+      let releasePrompt: () => void = () => {};
+      const promptGate = new Promise<void>((resolveGate) => {
+        releasePrompt = resolveGate;
+      });
+      let signalPromptEntered: () => void = () => {};
+      const promptEntered = new Promise<void>((resolveEntered) => {
+        signalPromptEntered = resolveEntered;
+      });
+      const runtimeInternals = runtime as unknown as {
+        buildStepPrompt: (...args: unknown[]) => Promise<string>;
+      };
+      const originalBuildStepPrompt = runtimeInternals.buildStepPrompt.bind(runtime);
+      runtimeInternals.buildStepPrompt = async (...args: unknown[]) => {
+        signalPromptEntered();
+        await promptGate;
+        return originalBuildStepPrompt(...args);
+      };
+
+      const approval = runtime.approve({ campaignId: approvedFirstId });
+      await promptEntered;
+      expect(store.getCampaign(approvedFirstId)?.state).toBe("running");
+      const cancellation = runtime.cancel({ campaignId: approvedFirstId });
+      const cancellingDeadline = Date.now() + 1_000;
+      while (
+        store.getCampaign(approvedFirstId)?.state !== "cancelling" &&
+        Date.now() < cancellingDeadline
+      ) {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 5));
+      }
+      expect(store.getCampaign(approvedFirstId)?.state).toBe("cancelling");
+      expect(startSpy).not.toHaveBeenCalled();
+      releasePrompt();
+
+      const [approvalResult, cancellationResult] = await Promise.all([approval, cancellation]);
+      expect(
+        (approvalResult.details as { campaign: { state: string } }).campaign.state
+      ).toBe("cancelled");
+      expect(
+        (cancellationResult.details as { campaign: { state: string } }).campaign.state
+      ).toBe("cancelled");
+      expect(store.getCampaign(approvedFirstId)?.state).toBe("cancelled");
+      expect(store.listRuns(approvedFirstId)).toMatchObject([{ state: "cancelled" }]);
+      expect(startSpy).not.toHaveBeenCalled();
+    } finally {
+      store.close();
+      await sessionStore.close();
+    }
+  });
+
+  it("terminalizes the campaign and active run when artifact persistence fails", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-artifact-failure-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const config = makeConfig({ acpxCommand });
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store: sessionStore,
+      outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+    });
+    const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+    const runtime = new OrchestratorRuntime({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      sessionStore,
+      store,
+      sessionManager: manager
+    });
+    await runtime.createProject({ name: "artifact-failure-project", rootDir: workspaceDir });
+    const writableStore = store as OrchestratorStore & {
+      upsertArtifact: OrchestratorStore["upsertArtifact"];
+    };
+    writableStore.upsertArtifact = () => {
+      throw new Error("injected artifact persistence failure");
+    };
+
+    await expect(
+      runtime.runCampaign({
+        projectId: "artifact-failure-project",
+        workerId: "local",
+        name: "artifact-failure",
+        template: "custom",
+        experimentCommands: [],
+        experimentParallelism: 1,
+        iterations: 1,
+        steps: [
+          {
+            title: "Successful command",
+            kind: "experiment",
+            executor: "command",
+            command: nodePrintCommand("command succeeded\\n"),
+            contextFiles: [],
+            approvalRequired: false,
+            env: {},
+            retryLimit: 0
+          }
+        ]
+      })
+    ).rejects.toThrow("injected artifact persistence failure");
+
+    const snapshot = store.getCampaignSnapshot(store.listCampaigns()[0]!.id)!;
+    expect(snapshot.campaign.state).toBe("failed");
+    expect(snapshot.campaign.failureCode).toBe("CAMPAIGN_EXECUTION_ERROR");
+    expect(snapshot.runs).toHaveLength(1);
+    expect(snapshot.runs[0]?.state).toBe("failed");
+    expect(snapshot.artifacts).toHaveLength(0);
+  });
+
   it("creates projects, syncs context, and runs a baseline campaign", async () => {
     const workspaceDir = await createTempDir("puppenclaw-orch-");
     await writeFile(join(workspaceDir, "AGENTS.md"), "Follow the repo conventions.\n", "utf8");

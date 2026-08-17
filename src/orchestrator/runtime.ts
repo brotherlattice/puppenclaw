@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -35,7 +36,14 @@ import type {
   ToolResult,
   WorkerManifestInput
 } from "../shared/types.js";
-import { confineToRoot, ensureDir, loadContextFiles, nowIso, pathExists } from "../shared/utils.js";
+import {
+  confineToRoot,
+  ensureDir,
+  loadContextFiles,
+  nowIso,
+  pathExists,
+  redactSensitiveText
+} from "../shared/utils.js";
 import { importReassessmentSessions } from "./reassessment.js";
 import { OrchestratorStore } from "./store.js";
 import type {
@@ -89,6 +97,8 @@ type ShellCommandResult = {
   outputText: string;
 };
 
+type RecoveryDisposition = "gone" | "terminated" | "ambiguous";
+
 type StepAttemptOutcome =
   | {
       ok: true;
@@ -113,6 +123,7 @@ type StepRunOutcome =
   | {
       ok: false;
       run: RunRecord;
+      cancelled?: boolean;
     };
 
 type StepInput = {
@@ -177,6 +188,59 @@ function summarizeText(value: string, max = 220): string {
 
 function normalizeArtifactContent(content: string): string {
   return `${content.trimEnd()}\n`;
+}
+
+async function readLinuxProcessStartIdentity(pid: number): Promise<string | null> {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  const raw = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => null);
+  if (raw == null) {
+    return null;
+  }
+  const closeParen = raw.lastIndexOf(")");
+  if (closeParen < 0) {
+    return null;
+  }
+  const fields = raw.slice(closeParen + 2).trim().split(/\s+/u);
+  const startTicks = fields[19];
+  return startTicks != null ? `${pid}:${startTicks}` : null;
+}
+
+function readLinuxProcessStartIdentitySync(pid: number): string | null {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const closeParen = raw.lastIndexOf(")");
+    if (closeParen < 0) {
+      return null;
+    }
+    const fields = raw.slice(closeParen + 2).trim().split(/\s+/u);
+    const startTicks = fields[19];
+    return startTicks != null ? `${pid}:${startTicks}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function pidMayExist(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function processGroupMayExist(processGroupId: number): boolean {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function hashTextContent(content: string): string {
@@ -316,6 +380,9 @@ function describeReassessment(record: ReassessmentRecord): string {
 
 export class OrchestratorRuntime implements IOrchestrator {
   private readonly activeCommands = new Map<string, Set<ChildProcessWithoutNullStreams>>();
+  private readonly activeAcpSessions = new Map<string, Set<string>>();
+  private readonly activeStepExecutions = new Map<string, number>();
+  private interruptedCampaignsRecovered = false;
 
   constructor(
     private readonly deps: {
@@ -326,6 +393,157 @@ export class OrchestratorRuntime implements IOrchestrator {
       logger: PluginLogger;
     }
   ) {}
+
+  async recoverInterruptedCampaigns(): Promise<void> {
+    if (this.interruptedCampaignsRecovered) {
+      return;
+    }
+    for (const campaign of this.deps.store.listCampaigns()) {
+      if (campaign.state !== "running" && campaign.state !== "cancelling") {
+        continue;
+      }
+      const activeRuns = this.deps.store
+        .listRuns(campaign.id)
+        .filter((run) => ["pending", "queued", "running", "waiting_approval"].includes(run.state));
+      const outcomes: RecoveryDisposition[] = [];
+      for (const run of activeRuns) {
+        outcomes.push(
+          run.executor === "command"
+            ? await this.recoverPersistedCommand(run)
+            : await this.recoverPersistedAcpSession(campaign, run)
+        );
+      }
+      if (outcomes.includes("ambiguous")) {
+        const detectedAt = nowIso();
+        this.deps.store.upsertCampaign({
+          ...campaign,
+          state: "recovery_required",
+          failureCode: "CAMPAIGN_RECOVERY_REQUIRED",
+          lastError: "Interrupted campaign work could not be proven terminated.",
+          lastProgressAt: detectedAt,
+          updatedAt: detectedAt
+        });
+        this.deps.logger.warn(
+          `Campaign ${campaign.id} is fenced because interrupted work could not be proven terminated.`
+        );
+        continue;
+      }
+      if (campaign.state === "cancelling") {
+        this.deps.store.finalizeCampaignCancellation(campaign.id, nowIso());
+        continue;
+      }
+      this.deps.store.finalizeCampaignFailure({
+        campaignId: campaign.id,
+        failedAt: nowIso(),
+        failureCode: "CAMPAIGN_INTERRUPTED",
+        message: "Campaign execution was interrupted by a daemon restart."
+      });
+    }
+    this.interruptedCampaignsRecovered = true;
+  }
+
+  private async recoverPersistedAcpSession(
+    campaign: CampaignSpecRecord,
+    run: RunRecord
+  ): Promise<RecoveryDisposition> {
+    const step = campaign.steps[run.stepIndex];
+    const sessionName =
+      run.sessionName ??
+      (step?.sessionScope === "step"
+        ? `${slug(campaign.name)}-${run.stepId}-${campaign.id.slice(-6)}`
+        : campaign.acpSessionName ?? `${slug(campaign.name)}-${campaign.id.slice(-8)}`);
+    const session = this.deps.sessionStore.getSession(sessionName);
+    if (session == null) {
+      return "gone";
+    }
+    const mayBeActive =
+      session.state === "running" ||
+      session.activeTurn?.state === "running" ||
+      session.recoveryFence != null;
+    if (!mayBeActive) {
+      return "gone";
+    }
+    try {
+      await this.deps.sessionManager.stop({ name: sessionName });
+    } catch (error) {
+      this.deps.logger.warn(
+        `Unable to stop interrupted ACP session ${sessionName}: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`
+      );
+      return "ambiguous";
+    }
+    const latest = this.deps.sessionStore.getSession(sessionName);
+    return latest == null ||
+      (latest.state !== "running" &&
+        latest.activeTurn?.state !== "running" &&
+        latest.recoveryFence == null)
+      ? "terminated"
+      : "ambiguous";
+  }
+
+  private async recoverPersistedCommand(run: RunRecord): Promise<RecoveryDisposition> {
+    if (run.pid == null) {
+      return "ambiguous";
+    }
+    const observed = await readLinuxProcessStartIdentity(run.pid);
+    if (observed == null) {
+      if (pidMayExist(run.pid)) {
+        return "ambiguous";
+      }
+      return run.processGroupId != null && processGroupMayExist(run.processGroupId)
+        ? "ambiguous"
+        : "gone";
+    }
+    if (run.processStartIdentity == null) {
+      return "ambiguous";
+    }
+    if (observed !== run.processStartIdentity) {
+      return "gone";
+    }
+    if (
+      process.platform !== "linux" ||
+      run.pid === process.pid ||
+      (run.processGroupId != null && run.processGroupId !== run.pid)
+    ) {
+      return "ambiguous";
+    }
+    const processGroupId = run.processGroupId ?? run.pid;
+    this.signalPersistedProcessGroup(processGroupId, "SIGTERM");
+    if (await this.waitForPersistedProcessExit(run, processGroupId, PROCESS_KILL_ESCALATION_MS)) {
+      return "terminated";
+    }
+    this.signalPersistedProcessGroup(processGroupId, "SIGKILL");
+    return (await this.waitForPersistedProcessExit(run, processGroupId, PROCESS_STREAM_CLOSE_GRACE_MS))
+      ? "terminated"
+      : "ambiguous";
+  }
+
+  private signalPersistedProcessGroup(processGroupId: number, signal: NodeJS.Signals): void {
+    try {
+      process.kill(-processGroupId, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        this.deps.logger.warn(
+          `Unable to signal interrupted campaign process group: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`
+        );
+      }
+    }
+  }
+
+  private async waitForPersistedProcessExit(
+    run: RunRecord,
+    processGroupId: number,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    do {
+      const observed = run.pid != null ? await readLinuxProcessStartIdentity(run.pid) : null;
+      if (observed !== run.processStartIdentity && !processGroupMayExist(processGroupId)) {
+        return true;
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 25));
+    } while (Date.now() < deadline);
+    return false;
+  }
 
   async ensureDefaultWorker(): Promise<void> {
     if (!this.deps.config.orchestration.enabled) {
@@ -508,7 +726,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       ...(preparedFusion != null ? { fusion: preparedFusion.fusion } : {})
     };
     this.deps.store.upsertCampaign(campaign);
-    const snapshot = await this.executeCampaign(campaign);
+    const snapshot = await this.driveCampaign(campaign);
     return textToolResult(describeCampaign(snapshot), snapshot);
   }
 
@@ -591,30 +809,39 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   async approve(params: CampaignActionParams): Promise<ToolResult> {
     await this.prepareRuntime();
-    const campaign = this.requireCampaign(params.campaignId);
-    if (campaign.waitingApprovalStepId == null) {
+    const resumed = this.deps.store.resumeCampaignApproval(params.campaignId, nowIso());
+    if (resumed == null) {
+      if (this.deps.store.getCampaign(params.campaignId) == null) {
+        throw new PuppenclawError("UNKNOWN_CAMPAIGN", `Unknown campaign ${params.campaignId}.`);
+      }
       throw new PuppenclawError(
         "CAMPAIGN_NOT_WAITING_APPROVAL",
-        `Campaign ${campaign.id} is not waiting for approval.`
+        `Campaign ${params.campaignId} is not waiting for approval.`
       );
     }
-    const approvedStepId = campaign.waitingApprovalStepId;
-    const resumedAt = nowIso();
-    const resumed: CampaignSpecRecord = {
-      ...campaign,
-      state: "running",
-      lastProgressAt: resumedAt,
-      updatedAt: resumedAt
-    };
-    delete resumed.waitingApprovalStepId;
-    this.deps.store.upsertCampaign(resumed);
-    const snapshot = await this.executeCampaign(resumed, approvedStepId);
+    const snapshot = await this.driveCampaign(resumed.campaign, resumed.approvedStepId);
     return textToolResult(`Approved campaign ${snapshot.campaign.name}.`, snapshot);
   }
 
   async cancel(params: CampaignActionParams): Promise<ToolResult> {
     await this.prepareRuntime();
-    const campaign = this.requireCampaign(params.campaignId);
+    const campaign = this.deps.store.beginCampaignCancellation(params.campaignId, nowIso());
+    if (campaign == null) {
+      throw new PuppenclawError("UNKNOWN_CAMPAIGN", `Unknown campaign ${params.campaignId}.`);
+    }
+    if (["completed", "failed", "cancelled"].includes(campaign.state)) {
+      return textToolResult(`Campaign ${campaign.name} is already ${campaign.state}.`, {
+        campaign
+      });
+    }
+    if (campaign.state === "recovery_required") {
+      return textToolResult(`Campaign ${campaign.name} remains fenced for operator recovery.`, {
+        campaign,
+        recoveryRequired: true
+      });
+    }
+
+    const terminationChecks: Array<Promise<boolean>> = [];
     const active = this.activeCommands.get(campaign.id);
     if (active != null) {
       for (const child of active) {
@@ -626,28 +853,81 @@ export class OrchestratorRuntime implements IOrchestrator {
             `Failed to terminate campaign ${campaign.id} command process: ${error.message}`
           );
         });
-      }
-      this.activeCommands.delete(campaign.id);
-    }
-    if (campaign.acpSessionName != null) {
-      try {
-        await this.deps.sessionManager.stop({ name: campaign.acpSessionName });
-      } catch (error) {
-        this.deps.logger.warn(
-          `Failed to stop ACP session ${campaign.acpSessionName}: ${error instanceof Error ? error.message : String(error)}`
-        );
+        terminationChecks.push(this.waitForCommandExit(child));
       }
     }
-    const cancelled: CampaignSpecRecord = {
-      ...campaign,
-      state: "cancelled",
-      updatedAt: nowIso()
-    };
-    delete cancelled.lastError;
-    this.deps.store.upsertCampaign(cancelled);
-    return textToolResult(`Cancelled campaign ${cancelled.name}.`, {
-      campaign: cancelled
-    });
+    const acpSessions = new Set([
+      ...(campaign.acpSessionName != null ? [campaign.acpSessionName] : []),
+      ...(this.activeAcpSessions.get(campaign.id) ?? [])
+    ]);
+    for (const sessionName of acpSessions) {
+      terminationChecks.push(
+        this.deps.sessionManager.stop({ name: sessionName }).then(
+          () => true,
+          (error: unknown) => {
+            this.deps.logger.warn(
+              `Failed to stop ACP session ${sessionName}: ${error instanceof Error ? error.message : String(error)}`
+            );
+            return false;
+          }
+        )
+      );
+    }
+    terminationChecks.push(this.waitForStepExecutions(campaign.id));
+    const proved = (await Promise.all(terminationChecks)).every(Boolean);
+    const noTrackedWork =
+      (this.activeCommands.get(campaign.id)?.size ?? 0) === 0 &&
+      (this.activeAcpSessions.get(campaign.id)?.size ?? 0) === 0;
+    if (!proved || !noTrackedWork) {
+      const fencedAt = nowIso();
+      const fenced: CampaignSpecRecord = {
+        ...this.requireCampaign(campaign.id),
+        state: "cancelling",
+        failureCode: "CANCELLATION_UNCONFIRMED",
+        lastError: "Campaign cancellation could not prove that all work terminated.",
+        lastProgressAt: fencedAt,
+        updatedAt: fencedAt
+      };
+      this.deps.store.upsertCampaign(fenced);
+      return textToolResult(`Campaign ${fenced.name} remains fenced while cancellation is verified.`, {
+        campaign: fenced,
+        recoveryRequired: true
+      });
+    }
+    const cancelled = this.deps.store.finalizeCampaignCancellation(campaign.id, nowIso());
+    if (cancelled == null) {
+      throw new PuppenclawError("UNKNOWN_CAMPAIGN", `Unknown campaign ${campaign.id}.`);
+    }
+    return textToolResult(`Cancelled campaign ${cancelled.name}.`, { campaign: cancelled });
+  }
+
+  private async waitForCommandExit(child: ChildProcessWithoutNullStreams): Promise<boolean> {
+    const processGroupId = process.platform === "win32" ? null : (child.pid ?? null);
+    const deadline = Date.now() + PROCESS_KILL_ESCALATION_MS + PROCESS_STREAM_CLOSE_GRACE_MS;
+    do {
+      const childExited = child.exitCode != null || child.signalCode != null;
+      const processGroupExited =
+        processGroupId == null || !processGroupMayExist(processGroupId);
+      if (childExited && processGroupExited) {
+        return true;
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 25));
+    } while (Date.now() < deadline);
+    return (
+      (child.exitCode != null || child.signalCode != null) &&
+      (processGroupId == null || !processGroupMayExist(processGroupId))
+    );
+  }
+
+  private async waitForStepExecutions(campaignId: string): Promise<boolean> {
+    const deadline = Date.now() + PROCESS_KILL_ESCALATION_MS + PROCESS_STREAM_CLOSE_GRACE_MS;
+    while ((this.activeStepExecutions.get(campaignId) ?? 0) > 0) {
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+    }
+    return true;
   }
 
   async startReassessment(params: ReassessmentStartParams): Promise<ToolResult> {
@@ -903,8 +1183,10 @@ export class OrchestratorRuntime implements IOrchestrator {
     const protectedCampaignIds = new Set(
       this.deps.store
         .listCampaigns()
-        .filter(
-          (campaign) => campaign.state === "running" || campaign.state === "waiting_approval"
+        .filter((campaign) =>
+          ["running", "cancelling", "recovery_required", "waiting_approval"].includes(
+            campaign.state
+          )
         )
         .map((campaign) => campaign.id)
     );
@@ -1149,6 +1431,8 @@ export class OrchestratorRuntime implements IOrchestrator {
       .filter((campaign) =>
         campaign.state === "draft" ||
         campaign.state === "running" ||
+        campaign.state === "cancelling" ||
+        campaign.state === "recovery_required" ||
         campaign.state === "waiting_approval"
       );
     if (active.length >= this.deps.config.orchestration.maxCampaigns) {
@@ -1182,6 +1466,8 @@ export class OrchestratorRuntime implements IOrchestrator {
         campaign.workerId === worker.id &&
         (campaign.state === "draft" ||
           campaign.state === "running" ||
+          campaign.state === "cancelling" ||
+          campaign.state === "recovery_required" ||
           campaign.state === "waiting_approval")
       ).length;
     if (activeRuns >= worker.maxConcurrentRuns) {
@@ -1550,8 +1836,8 @@ export class OrchestratorRuntime implements IOrchestrator {
       if (step == null) {
         break;
       }
-      if (current.state === "cancelled") {
-        return this.requireSnapshot(current.id);
+      if (current.state === "cancelling" || current.state === "cancelled") {
+        return this.waitForCancellationSnapshot(current.id);
       }
       if (step.approvalRequired && approvedStepId !== step.id) {
         const waitingAt = nowIso();
@@ -1575,6 +1861,10 @@ export class OrchestratorRuntime implements IOrchestrator {
             this.executeStepRun(current, project, batchStep, stepIndex)
           )
         );
+        current = this.requireCampaign(current.id);
+        if (current.state === "cancelling" || current.state === "cancelled") {
+          return this.waitForCancellationSnapshot(current.id);
+        }
         const failed = outcomes.find((outcome) => !outcome.ok);
         if (failed != null && !failed.ok) {
           current = this.failCampaign(current, index, failed.run);
@@ -1600,6 +1890,10 @@ export class OrchestratorRuntime implements IOrchestrator {
       }
 
       const outcome = await this.executeStepRun(current, project, step, index);
+      current = this.requireCampaign(current.id);
+      if (current.state === "cancelling" || current.state === "cancelled") {
+        return this.waitForCancellationSnapshot(current.id);
+      }
       if (!outcome.ok) {
         current = this.failCampaign(current, index, outcome.run);
         return this.requireSnapshot(current.id);
@@ -1615,6 +1909,44 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
 
     return this.requireSnapshot(current.id);
+  }
+
+  private async driveCampaign(
+    campaign: CampaignSpecRecord,
+    approvedStepId?: string
+  ): Promise<CampaignStatusSnapshot> {
+    try {
+      return await this.executeCampaign(campaign, approvedStepId);
+    } catch (error) {
+      const current = this.deps.store.getCampaign(campaign.id);
+      if (current?.state === "cancelling" || current?.state === "cancelled") {
+        return this.waitForCancellationSnapshot(campaign.id);
+      }
+      const message = redactSensitiveText(
+        summarizeText(error instanceof Error ? error.message : String(error), 2_000)
+      );
+      const failureCode =
+        error instanceof PuppenclawError ? error.code : "CAMPAIGN_EXECUTION_ERROR";
+      this.deps.store.finalizeCampaignFailure({
+        campaignId: campaign.id,
+        failedAt: nowIso(),
+        failureCode,
+        message
+      });
+      throw error;
+    }
+  }
+
+  private async waitForCancellationSnapshot(campaignId: string): Promise<CampaignStatusSnapshot> {
+    const deadline = Date.now() + PROCESS_KILL_ESCALATION_MS + PROCESS_STREAM_CLOSE_GRACE_MS;
+    while (Date.now() < deadline) {
+      const campaign = this.requireCampaign(campaignId);
+      if (campaign.state !== "cancelling" || campaign.failureCode === "CANCELLATION_UNCONFIRMED") {
+        return this.requireSnapshot(campaignId);
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
+    }
+    return this.requireSnapshot(campaignId);
   }
 
   private collectParallelStepBatch(
@@ -1666,6 +1998,26 @@ export class OrchestratorRuntime implements IOrchestrator {
     step: CampaignStepRecord,
     stepIndex: number
   ): Promise<StepRunOutcome> {
+    this.activeStepExecutions.set(
+      campaign.id,
+      (this.activeStepExecutions.get(campaign.id) ?? 0) + 1
+    );
+    return this.executeTrackedStepRun(campaign, project, step, stepIndex).finally(() => {
+      const remaining = (this.activeStepExecutions.get(campaign.id) ?? 1) - 1;
+      if (remaining === 0) {
+        this.activeStepExecutions.delete(campaign.id);
+      } else {
+        this.activeStepExecutions.set(campaign.id, remaining);
+      }
+    });
+  }
+
+  private async executeTrackedStepRun(
+    campaign: CampaignSpecRecord,
+    project: ProjectRecord,
+    step: CampaignStepRecord,
+    stepIndex: number
+  ): Promise<StepRunOutcome> {
     const startedAt = nowIso();
     const baseRun: RunRecord = {
       id: `run-${randomUUID()}`,
@@ -1686,11 +2038,23 @@ export class OrchestratorRuntime implements IOrchestrator {
     this.deps.store.upsertRun(baseRun);
     this.markCampaignRunActive(campaign, stepIndex, baseRun.id, startedAt);
 
+    const activeCampaign = this.requireCampaign(campaign.id);
+    if (activeCampaign.state === "cancelling" || activeCampaign.state === "cancelled") {
+      const run = this.cancelRun(baseRun, startedAt);
+      return { ok: false, run, cancelled: true };
+    }
+
     const attempt = await this.executeStepWithRetries(campaign, project, step, baseRun);
+    const afterAttempt = this.requireCampaign(campaign.id);
+    if (afterAttempt.state === "cancelling" || afterAttempt.state === "cancelled") {
+      const run = this.cancelRun(baseRun, nowIso());
+      return { ok: false, run, cancelled: true };
+    }
     if (!attempt.ok) {
       const failedAt = nowIso();
+      const storedRun = this.deps.store.getRun(baseRun.id) ?? baseRun;
       const run: RunRecord = {
-        ...baseRun,
+        ...storedRun,
         state: "failed",
         updatedAt: failedAt,
         lastProgressAt: failedAt,
@@ -1723,8 +2087,14 @@ export class OrchestratorRuntime implements IOrchestrator {
       relativePath,
       content: attempt.result.outputText
     });
+    const writtenArtifacts = [artifact];
+    if (this.isCampaignCancelling(campaign.id)) {
+      await this.removeWrittenArtifacts(writtenArtifacts);
+      const run = this.cancelRun(baseRun, nowIso());
+      return { ok: false, run, cancelled: true };
+    }
     for (const extraArtifact of attempt.result.extraArtifacts ?? []) {
-      await this.writeTextArtifact({
+      writtenArtifacts.push(await this.writeTextArtifact({
         projectId: campaign.projectId,
         campaignId: campaign.id,
         runId: baseRun.id,
@@ -1734,10 +2104,16 @@ export class OrchestratorRuntime implements IOrchestrator {
         ...(extraArtifact.summary != null ? { summary: extraArtifact.summary } : {}),
         relativePath: extraArtifact.relativePath,
         content: extraArtifact.content
-      });
+      }));
+      if (this.isCampaignCancelling(campaign.id)) {
+        await this.removeWrittenArtifacts(writtenArtifacts);
+        const run = this.cancelRun(baseRun, nowIso());
+        return { ok: false, run, cancelled: true };
+      }
     }
+    const storedRun = this.deps.store.getRun(baseRun.id) ?? baseRun;
     const run: RunRecord = {
-      ...baseRun,
+      ...storedRun,
       state: "completed",
       updatedAt: artifact.createdAt,
       lastProgressAt: artifact.createdAt,
@@ -1765,6 +2141,17 @@ export class OrchestratorRuntime implements IOrchestrator {
   ): Promise<StepAttemptOutcome> {
     let attempts = 0;
     while (attempts < step.retryLimit + 1) {
+      const current = this.requireCampaign(campaign.id);
+      if (current.state === "cancelling" || current.state === "cancelled") {
+        return {
+          ok: false,
+          attempts,
+          message: "Campaign cancelled.",
+          outputText: "Campaign cancelled.",
+          failureCode: "CAMPAIGN_CANCELLED",
+          failureCategory: "execution"
+        };
+      }
       attempts += 1;
       const progressAt = nowIso();
       this.deps.store.upsertRun({
@@ -1779,7 +2166,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         return {
           ok: true,
           attempts,
-          result: await this.executeStep(campaign, project, step)
+          result: await this.executeStep(campaign, project, step, baseRun.id)
         };
       } catch (error) {
         const failure = this.describeStepFailure(error);
@@ -1819,18 +2206,19 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async executeStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    runId: string
   ): Promise<StepExecutionResult> {
     if (campaign.template === "puppenfusion" && step.fusion?.role === "integration") {
       return this.executeFusionIntegrationStep(campaign, step);
     }
     if (step.kind === "research" && this.deps.config.orchestration.gptResearcherCommand != null) {
-      return this.executeResearchCommandStep(campaign, project, step);
+      return this.executeResearchCommandStep(campaign, project, step, runId);
     }
     if (step.executor === "acp") {
-      return this.executeAcpStep(campaign, project, step);
+      return this.executeAcpStep(campaign, project, step, runId);
     }
-    return this.executeCommandStep(campaign, project, step);
+    return this.executeCommandStep(campaign, project, step, runId);
   }
 
   private markCampaignRunActive(
@@ -1839,8 +2227,12 @@ export class OrchestratorRuntime implements IOrchestrator {
     runId: string,
     updatedAt: string
   ): void {
+    const stored = this.requireCampaign(campaign.id);
+    if (stored.state === "cancelling" || stored.state === "cancelled") {
+      return;
+    }
     const next: CampaignSpecRecord = {
-      ...campaign,
+      ...stored,
       state: "running",
       currentStepIndex: stepIndex,
       currentRunId: runId,
@@ -1857,12 +2249,16 @@ export class OrchestratorRuntime implements IOrchestrator {
     updatedAt: string,
     sessionName?: string
   ): CampaignSpecRecord {
+    const stored = this.requireCampaign(campaign.id);
+    if (["cancelling", "cancelled", "failed", "completed"].includes(stored.state)) {
+      return stored;
+    }
     const next: CampaignSpecRecord = {
-      ...campaign,
+      ...stored,
       currentStepIndex: nextStepIndex,
       lastProgressAt: updatedAt,
       updatedAt,
-      state: nextStepIndex >= campaign.steps.length ? "completed" : "running",
+      state: nextStepIndex >= stored.steps.length ? "completed" : "running",
       ...(sessionName != null ? { acpSessionName: sessionName } : {})
     };
     delete next.waitingApprovalStepId;
@@ -1870,6 +2266,36 @@ export class OrchestratorRuntime implements IOrchestrator {
     delete next.currentRunId;
     this.deps.store.upsertCampaign(next);
     return next;
+  }
+
+  private cancelRun(run: RunRecord, cancelledAt: string): RunRecord {
+    const stored = this.deps.store.getRun(run.id) ?? run;
+    if (["completed", "failed", "cancelled"].includes(stored.state)) {
+      return stored;
+    }
+    const cancelled: RunRecord = {
+      ...stored,
+      state: "cancelled",
+      failureCode: "CAMPAIGN_CANCELLED",
+      summary: "Cancelled by campaign cancellation.",
+      updatedAt: cancelledAt,
+      lastProgressAt: cancelledAt,
+      finishedAt: cancelledAt
+    };
+    this.deps.store.upsertRun(cancelled);
+    return cancelled;
+  }
+
+  private isCampaignCancelling(campaignId: string): boolean {
+    const state = this.requireCampaign(campaignId).state;
+    return state === "cancelling" || state === "cancelled";
+  }
+
+  private async removeWrittenArtifacts(artifacts: ArtifactRecord[]): Promise<void> {
+    for (const artifact of artifacts) {
+      this.deps.store.deleteArtifact(artifact.id);
+      await rm(join(this.deps.store.resolveArtifactsDir(), artifact.relativePath), { force: true });
+    }
   }
 
   private resolveNextCampaignSessionName(
@@ -2403,9 +2829,13 @@ export class OrchestratorRuntime implements IOrchestrator {
     stepIndex: number,
     run: RunRecord
   ): CampaignSpecRecord {
+    const stored = this.requireCampaign(campaign.id);
+    if (["cancelling", "cancelled", "completed"].includes(stored.state)) {
+      return stored;
+    }
     const updatedAt = run.finishedAt ?? nowIso();
     let next: CampaignSpecRecord = {
-      ...campaign,
+      ...stored,
       state: "failed",
       lastError: run.summary ?? run.outputText ?? "Campaign step failed.",
       currentStepIndex: stepIndex,
@@ -2459,7 +2889,8 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async executeAcpStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    runId: string
   ): Promise<StepExecutionResult> {
     const stepDirectory = this.resolveStepWorkingDirectory(project, step);
     const sessionScope = step.sessionScope ?? "campaign";
@@ -2468,9 +2899,17 @@ export class OrchestratorRuntime implements IOrchestrator {
       : campaign.acpSessionName ?? `${slug(campaign.name)}-${campaign.id.slice(-8)}`;
     const selectedAgent = step.agent ?? project.defaultAgent ?? this.deps.config.defaultAgent;
     const prompt = await this.buildStepPrompt(project, campaign, step, selectedAgent);
+    this.assertCampaignLaunchable(campaign.id);
     const startFresh = sessionScope === "step" || campaign.acpSessionName == null;
-    const result = startFresh
-      ? await this.deps.sessionManager.start({
+    const storedRun = this.deps.store.getRun(runId);
+    if (storedRun != null && storedRun.state === "running") {
+      this.deps.store.upsertRun({ ...storedRun, sessionName, updatedAt: nowIso() });
+    }
+    const activeSessions = this.activeAcpSessions.get(campaign.id) ?? new Set<string>();
+    activeSessions.add(sessionName);
+    this.activeAcpSessions.set(campaign.id, activeSessions);
+    const result = await (startFresh
+      ? this.deps.sessionManager.start({
           agent: selectedAgent,
           name: sessionName,
           directory: stepDirectory,
@@ -2481,10 +2920,15 @@ export class OrchestratorRuntime implements IOrchestrator {
           ...(project.planningProfile != null ? { planningProfile: project.planningProfile } : {}),
           contextFiles: step.contextFiles
         })
-      : await this.deps.sessionManager.send({
+      : this.deps.sessionManager.send({
           name: sessionName,
           message: prompt,
           contextFiles: step.contextFiles
+        })).finally(() => {
+          activeSessions.delete(sessionName);
+          if (activeSessions.size === 0) {
+            this.activeAcpSessions.delete(campaign.id);
+          }
         });
     const details = result.details as { output?: string };
     const outputText = details.output ?? result.content.map((entry) => entry.text).join("\n");
@@ -2648,7 +3092,8 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async executeCommandStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    runId: string
   ): Promise<StepExecutionResult> {
     if (!this.deps.config.orchestration.allowLocalCommandExecution) {
       throw new PuppenclawError(
@@ -2663,6 +3108,7 @@ export class OrchestratorRuntime implements IOrchestrator {
         : undefined;
     const result = await this.runShellCommand({
       campaignId: campaign.id,
+      runId,
       command: step.command ?? "",
       cwd,
       env: step.env,
@@ -2692,7 +3138,8 @@ export class OrchestratorRuntime implements IOrchestrator {
   private async executeResearchCommandStep(
     campaign: CampaignSpecRecord,
     project: ProjectRecord,
-    step: CampaignStepRecord
+    step: CampaignStepRecord,
+    runId: string
   ): Promise<StepExecutionResult> {
     const command = this.deps.config.orchestration.gptResearcherCommand;
     if (command == null) {
@@ -2700,6 +3147,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
     const result = await this.runShellCommand({
       campaignId: campaign.id,
+      runId,
       command,
       cwd: project.rootDir,
       env: {
@@ -3501,12 +3949,18 @@ export class OrchestratorRuntime implements IOrchestrator {
         }
       ]
     };
-    this.deps.store.upsertArtifact(artifact);
+    try {
+      this.deps.store.upsertArtifact(artifact);
+    } catch (error) {
+      await rm(join(this.deps.store.resolveArtifactsDir(), params.relativePath), { force: true });
+      throw error;
+    }
     return artifact;
   }
 
   private async runShellCommand(params: {
     campaignId: string;
+    runId?: string;
     command: string;
     cwd: string;
     env?: Record<string, string>;
@@ -3516,6 +3970,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     if (process.platform === "win32") {
       return this.runProcess({
         campaignId: params.campaignId,
+        ...(params.runId != null ? { runId: params.runId } : {}),
         command: "cmd.exe",
         args: ["/d", "/s", "/c", params.command],
         cwd: params.cwd,
@@ -3526,6 +3981,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     }
     return this.runProcess({
       campaignId: params.campaignId,
+      ...(params.runId != null ? { runId: params.runId } : {}),
       command: "bash",
       args: ["-lc", params.command],
       cwd: params.cwd,
@@ -3537,6 +3993,7 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   private async runProcess(params: {
     campaignId: string;
+    runId?: string;
     command: string;
     args: string[];
     cwd: string;
@@ -3544,6 +4001,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     stdinText?: string;
     timeoutMs?: number;
   }): Promise<ShellCommandResult> {
+    this.assertCampaignLaunchable(params.campaignId);
     const child = spawn(params.command, params.args, {
       cwd: params.cwd,
       windowsHide: true,
@@ -3557,6 +4015,19 @@ export class OrchestratorRuntime implements IOrchestrator {
     const children = this.activeCommands.get(params.campaignId) ?? new Set<ChildProcessWithoutNullStreams>();
     children.add(child);
     this.activeCommands.set(params.campaignId, children);
+    if (params.runId != null && child.pid != null) {
+      const storedRun = this.deps.store.getRun(params.runId);
+      if (storedRun != null && storedRun.state === "running") {
+        const processStartIdentity = readLinuxProcessStartIdentitySync(child.pid);
+        this.deps.store.upsertRun({
+          ...storedRun,
+          pid: child.pid,
+          ...(process.platform !== "win32" ? { processGroupId: child.pid } : {}),
+          ...(processStartIdentity != null ? { processStartIdentity } : {}),
+          updatedAt: nowIso()
+        });
+      }
+    }
     const stdout = createCappedOutputCollector(MAX_PROCESS_OUTPUT_BYTES);
     const stderr = createCappedOutputCollector(MAX_PROCESS_OUTPUT_BYTES);
     child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
@@ -3624,6 +4095,23 @@ export class OrchestratorRuntime implements IOrchestrator {
     };
   }
 
+  private assertCampaignLaunchable(campaignId: string): void {
+    const campaign = this.deps.store.getCampaign(campaignId);
+    if (campaign == null) {
+      return;
+    }
+    if (campaign.state === "running") {
+      return;
+    }
+    if (campaign.state === "cancelling" || campaign.state === "cancelled") {
+      throw new PuppenclawError("CAMPAIGN_CANCELLED", `Campaign ${campaignId} was cancelled.`);
+    }
+    throw new PuppenclawError(
+      "CAMPAIGN_NOT_RUNNING",
+      `Campaign ${campaignId} is not running and cannot launch new work.`
+    );
+  }
+
   private async buildSiteStatus(params: SiteStatusParams): Promise<SiteStatus> {
     const sessions = this.deps.sessionStore.listSessions();
     const campaigns = this.deps.store.listCampaigns();
@@ -3672,6 +4160,8 @@ export class OrchestratorRuntime implements IOrchestrator {
         active: campaigns.filter((campaign) =>
           campaign.state === "draft" ||
           campaign.state === "running" ||
+          campaign.state === "cancelling" ||
+          campaign.state === "recovery_required" ||
           campaign.state === "waiting_approval"
         ).length,
         ...(params.verbose
@@ -3704,6 +4194,8 @@ export class OrchestratorRuntime implements IOrchestrator {
           campaign.workerId === worker.id &&
           (campaign.state === "draft" ||
             campaign.state === "running" ||
+            campaign.state === "cancelling" ||
+            campaign.state === "recovery_required" ||
             campaign.state === "waiting_approval")
         ).length
       })),

@@ -131,6 +131,163 @@ export class OrchestratorStore {
       .run(campaign.id, campaign.projectId, JSON.stringify(campaign));
   }
 
+  resumeCampaignApproval(
+    campaignId: string,
+    resumedAt: string
+  ): { campaign: CampaignSpecRecord; approvedStepId: string } | null {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const campaign = this.getCampaign(campaignId);
+      if (campaign?.state !== "waiting_approval" || campaign.waitingApprovalStepId == null) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      const approvedStepId = campaign.waitingApprovalStepId;
+      const resumed: CampaignSpecRecord = {
+        ...campaign,
+        state: "running",
+        lastProgressAt: resumedAt,
+        updatedAt: resumedAt
+      };
+      delete resumed.waitingApprovalStepId;
+      this.upsertCampaign(resumed);
+      this.db.exec("COMMIT");
+      return { campaign: resumed, approvedStepId };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  beginCampaignCancellation(
+    campaignId: string,
+    cancellingAt: string
+  ): CampaignSpecRecord | null {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const campaign = this.getCampaign(campaignId);
+      if (campaign == null) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      if (
+        ["completed", "failed", "cancelled", "cancelling", "recovery_required"].includes(
+          campaign.state
+        )
+      ) {
+        this.db.exec("COMMIT");
+        return campaign;
+      }
+      const cancelling: CampaignSpecRecord = {
+        ...campaign,
+        state: "cancelling",
+        failureCode: "CAMPAIGN_CANCELLING",
+        lastProgressAt: cancellingAt,
+        updatedAt: cancellingAt
+      };
+      delete cancelling.waitingApprovalStepId;
+      this.upsertCampaign(cancelling);
+      this.db.exec("COMMIT");
+      return cancelling;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finalizeCampaignCancellation(campaignId: string, cancelledAt: string): CampaignSpecRecord | null {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const campaign = this.getCampaign(campaignId);
+      if (campaign == null) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      if (campaign.state !== "cancelling" && campaign.state !== "cancelled") {
+        this.db.exec("COMMIT");
+        return campaign;
+      }
+      for (const run of this.listRuns(campaignId)) {
+        if (["pending", "queued", "running", "waiting_approval"].includes(run.state)) {
+          this.upsertRun({
+            ...run,
+            state: "cancelled",
+            failureCode: "CAMPAIGN_CANCELLED",
+            summary: "Cancelled by campaign cancellation.",
+            updatedAt: cancelledAt,
+            lastProgressAt: cancelledAt,
+            finishedAt: cancelledAt
+          });
+        }
+      }
+      const cancelled: CampaignSpecRecord = {
+        ...campaign,
+        state: "cancelled",
+        failureCode: "CAMPAIGN_CANCELLED",
+        lastProgressAt: cancelledAt,
+        updatedAt: cancelledAt
+      };
+      delete cancelled.lastError;
+      delete cancelled.waitingApprovalStepId;
+      delete cancelled.currentRunId;
+      this.upsertCampaign(cancelled);
+      this.db.exec("COMMIT");
+      return cancelled;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finalizeCampaignFailure(params: {
+    campaignId: string;
+    failedAt: string;
+    failureCode: string;
+    message: string;
+  }): CampaignSpecRecord | null {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const campaign = this.getCampaign(params.campaignId);
+      if (campaign == null) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      if (["completed", "failed", "cancelled", "cancelling", "recovery_required"].includes(campaign.state)) {
+        this.db.exec("COMMIT");
+        return campaign;
+      }
+      for (const run of this.listRuns(params.campaignId)) {
+        if (["pending", "queued", "running", "waiting_approval"].includes(run.state)) {
+          this.upsertRun({
+            ...run,
+            state: "failed",
+            failureCode: params.failureCode,
+            summary: params.message,
+            updatedAt: params.failedAt,
+            lastProgressAt: params.failedAt,
+            finishedAt: params.failedAt
+          });
+        }
+      }
+      const failed: CampaignSpecRecord = {
+        ...campaign,
+        state: "failed",
+        failureCode: params.failureCode,
+        lastError: params.message,
+        lastProgressAt: params.failedAt,
+        updatedAt: params.failedAt
+      };
+      delete failed.waitingApprovalStepId;
+      delete failed.currentRunId;
+      this.upsertCampaign(failed);
+      this.db.exec("COMMIT");
+      return failed;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getCampaign(campaignId: string): CampaignSpecRecord | null {
     const row = this.db.prepare("SELECT payload FROM campaigns WHERE id = ?").get(campaignId) as
       | { payload: string }

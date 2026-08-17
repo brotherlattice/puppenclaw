@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
+import { OutputRouter } from "../../src/plugin/output-router.js";
 import { SessionStore } from "../../src/shared/store.js";
 import type { SessionInfo } from "../../src/shared/types.js";
 import {
@@ -37,6 +39,51 @@ async function linuxProcessIdentity(pid: number): Promise<string> {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Unable to read process identity for ${pid}.`);
+}
+
+function stableLegacyJson(value: unknown): string {
+  if (value == null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableLegacyJson).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableLegacyJson(record[key] ?? null)}`)
+    .join(",")}}`;
+}
+
+function legacyStartFingerprint(params: {
+  agent: "claude" | "codex";
+  name: string;
+  directory: string;
+  task: string;
+  contextFiles?: string[];
+  skills?: string[];
+}): string {
+  return createHash("sha256")
+    .update(
+      stableLegacyJson({
+        version: 1,
+        operation: "start",
+        sessionName: params.name.trim(),
+        agent: params.agent,
+        directory: resolve(params.directory),
+        task: params.task.trim(),
+        permissionMode: null,
+        interactionMode: null,
+        effort: null,
+        planningProfile: null,
+        model: null,
+        modelProviderId: null,
+        modelProvider: null,
+        contextFiles: (params.contextFiles ?? []).map((entry) => entry.trim()),
+        skills: [...new Set((params.skills ?? []).map((entry) => entry.trim()))].sort()
+      })
+    )
+    .digest("hex");
 }
 
 describe("writeJsonFileAtomic", () => {
@@ -446,6 +493,77 @@ describe("durable turn requests", () => {
     permissionMode: "approve-reads" as const,
     warnings: [],
     transcript: []
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps the historical no-owner start fingerprint golden",
+    () => {
+      const request = {
+        agent: "claude" as const,
+        name: " legacy-golden ",
+        directory: "/var/tmp/puppenclaw-legacy-project",
+        task: " Preserve this keyed start. ",
+        contextFiles: [" context.txt "],
+        skills: ["review", "review", "planning"]
+      };
+      expect(fingerprintStartRequest(request)).toBe(
+        "498f615ce5bafc81233788588cd6d15a900dbf0275c5cbe027c18f810aa103f9"
+      );
+      expect(fingerprintStartRequest(request)).toBe(legacyStartFingerprint(request));
+      expect(
+        fingerprintStartRequest({ ...request, ownerKey: "owner.account.a.00000001" })
+      ).not.toBe(fingerprintStartRequest(request));
+      expect(
+        fingerprintStartRequest({ ...request, ownerKey: "owner.account.a.00000001" })
+      ).not.toBe(
+        fingerprintStartRequest({ ...request, ownerKey: "owner.account.b.00000002" })
+      );
+    }
+  );
+
+  it("replays a seeded pre-owner start receipt after a store restart", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-legacy-start-replay-");
+    const request = {
+      agent: "claude" as const,
+      name: "legacy-start-replay",
+      directory: workspaceDir,
+      task: "Do not dispatch this historical request again.",
+      contextFiles: [],
+      turnKey: "legacy:start:replay"
+    };
+    const legacyFingerprint = legacyStartFingerprint(request);
+    expect(fingerprintStartRequest(request)).toBe(legacyFingerprint);
+
+    const first = await SessionStore.open(workspaceDir);
+    await first.claimTurnRequest({
+      sessionName: request.name,
+      turnKey: request.turnKey,
+      operation: "start",
+      requestFingerprint: legacyFingerprint
+    });
+    await first.close();
+
+    const reopened = await SessionStore.open(workspaceDir);
+    try {
+      const manager = new AcpxSessionManager({
+        config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        store: reopened,
+        outputRouter: new OutputRouter({
+          info() {},
+          warn() {},
+          error() {},
+          debug() {}
+        })
+      });
+      await manager.reconcilePersistedSessions();
+      await expect(manager.start(request)).rejects.toMatchObject({
+        code: "TURN_INTERRUPTED_RESTART",
+        details: { turnReceipt: { state: "replayed" } }
+      });
+    } finally {
+      await reopened.close();
+    }
   });
 
   it("bounds full replay outcomes without ever making an old key executable", async () => {

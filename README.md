@@ -420,6 +420,28 @@ boundary and is deliberately absent from the OpenClaw plugin command and tool
 schemas. Capability discovery advertises these semantics under
 `sessionQuiescence.version: 2`.
 
+Account deletion can fence and clean every daemon session associated with an
+opaque owner selector. The selector is accepted only when daemon bearer
+authentication is configured and is never returned by session or cleanup
+responses. Supply the same 16–128 character `ownerKey` on each authenticated
+`POST /session/start` for the account. Then use
+`POST /sessions/owner/list` with `{ "ownerKey": "..." }`, followed by
+`POST /sessions/owner/quiesce` and `POST /sessions/owner/purge` with
+`{ "ownerKey": "...", "operationKey": "...", "sessionNames": [...] }`. Reuse
+one operation key for idempotent retries. `sessionNames` is an optional,
+authoritative backfill for sessions created before owner selectors existed: the
+daemon atomically binds only present, previously unowned sessions (or names it
+already bound to that owner), rejects conflicting ownership, and fails closed
+when absence cannot be proved by a durable prior binding. Owner claims survive
+purge so retries can prove that a named legacy session was already removed. The
+first cleanup call installs a durable account-wide creation fence; successful
+purge is reported only after no owned session remains. Ambiguous survivors
+return `OWNER_CLEANUP_INCOMPLETE` with
+`recoveryRequired: true` while retaining the fence. Sessions created by legacy
+callers without an owner selector remain unowned and must still be reconciled
+or purged individually. Capability discovery advertises this contract under
+`sessionOwnerCleanup.version: 1`.
+
 ## OpenClaw Usage Surfaces
 
 Puppenclaw exposes three main surfaces:
@@ -646,6 +668,8 @@ Examples:
 ```
 
 Use the orchestration surface first when the work is project-shaped. Use raw sessions when the operator explicitly wants direct ACP control.
+
+Session HTTP/SSE results expose provider failures without forwarding raw credential diagnostics. `PROVIDER_AUTHENTICATION_REQUIRED` is terminal and non-retryable until an operator refreshes the provider login; `PROVIDER_CONNECTION_FAILED` is retryable. A provider-rejected model turn is a terminal session result rather than an HTTP request failure: JSON returns 200 with the failed session, safe message, code, and retryability, while SSE emits the same typed `error` followed by that terminal `result`. Initial keyed execution and every keyed replay preserve this exact shape. The code and `retryable` flag are also retained in session status, active-turn metadata, and durable turn receipts. `/capabilities` advertises this as `providerFailureContracts` version 1.
 
 ## ACP Verification
 

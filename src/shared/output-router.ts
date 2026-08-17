@@ -1,4 +1,4 @@
-import { ensureError } from "./errors.js";
+import { ensureError, PuppenclawError } from "./errors.js";
 import type { PluginLogger } from "./logger.js";
 
 export type OutputRouteEvent =
@@ -33,6 +33,7 @@ export type OutputRouteEvent =
       sessionName: string;
       text: string;
       code?: string;
+      retryable?: boolean;
       details?: Record<string, unknown>;
     }
   | {
@@ -136,12 +137,23 @@ export class OutputRouter {
     });
   }
 
-  async onError(sessionName: string, error: Error): Promise<void> {
+  async onError(
+    sessionName: string,
+    error: Error,
+    metadata: { code?: string; retryable?: boolean; details?: Record<string, unknown> } = {}
+  ): Promise<void> {
     await this.flushBufferedChunks(sessionName, true);
     await this.dispatch(sessionName, {
       kind: "error",
       sessionName,
-      text: error.message
+      text: error.message,
+      ...(metadata.code != null
+        ? { code: metadata.code }
+        : error instanceof PuppenclawError
+          ? { code: error.code }
+          : {}),
+      ...(metadata.retryable != null ? { retryable: metadata.retryable } : {}),
+      ...(metadata.details != null ? { details: metadata.details } : {})
     });
   }
 

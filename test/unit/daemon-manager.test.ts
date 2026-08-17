@@ -59,12 +59,189 @@ if (outputPath != null) {
 }
 
 describe("DaemonSessionManager", () => {
+  it("streams and persists typed Claude OAuth failures", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-daemon-claude-oauth-");
+    const config = makeConfig({ acpxCommand: await resolveFakeAcpxCommand() });
+    const { app } = await createDaemonServer({ config, dataDir: workspaceDir });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/session/start/stream",
+        payload: {
+          agent: "claude",
+          name: "daemon-oauth-expired",
+          directory: workspaceDir,
+          task: "CLAUDE_OAUTH_EXPIRED",
+          contextFiles: []
+        }
+      });
+      const events = response.body
+        .split(/\r?\n/u)
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => JSON.parse(line.slice("data: ".length)) as Record<string, unknown>);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "error",
+          code: "PROVIDER_AUTHENTICATION_REQUIRED",
+          retryable: false
+        })
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "result",
+          result: expect.objectContaining({
+            details: expect.objectContaining({
+              failureCode: "PROVIDER_AUTHENTICATION_REQUIRED",
+              retryable: false,
+              session: expect.objectContaining({
+                failureCode: "PROVIDER_AUTHENTICATION_REQUIRED",
+                retryable: false
+              })
+            })
+          })
+        })
+      );
+      expect(response.body).not.toContain("must-not-survive");
+
+      const status = await app.inject({ method: "GET", url: "/session/daemon-oauth-expired" });
+      expect(JSON.parse(status.body)).toMatchObject({
+        details: {
+          session: {
+            state: "failed",
+            failureCode: "PROVIDER_AUTHENTICATION_REQUIRED",
+            retryable: false
+          }
+        }
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each([
+    {
+      label: "authentication",
+      task: "CLAUDE_OAUTH_EXPIRED",
+      code: "PROVIDER_AUTHENTICATION_REQUIRED",
+      retryable: false,
+      message:
+        "Claude OAuth credentials have expired or are invalid. Contact the system administrator to sign in to Claude again."
+    },
+    {
+      label: "network",
+      task: "PROVIDER_CONNECTION_FAILED",
+      code: "PROVIDER_CONNECTION_FAILED",
+      retryable: true,
+      message: "Claude is temporarily unreachable because of a network or provider outage. Please retry."
+    }
+  ])(
+    "preserves Claude $label failure parity across keyed SSE and JSON replay",
+    async ({ label, task, code, retryable, message }) => {
+      const workspaceDir = await createTempDir(`puppenclaw-daemon-${label}-parity-`);
+      const { app } = await createDaemonServer({
+        config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+        dataDir: workspaceDir
+      });
+      const request = {
+        agent: "claude",
+        name: `daemon-${label}-parity`,
+        directory: workspaceDir,
+        task,
+        turnKey: `provider:${label}:parity`,
+        contextFiles: []
+      };
+      const events = (body: string): Array<Record<string, unknown>> =>
+        body
+          .split(/\r?\n/u)
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => JSON.parse(line.slice("data: ".length)) as Record<string, unknown>);
+
+      try {
+        const initial = await app.inject({
+          method: "POST",
+          url: "/session/start/stream",
+          payload: request
+        });
+        const initialEvents = events(initial.body);
+        expect(initialEvents.map((event) => event.kind)).toEqual(["error", "result", "done"]);
+        expect(initialEvents[0]).toMatchObject({
+          kind: "error",
+          code,
+          retryable,
+          text: message
+        });
+        expect(initialEvents[1]).toMatchObject({
+          kind: "result",
+          result: {
+            details: {
+              session: { state: "failed", failureCode: code, retryable },
+              output: message,
+              outputRole: "status",
+              failureCode: code,
+              retryable,
+              turnReceipt: { state: "accepted" }
+            }
+          }
+        });
+
+        const replay = await app.inject({
+          method: "POST",
+          url: "/session/start/stream",
+          payload: request
+        });
+        const replayEvents = events(replay.body);
+        expect(replayEvents.map((event) => event.kind)).toEqual(["error", "result", "done"]);
+        expect(replayEvents[0]).toMatchObject({
+          kind: "error",
+          code,
+          retryable,
+          text: message
+        });
+        expect(replayEvents[1]).toMatchObject({
+          result: {
+            details: {
+              output: message,
+              failureCode: code,
+              retryable,
+              turnReceipt: { state: "replayed" }
+            }
+          }
+        });
+
+        const jsonReplay = await app.inject({
+          method: "POST",
+          url: "/session/start",
+          payload: request
+        });
+        expect(jsonReplay.statusCode).toBe(200);
+        expect(JSON.parse(jsonReplay.body)).toMatchObject({
+          details: {
+            session: { state: "failed", failureCode: code, retryable },
+            output: message,
+            outputRole: "status",
+            failureCode: code,
+            retryable,
+            turnReceipt: { state: "replayed" }
+          }
+        });
+        for (const response of [initial.body, replay.body, jsonReplay.body]) {
+          expect(response).not.toContain("must-not-survive");
+          expect(response).not.toContain("access token expired");
+        }
+      } finally {
+        await app.close();
+      }
+    }
+  );
+
   it("reports the daemon HTTP capabilities", async () => {
     const workspaceDir = await createTempDir("puppenclaw-capabilities-");
     const acpxCommand = await resolveFakeAcpxCommand();
     const config = makeConfig({
       backend: "daemon",
       acpxCommand,
+      daemonAuthToken: "capability-test-token",
       maxSessions: 7
     });
 
@@ -84,6 +261,7 @@ describe("DaemonSessionManager", () => {
         sessionTurnIdempotency?: unknown;
         sessionModelProviderRefresh?: boolean;
         codexTurnPolicy?: unknown;
+        sessionOwnerCleanup?: unknown;
         sessionOutput?: boolean;
         sessionPurge?: boolean;
         sessionQuiesce?: boolean;
@@ -112,6 +290,14 @@ describe("DaemonSessionManager", () => {
         version: 1,
         serverControlled: true,
         userExecutionMarkersTrusted: false
+      });
+      expect(payload.sessionOwnerCleanup).toEqual({
+        version: 1,
+        authenticated: true,
+        opaqueOwnerKey: true,
+        durableFence: true,
+        authoritativeNameAdoption: true,
+        operations: ["list", "quiesce", "purge"]
       });
       expect(payload.sessionOutput).toBe(true);
       expect(payload.sessionPurge).toBe(true);
