@@ -30,6 +30,8 @@ import {
   focusParamsZod,
   forkParamsZod,
   logsParamsZod,
+  ownerSessionCleanupParamsZod,
+  ownerSessionListParamsZod,
   projectCreateParamsZod,
   quiescenceReleaseParamsZod,
   quiesceParamsZod,
@@ -211,6 +213,7 @@ export async function createDaemonServer(params: {
   } = initialized;
 
   const ok = (result: ToolResult) => result;
+  const ownerCleanupTails = new Map<string, Promise<void>>();
 
   app.get("/health", async () => {
     const recovery = store.getRecoveryStatus();
@@ -251,6 +254,14 @@ export async function createDaemonServer(params: {
       codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED"],
       retryability: true,
       durableReplay: true
+    },
+    sessionOwnerCleanup: {
+      version: 1,
+      authenticated: true,
+      opaqueOwnerKey: true,
+      durableFence: true,
+      authoritativeNameAdoption: true,
+      operations: ["list", "quiesce", "purge"]
     },
     sessionOutput: true,
     sessionPurge: true,
@@ -342,6 +353,80 @@ export async function createDaemonServer(params: {
 
   app.get("/sessions", async () => ok(await manager.status(statusParamsZod.parse({}))));
 
+  app.post("/sessions/owner/list", async (request) => {
+    assertOwnerCleanupAuthentication(authToken);
+    const parsed = ownerSessionListParamsZod.parse(request.body);
+    return {
+      ok: true,
+      sessions: store.listSessionsByOwner(parsed.ownerKey).map(ownerSessionSummary),
+      cleanup: publicOwnerCleanup(store.getOwnerCleanup(parsed.ownerKey))
+    };
+  });
+
+  app.post("/sessions/owner/quiesce", async (request) => {
+    assertOwnerCleanupAuthentication(authToken);
+    const parsed = ownerSessionCleanupParamsZod.parse(request.body);
+    return await withOwnerCleanupLock(ownerCleanupTails, parsed.ownerKey, async () => {
+      const reservation = await store.reserveOwnerCleanup(
+        parsed.ownerKey,
+        parsed.operationKey,
+        parsed.sessionNames
+      );
+      const sessions = store.listSessionsByOwner(parsed.ownerKey);
+      try {
+        for (const session of sessions) {
+          await manager.quiesce({ name: session.name });
+        }
+      } catch (error) {
+        throw ownerCleanupIncomplete("quiesce", sessions.length, error);
+      }
+      return {
+        ok: true,
+        adopted: parsed.sessionNames.length,
+        quiesced: sessions.length,
+        sessions: store.listSessionsByOwner(parsed.ownerKey).map(ownerSessionSummary),
+        cleanup: publicOwnerCleanup(reservation)
+      };
+    });
+  });
+
+  app.post("/sessions/owner/purge", async (request) => {
+    assertOwnerCleanupAuthentication(authToken);
+    const parsed = ownerSessionCleanupParamsZod.parse(request.body);
+    return await withOwnerCleanupLock(ownerCleanupTails, parsed.ownerKey, async () => {
+      await store.reserveOwnerCleanup(
+        parsed.ownerKey,
+        parsed.operationKey,
+        parsed.sessionNames
+      );
+      await store.promoteOwnerCleanup(parsed.ownerKey, parsed.operationKey, "purging");
+      const sessions = store.listSessionsByOwner(parsed.ownerKey);
+      try {
+        for (const session of sessions) {
+          await manager.purge({ name: session.name });
+        }
+      } catch (error) {
+        throw ownerCleanupIncomplete("purge", sessions.length, error);
+      }
+      const remaining = store.listSessionsByOwner(parsed.ownerKey);
+      if (remaining.length > 0) {
+        throw ownerCleanupIncomplete("purge", sessions.length, undefined, remaining.length);
+      }
+      const reservation = await store.promoteOwnerCleanup(
+        parsed.ownerKey,
+        parsed.operationKey,
+        "purged"
+      );
+      return {
+        ok: true,
+        adopted: parsed.sessionNames.length,
+        purged: sessions.length,
+        sessions: [],
+        cleanup: publicOwnerCleanup(reservation)
+      };
+    });
+  });
+
   app.get("/skills", async () => ok(await manager.listSkills()));
 
   app.get("/session/:name", async (request) =>
@@ -425,12 +510,19 @@ export async function createDaemonServer(params: {
     )
   );
 
-  app.post("/session/start", async (request) =>
-    ok(await manager.start(startParamsZod.parse(request.body)))
-  );
+  app.post("/session/start", async (request) => {
+    const parsed = startParamsZod.parse(request.body);
+    if (parsed.ownerKey != null) {
+      assertOwnerCleanupAuthentication(authToken);
+    }
+    return ok(await manager.start(parsed));
+  });
 
   app.post("/session/start/stream", async (request, reply) => {
     const parsed = startParamsZod.parse(request.body);
+    if (parsed.ownerKey != null) {
+      assertOwnerCleanupAuthentication(authToken);
+    }
     return streamToolResult({
       reply,
       sessionName: parsed.name,
@@ -727,6 +819,13 @@ function daemonStatusForError(code: string): number {
       return 404;
     case "PROVIDER_AUTHENTICATION_REQUIRED":
       return 424;
+    case "DAEMON_AUTH_REQUIRED":
+    case "OWNER_CLEANUP_INCOMPLETE":
+      return 503;
+    case "OWNER_SCOPE_QUIESCED":
+    case "SESSION_OWNER_CONFLICT":
+    case "OWNER_CLEANUP_CONFLICT":
+    case "OWNER_ADOPTION_UNPROVEN":
     case "SESSION_QUIESCED":
     case "STALE_QUIESCENCE_EPOCH":
     case "LIFECYCLE_EPOCH_REQUIRED":
@@ -746,6 +845,87 @@ function daemonStatusForError(code: string): number {
       return 503;
     default:
       return 500;
+  }
+}
+
+function assertOwnerCleanupAuthentication(authToken: string): void {
+  if (authToken.length === 0) {
+    throw new PuppenclawError(
+      "DAEMON_AUTH_REQUIRED",
+      "Account-scoped cleanup requires daemon bearer authentication."
+    );
+  }
+}
+
+function ownerSessionSummary(session: {
+  name: string;
+  state: string;
+  lastActivity: string;
+  recoveryFence?: unknown;
+}): Record<string, unknown> {
+  return {
+    name: session.name,
+    state: session.state,
+    lastActivity: session.lastActivity,
+    recoveryRequired: session.recoveryFence != null
+  };
+}
+
+function publicOwnerCleanup(
+  reservation: {
+    epoch: number;
+    state: string;
+    updatedAt: string;
+  } | null
+): Record<string, unknown> | null {
+  return reservation == null
+    ? null
+    : {
+        epoch: reservation.epoch,
+        state: reservation.state,
+        updatedAt: reservation.updatedAt
+      };
+}
+
+function ownerCleanupIncomplete(
+  stage: "quiesce" | "purge",
+  matched: number,
+  cause?: unknown,
+  remaining?: number
+): PuppenclawError {
+  return new PuppenclawError(
+    "OWNER_CLEANUP_INCOMPLETE",
+    `Account-scoped ${stage} could not prove that every matched runner is terminal.`,
+    {
+      stage,
+      matched,
+      remaining: remaining ?? null,
+      recoveryRequired: true,
+      ...(cause instanceof PuppenclawError ? { causeCode: cause.code } : {})
+    }
+  );
+}
+
+async function withOwnerCleanupLock<T>(
+  tails: Map<string, Promise<void>>,
+  ownerKey: string,
+  run: () => Promise<T>
+): Promise<T> {
+  const previous = tails.get(ownerKey) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(async () => await gate);
+  tails.set(ownerKey, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await run();
+  } finally {
+    release();
+    if (tails.get(ownerKey) === tail) {
+      tails.delete(ownerKey);
+    }
   }
 }
 
@@ -771,7 +951,8 @@ function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unk
       "STALE_LIFECYCLE_EPOCH",
       "TURN_KEY_CONFLICT",
       "TURN_REPLAY_UNAVAILABLE",
-      "QUIESCENCE_UNAVAILABLE"
+      "QUIESCENCE_UNAVAILABLE",
+      "OWNER_CLEANUP_INCOMPLETE"
     ].includes(error.code) ||
     error.details == null
   ) {
@@ -787,7 +968,12 @@ function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unk
     "requestedEpoch",
     "activeEpoch",
     "latestEpoch",
-    "lastEpoch"
+    "lastEpoch",
+    "stage",
+    "matched",
+    "remaining",
+    "recoveryRequired",
+    "causeCode"
   ]) {
     const value = error.details[key];
     if (

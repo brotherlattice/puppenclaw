@@ -54,6 +54,7 @@ export function fingerprintStartRequest(params: StartParams): string {
     model: params.model ?? null,
     modelProviderId: params.modelProviderId ?? null,
     modelProvider: canonicalProvider(params.modelProvider),
+    ownerKey: params.ownerKey ?? null,
     contextFiles: (params.contextFiles ?? []).map((entry) => entry.trim()),
     skills: [...new Set((params.skills ?? []).map((entry) => entry.trim()))].sort()
   });

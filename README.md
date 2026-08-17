@@ -420,6 +420,28 @@ boundary and is deliberately absent from the OpenClaw plugin command and tool
 schemas. Capability discovery advertises these semantics under
 `sessionQuiescence.version: 2`.
 
+Account deletion can fence and clean every daemon session associated with an
+opaque owner selector. The selector is accepted only when daemon bearer
+authentication is configured and is never returned by session or cleanup
+responses. Supply the same 16–128 character `ownerKey` on each authenticated
+`POST /session/start` for the account. Then use
+`POST /sessions/owner/list` with `{ "ownerKey": "..." }`, followed by
+`POST /sessions/owner/quiesce` and `POST /sessions/owner/purge` with
+`{ "ownerKey": "...", "operationKey": "...", "sessionNames": [...] }`. Reuse
+one operation key for idempotent retries. `sessionNames` is an optional,
+authoritative backfill for sessions created before owner selectors existed: the
+daemon atomically binds only present, previously unowned sessions (or names it
+already bound to that owner), rejects conflicting ownership, and fails closed
+when absence cannot be proved by a durable prior binding. Owner claims survive
+purge so retries can prove that a named legacy session was already removed. The
+first cleanup call installs a durable account-wide creation fence; successful
+purge is reported only after no owned session remains. Ambiguous survivors
+return `OWNER_CLEANUP_INCOMPLETE` with
+`recoveryRequired: true` while retaining the fence. Sessions created by legacy
+callers without an owner selector remain unowned and must still be reconciled
+or purged individually. Capability discovery advertises this contract under
+`sessionOwnerCleanup.version: 1`.
+
 ## OpenClaw Usage Surfaces
 
 Puppenclaw exposes three main surfaces:

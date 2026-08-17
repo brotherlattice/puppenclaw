@@ -58,6 +58,7 @@ const nonEmptyString = z.string().trim().min(1);
 const idString = nonEmptyString.regex(/^[a-zA-Z0-9._:-]+$/u);
 const skillNameString = nonEmptyString.regex(/^[a-zA-Z0-9._-]+$/u);
 export const turnKeyZod = z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9._:-]+$/u);
+export const ownerKeyZod = z.string().trim().min(16).max(128).regex(/^[a-zA-Z0-9._:-]+$/u);
 
 export const agentKindZod = z.enum(["claude", "codex"]);
 export const backendZod = z.enum(["local", "daemon"]);
@@ -485,6 +486,7 @@ export const startParamsZod = z
     model: nonEmptyString.optional(),
     modelProviderId: skillNameString.optional(),
     modelProvider: modelProviderConfigZod.optional(),
+    ownerKey: ownerKeyZod.optional(),
     turnKey: turnKeyZod.optional(),
     lifecycleEpoch: z.number().int().positive().safe().optional(),
     contextFiles: z.array(nonEmptyString).default([]),
@@ -493,7 +495,26 @@ export const startParamsZod = z
   .strict();
 
 export const pluginStartParamsZod = startParamsZod
-  .omit({ permissionMode: true, interactionMode: true, lifecycleEpoch: true, turnKey: true })
+  .omit({
+    permissionMode: true,
+    interactionMode: true,
+    lifecycleEpoch: true,
+    ownerKey: true,
+    turnKey: true
+  })
+  .strict();
+
+export const ownerSessionListParamsZod = z
+  .object({
+    ownerKey: ownerKeyZod
+  })
+  .strict();
+
+export const ownerSessionCleanupParamsZod = ownerSessionListParamsZod
+  .extend({
+    operationKey: turnKeyZod,
+    sessionNames: z.array(nonEmptyString).max(1_000).default([])
+  })
   .strict();
 
 export const sendParamsZod = z

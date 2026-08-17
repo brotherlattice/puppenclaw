@@ -1614,6 +1614,15 @@ export class AcpxSessionManager implements ISessionManager {
             `Session ${params.name} already points at ${existing.directory}.`
           );
         }
+        if (
+          params.ownerKey != null &&
+          this.deps.store.getSessionOwner(params.name) !== params.ownerKey
+        ) {
+          throw new PuppenclawError(
+            "SESSION_OWNER_CONFLICT",
+            `Session ${params.name} belongs to a different account scope.`
+          );
+        }
       }
       const permissionModes =
         existing == null
@@ -1685,7 +1694,7 @@ export class AcpxSessionManager implements ISessionManager {
       };
       // Persist the identity before starting external runtime work. A cleanup
       // request racing an ambiguous start response can then fence this runtime.
-      await this.deps.store.upsertSession(provisionalSession);
+      await this.deps.store.upsertSession(provisionalSession, params.ownerKey);
       this.assertTurnWasNotStopped(params.name);
 
       try {
@@ -2410,6 +2419,10 @@ export class AcpxSessionManager implements ISessionManager {
     }
     if (source.modelProvider != null) {
       startParams.modelProvider = source.modelProvider;
+    }
+    const ownerKey = this.deps.store.getSessionOwner(source.name);
+    if (ownerKey != null) {
+      startParams.ownerKey = ownerKey;
     }
     await this.enterSessionTurnAfterLifecycleLock(params.target, undefined);
     return startParams;

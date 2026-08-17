@@ -36,6 +36,8 @@ import type {
   focusParamsZod,
   suspendParamsZod,
   modelProviderConfigZod,
+  ownerSessionCleanupParamsZod,
+  ownerSessionListParamsZod,
   runStateZod,
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -71,6 +73,8 @@ export type OrchestrationConfig = z.infer<typeof orchestrationConfigZod>;
 export type StartParams = Omit<z.infer<typeof startParamsZod>, "skills"> & {
   skills?: z.infer<typeof startParamsZod>["skills"];
 };
+export type OwnerSessionListParams = z.infer<typeof ownerSessionListParamsZod>;
+export type OwnerSessionCleanupParams = z.infer<typeof ownerSessionCleanupParamsZod>;
 export type SendParams = z.infer<typeof sendParamsZod>;
 export type StopParams = z.infer<typeof stopParamsZod>;
 export type QuiesceParams = z.infer<typeof quiesceParamsZod>;
@@ -362,6 +366,20 @@ export type SessionQuiescenceState = {
   latestByName: Record<string, number>;
 };
 
+export type OwnerCleanupLifecycleState = "quiesced" | "purging" | "purged";
+
+export type OwnerCleanupReservation = {
+  epoch: number;
+  operationKey: string;
+  state: OwnerCleanupLifecycleState;
+  updatedAt: string;
+};
+
+export type OwnerCleanupState = {
+  lastEpoch: number;
+  scopes: Record<string, OwnerCleanupReservation>;
+};
+
 export type ExposureRecord = {
   bindingId: string;
   conversation: ConversationScope;
@@ -478,6 +496,8 @@ export type StoredState = {
   turnGenerations: Record<string, number>;
   exposures: Record<string, ExposureRecord>;
   quiescence: SessionQuiescenceState;
+  sessionOwners: Record<string, string>;
+  ownerCleanup: OwnerCleanupState;
 };
 
 export type StateRecoveryStatus =

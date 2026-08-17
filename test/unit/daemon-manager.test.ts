@@ -144,6 +144,7 @@ describe("DaemonSessionManager", () => {
         sessionTurnIdempotency?: unknown;
         sessionModelProviderRefresh?: boolean;
         codexTurnPolicy?: unknown;
+        sessionOwnerCleanup?: unknown;
         sessionOutput?: boolean;
         sessionPurge?: boolean;
         sessionQuiesce?: boolean;
@@ -172,6 +173,14 @@ describe("DaemonSessionManager", () => {
         version: 1,
         serverControlled: true,
         userExecutionMarkersTrusted: false
+      });
+      expect(payload.sessionOwnerCleanup).toEqual({
+        version: 1,
+        authenticated: true,
+        opaqueOwnerKey: true,
+        durableFence: true,
+        authoritativeNameAdoption: true,
+        operations: ["list", "quiesce", "purge"]
       });
       expect(payload.sessionOutput).toBe(true);
       expect(payload.sessionPurge).toBe(true);
