@@ -1,3 +1,6 @@
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { createDaemonServer } from "../../src/daemon/server.js";
@@ -25,6 +28,56 @@ function storedSession(name: string, directory: string): SessionInfo {
 }
 
 describe("account-scoped daemon cleanup", () => {
+  it("hydrates owner defaults from pre-owner state and persists later mutations", async () => {
+    const dataDir = await createTempDir("puppenclaw-owner-legacy-upgrade-");
+    const legacyName = "legacy-before-owner-scopes";
+    await writeFile(
+      join(dataDir, "state.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          sessions: { [legacyName]: storedSession(legacyName, dataDir) },
+          turnRequests: {},
+          turnGenerations: {},
+          exposures: {},
+          quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+
+    let store = await SessionStore.open(dataDir);
+    try {
+      expect(store.getSessionOwner(legacyName)).toBeNull();
+      expect(store.listSessionsByOwner(OWNER_A)).toEqual([]);
+      expect(store.getOwnerCleanup(OWNER_A)).toBeNull();
+      await store.upsertSession(storedSession("owned-after-upgrade", dataDir), OWNER_A);
+    } finally {
+      await store.close();
+    }
+
+    store = await SessionStore.open(dataDir);
+    try {
+      expect(store.getSessionOwner(legacyName)).toBeNull();
+      expect(store.getSessionOwner("owned-after-upgrade")).toBe(OWNER_A);
+      await store.reserveOwnerCleanup(OWNER_B, "delete.account.b.legacy.0001");
+    } finally {
+      await store.close();
+    }
+
+    store = await SessionStore.open(dataDir);
+    try {
+      expect(store.getOwnerCleanup(OWNER_B)).toMatchObject({
+        operationKey: "delete.account.b.legacy.0001",
+        state: "quiesced"
+      });
+    } finally {
+      await store.close();
+    }
+  });
+
   it("serializes authoritative adoption against racing starts", async () => {
     const dataDir = await createTempDir("puppenclaw-owner-adopt-race-");
     const store = await SessionStore.open(dataDir);

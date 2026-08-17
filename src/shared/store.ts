@@ -1426,7 +1426,10 @@ async function loadStoredState(statePath: string): Promise<{
   const validated = storedStateZod.safeParse(compatibleState);
   if (validated.success) {
     return {
-      state: compatibleState as StoredState,
+      // Zod defaults are part of the compatible-state upgrade. Returning the
+      // unparsed input here would validate a legacy file successfully while
+      // leaving newly defaulted namespaces undefined in memory.
+      state: validated.data as StoredState,
       recovery: { required: false }
     };
   }
