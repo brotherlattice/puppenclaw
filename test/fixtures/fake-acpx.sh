@@ -244,7 +244,16 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
   else
     emit_json "{\"type\":\"usage_update\",\"used\":${#normalized_input},\"size\":4096,\"input_tokens\":${#normalized_input},\"output_tokens\":12,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3}"
   fi
-  if [[ "$normalized_input" == *"SECRET_ERROR"* ]]; then
+  if [[ "$normalized_input" == *"CLAUDE_OAUTH_EXPIRED"* ]]; then
+    emit_error "AUTHENTICATION_ERROR" "OAuth access token expired; run claude login again. token=must-not-survive"
+    exit 0
+  elif [[ "$normalized_input" == *"PROVIDER_CONNECTION_FAILED"* ]]; then
+    emit_error "CONNECTION_FAILED" "upstream connection reset"
+    exit 0
+  elif [[ "$normalized_input" == *"PROVIDER_RATE_LIMITED"* ]]; then
+    emit_json '{"type":"error","code":"RATE_LIMITED","message":"rate limit exceeded","retryable":true}'
+    exit 0
+  elif [[ "$normalized_input" == *"SECRET_ERROR"* ]]; then
     emit_error "SIM_SECRET" "authorization: Bearer bearer-secret at https://user:pass@example.test/path?token=query-secret OPENAI_API_KEY=sk-proj-rawsecret PUPPENCLAW_DAEMON_TOKEN=raw-token Incorrect API key provided: sk-proj-anotherraw"
     exit 0
   elif [[ "$normalized_input" == *"FAIL_TURN"* ]]; then

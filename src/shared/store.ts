@@ -69,7 +69,9 @@ const activeTurnZod = z
     outputChars: z.number().int().nonnegative(),
     exitCode: z.number().int().nullable().optional(),
     signal: z.string().nullable().optional(),
-    error: z.string().optional()
+    error: z.string().optional(),
+    failureCode: z.string().min(1).optional(),
+    retryable: z.boolean().optional()
   })
   .strict()
   .superRefine((turn, context) => {
@@ -212,6 +214,8 @@ const sessionInfoZod = z
     tokenUsage: tokenUsageZod.optional(),
     pendingQuestion: z.string().optional(),
     lastError: z.string().optional(),
+    failureCode: z.string().min(1).optional(),
+    retryable: z.boolean().optional(),
     warnings: z.array(z.string()),
     transcript: z.array(transcriptEntryZod),
     handle: z
@@ -238,6 +242,8 @@ const replaySessionZod = z
     lastActivity: persistedTimestampZod,
     pendingQuestion: z.string().optional(),
     lastError: z.string().optional(),
+    failureCode: z.string().min(1).optional(),
+    retryable: z.boolean().optional(),
     activeTurn: activeTurnZod.optional(),
     tokenUsage: tokenUsageZod.optional()
   })
@@ -306,6 +312,8 @@ const turnRequestOutcomeZod = z.discriminatedUnion("kind", [
       session: replaySessionZod,
       output: z.string().max(MAX_TURN_REPLAY_OUTPUT_CHARS),
       outputRole: z.enum(["assistant", "status"]),
+      failureCode: z.string().min(1).optional(),
+      retryable: z.boolean().optional(),
       turnSignals: turnSignalsZod.optional(),
       contextFiles: z.array(contextFileEntryZod.omit({ resolvedPath: true }).strict()),
       skills: z.array(installedSkillReceiptZod.pick({ name: true }).strict()).optional()
@@ -317,6 +325,7 @@ const turnRequestOutcomeZod = z.discriminatedUnion("kind", [
       version: z.literal(1),
       code: z.string().min(1),
       message: z.string(),
+      retryable: z.boolean().optional(),
       details: safeErrorDetailsZod.optional(),
       session: replaySessionZod.optional()
     })
@@ -1515,6 +1524,8 @@ function replaySessionSnapshot(
       ? { pendingQuestion: redactSensitiveText(session.pendingQuestion) }
       : {}),
     ...(session.lastError != null ? { lastError: redactSensitiveText(session.lastError) } : {}),
+    ...(session.failureCode != null ? { failureCode: session.failureCode } : {}),
+    ...(session.retryable != null ? { retryable: session.retryable } : {}),
     ...(session.activeTurn != null
       ? {
           activeTurn: {

@@ -170,6 +170,8 @@ export type ActiveTurnMetadata = {
   exitCode?: number | null;
   signal?: string | null;
   error?: string;
+  failureCode?: string;
+  retryable?: boolean;
 };
 
 export type SessionRecoveryFence = {
@@ -249,11 +251,15 @@ export type TurnRequestSuccessOutcome = {
     lastActivity: string;
     pendingQuestion?: string;
     lastError?: string;
+    failureCode?: string;
+    retryable?: boolean;
     activeTurn?: ActiveTurnMetadata;
     tokenUsage?: TokenUsage;
   };
   output: string;
   outputRole: TurnOutputRole;
+  failureCode?: string;
+  retryable?: boolean;
   turnSignals?: TurnSignals;
   contextFiles: Array<Omit<ContextFileEntry, "resolvedPath">>;
   skills?: Array<Pick<InstalledSkillReceipt, "name">>;
@@ -264,6 +270,7 @@ export type TurnRequestErrorOutcome = {
   kind: "error";
   code: string;
   message: string;
+  retryable?: boolean;
   details?: Record<string, string | number | boolean | null>;
   session?: TurnRequestSuccessOutcome["session"];
 };
@@ -315,6 +322,8 @@ export type SessionInfo = {
   tokenUsage?: TokenUsage;
   pendingQuestion?: string;
   lastError?: string;
+  failureCode?: string;
+  retryable?: boolean;
   warnings: string[];
   transcript: SessionTranscriptEntry[];
   handle?: AcpxSessionHandle;

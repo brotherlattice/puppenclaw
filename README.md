@@ -647,6 +647,8 @@ Examples:
 
 Use the orchestration surface first when the work is project-shaped. Use raw sessions when the operator explicitly wants direct ACP control.
 
+Session HTTP/SSE results expose provider failures without forwarding raw credential diagnostics. `PROVIDER_AUTHENTICATION_REQUIRED` is terminal and non-retryable until an operator refreshes the provider login; `PROVIDER_CONNECTION_FAILED` is retryable. The code and `retryable` flag are retained in session status, active-turn metadata, keyed turn receipts, and replayed results. `/capabilities` advertises this as `providerFailureContracts` version 1.
+
 ## ACP Verification
 
 Before blaming Puppenclaw, prove the ACP stack from the same `HOME` and `cwd`

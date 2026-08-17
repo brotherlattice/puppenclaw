@@ -12,6 +12,7 @@ import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
 import type { OutputRouter } from "../shared/output-router.js";
 import { killProcessTree, killProcessTreeWithEscalation } from "../shared/process-tree.js";
+import { classifyProviderFailure, type ProviderFailure } from "../shared/provider-failures.js";
 import {
   acceptedReasoningModes,
   reasoningProfileFor,
@@ -97,7 +98,48 @@ type TurnResult = {
   transcript: SessionTranscriptEntry[];
   state: SessionInfo["state"];
   signals?: TurnSignals;
+  failureCode?: string;
+  retryable?: boolean;
 };
+
+function normalizeProviderError(session: Pick<SessionInfo, "agent">, error: unknown): Error {
+  if (
+    error instanceof PuppenclawError &&
+    (error.code === "PROVIDER_AUTHENTICATION_REQUIRED" ||
+      error.code === "PROVIDER_CONNECTION_FAILED")
+  ) {
+    return error;
+  }
+  const source = ensureError(error);
+  const code =
+    error instanceof PuppenclawError
+      ? error.code
+      : typeof (error as NodeJS.ErrnoException | null)?.code === "string"
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+  const failure = classifyProviderFailure({
+    agent: session.agent,
+    ...(code != null ? { code } : {}),
+    message: source.message,
+    ...(error instanceof PuppenclawError && typeof error.details?.retryable === "boolean"
+      ? { retryable: error.details.retryable }
+      : {})
+  });
+  return failure == null
+    ? source
+    : new PuppenclawError(failure.code, failure.message, { retryable: failure.retryable });
+}
+
+function failedProviderTurn(failure: ProviderFailure): TurnResult {
+  return {
+    output: failure.message,
+    warnings: [],
+    transcript: [{ role: "status", text: failure.message, createdAt: nowIso() }],
+    state: "failed",
+    failureCode: failure.code,
+    retryable: failure.retryable
+  };
+}
 
 function outputRoleForTurn(turn: TurnResult): TurnOutputRole {
   return turn.state === "failed" ? "status" : "assistant";
@@ -127,6 +169,8 @@ function toolResultFromTurnOutcome(
       session: outcome.session,
       output: outcome.output,
       outputRole: outcome.outputRole,
+      ...(outcome.failureCode != null ? { failureCode: outcome.failureCode } : {}),
+      ...(outcome.retryable != null ? { retryable: outcome.retryable } : {}),
       ...(outcome.turnSignals != null ? { turnSignals: outcome.turnSignals } : {}),
       contextFiles: outcome.contextFiles,
       ...(outcome.skills != null ? { skills: outcome.skills } : {})
@@ -159,6 +203,9 @@ function durableTurnError(error: unknown): TurnRequestErrorOutcome {
     kind: "error",
     code: error instanceof PuppenclawError ? error.code : "TURN_EXECUTION_FAILED",
     message: sanitizeActiveTurnText(source.message),
+    ...(error instanceof PuppenclawError && typeof error.details?.retryable === "boolean"
+      ? { retryable: error.details.retryable }
+      : {}),
     ...(Object.keys(details).length > 0 ? { details } : {})
   };
 }
@@ -170,6 +217,7 @@ function throwDurableTurnError(
 ): never {
   throw new PuppenclawError(outcome.code, outcome.message, {
     ...outcome.details,
+    ...(outcome.retryable != null ? { retryable: outcome.retryable } : {}),
     turnReceipt: { turnKey, state }
   });
 }
@@ -1211,10 +1259,15 @@ function parsePromptEventLine(line: string): PromptEvent | null {
       }
       case "error": {
         const code = asOptionalString(structured.payload.code);
+        const retryable =
+          typeof structured.payload.retryable === "boolean"
+            ? structured.payload.retryable
+            : undefined;
         return {
           type: "error",
           message: asOptionalString(structured.payload.message) ?? "ACP runtime error",
-          ...(code != null ? { code } : {})
+          ...(code != null ? { code } : {}),
+          ...(retryable != null ? { retryable } : {})
         };
       }
       default: {
@@ -1683,7 +1736,13 @@ export class AcpxSessionManager implements ISessionManager {
             ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
           });
         } catch (error) {
-          const durableError = durableTurnError(error);
+          const normalizedError = normalizeProviderError(session, error);
+          const durableError = durableTurnError(normalizedError);
+          const retryable =
+            normalizedError instanceof PuppenclawError &&
+            typeof normalizedError.details?.retryable === "boolean"
+              ? normalizedError.details.retryable
+              : undefined;
           await this.persistFinalTurnSession(
             params.name,
             "failed",
@@ -1692,12 +1751,15 @@ export class AcpxSessionManager implements ISessionManager {
               state: "failed",
               lastActivity: nowIso(),
               lastError: durableError.message,
+              failureCode: durableError.code,
+              ...(retryable != null ? { retryable } : {}),
               ...(activeTurn != null ? { activeTurn } : {})
             }),
             durableError.message,
-            durableError
+            durableError,
+            { code: durableError.code, ...(retryable != null ? { retryable } : {}) }
           );
-          throw error;
+          throw normalizedError;
         }
         const nextSession = await this.persistFinalTurnSession(
           params.name,
@@ -1717,7 +1779,11 @@ export class AcpxSessionManager implements ISessionManager {
             ]),
             ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
             ...(turn.state === "failed"
-              ? { lastError: turn.output || current.lastError || "ACP turn failed." }
+              ? {
+                  lastError: turn.output || current.lastError || "ACP turn failed.",
+                  ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
+                  ...(turn.retryable != null ? { retryable: turn.retryable } : {})
+                }
               : {}),
             ...(turn.tokenUsage != null
               ? { tokenUsage: turn.tokenUsage }
@@ -1740,6 +1806,8 @@ export class AcpxSessionManager implements ISessionManager {
             summary: `Started session ${params.name}.`,
             output: turn.output,
             outputRole: outputRoleForTurn(turn),
+            ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
+            ...(turn.retryable != null ? { retryable: turn.retryable } : {}),
             ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
             contextFiles: context.files.map((file) => ({
               path: basename(file.path),
@@ -1747,18 +1815,24 @@ export class AcpxSessionManager implements ISessionManager {
               truncated: file.truncated
             })),
             skills: installedSkills.map(({ name }) => ({ name }))
-          }
+          },
+          turn.failureCode != null
+            ? { code: turn.failureCode, ...(turn.retryable != null ? { retryable: turn.retryable } : {}) }
+            : undefined
         );
         this.recordTurnUsage(nextSession, turn);
         return textToolResult(`Started session ${params.name}.`, {
           session: nextSession,
           output: turn.output,
           outputRole: outputRoleForTurn(turn),
+          ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
+          ...(turn.retryable != null ? { retryable: turn.retryable } : {}),
           ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
           contextFiles: context.files,
           skills: installedSkills
         });
       } catch (error) {
+        const normalizedError = normalizeProviderError(session, error);
         if (
           this.keyedTurnExecutions.get(params.name) == null &&
           this.deps.store.getActiveQuiescenceEpoch(params.name) == null
@@ -1771,11 +1845,19 @@ export class AcpxSessionManager implements ISessionManager {
               ...(current ?? provisionalSession),
               state: "failed",
               lastActivity: nowIso(),
-              lastError: ensureError(error).message
+              lastError: normalizedError.message,
+              ...(normalizedError instanceof PuppenclawError
+                ? {
+                    failureCode: normalizedError.code,
+                    ...(typeof normalizedError.details?.retryable === "boolean"
+                      ? { retryable: normalizedError.details.retryable }
+                      : {})
+                  }
+                : {})
             };
           });
         }
-        throw error;
+        throw normalizedError;
       }
   }
 
@@ -1809,18 +1891,39 @@ export class AcpxSessionManager implements ISessionManager {
         await this.ensureConnectedCapacity(params.name);
       }
       if (!this.usesOneShotRuntime(effectiveSession)) {
-        await this.ensureRuntimeSession({
-          name: effectiveSession.name,
-          agent: effectiveSession.agent,
-          directory: effectiveSession.directory,
-          ...(effectiveSession.model != null ? { model: effectiveSession.model } : {}),
-          ...(effectiveSession.runtimeEffort != null
-            ? { effort: effectiveSession.runtimeEffort }
-            : {}),
-          ...(effectiveSession.modelProvider != null
-            ? { modelProvider: effectiveSession.modelProvider }
-            : {})
-        });
+        try {
+          await this.ensureRuntimeSession({
+            name: effectiveSession.name,
+            agent: effectiveSession.agent,
+            directory: effectiveSession.directory,
+            ...(effectiveSession.model != null ? { model: effectiveSession.model } : {}),
+            ...(effectiveSession.runtimeEffort != null
+              ? { effort: effectiveSession.runtimeEffort }
+              : {}),
+            ...(effectiveSession.modelProvider != null
+              ? { modelProvider: effectiveSession.modelProvider }
+              : {})
+          });
+        } catch (error) {
+          const normalizedError = normalizeProviderError(effectiveSession, error);
+          if (normalizedError instanceof PuppenclawError) {
+            await this.deps.store.patchSession(params.name, (current) =>
+              current == null
+                ? null
+                : {
+                    ...current,
+                    state: "failed",
+                    lastActivity: nowIso(),
+                    lastError: normalizedError.message,
+                    failureCode: normalizedError.code,
+                    ...(typeof normalizedError.details?.retryable === "boolean"
+                      ? { retryable: normalizedError.details.retryable }
+                      : {})
+                  }
+            );
+          }
+          throw normalizedError;
+        }
       }
       const context = await loadContextFiles(session.directory, params.contextFiles);
       const prefix =
@@ -1856,7 +1959,13 @@ export class AcpxSessionManager implements ISessionManager {
           ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {})
         });
       } catch (error) {
-        const durableError = durableTurnError(error);
+        const normalizedError = normalizeProviderError(effectiveSession, error);
+        const durableError = durableTurnError(normalizedError);
+        const retryable =
+          normalizedError instanceof PuppenclawError &&
+          typeof normalizedError.details?.retryable === "boolean"
+            ? normalizedError.details.retryable
+            : undefined;
         await this.persistFinalTurnSession(
           params.name,
           "failed",
@@ -1865,12 +1974,15 @@ export class AcpxSessionManager implements ISessionManager {
             state: "failed",
             lastActivity: nowIso(),
             lastError: durableError.message,
+            failureCode: durableError.code,
+            ...(retryable != null ? { retryable } : {}),
             ...(activeTurn != null ? { activeTurn } : {})
           }),
           durableError.message,
-          durableError
+          durableError,
+          { code: durableError.code, ...(retryable != null ? { retryable } : {}) }
         );
-        throw error;
+        throw normalizedError;
       }
       const nextSession = await this.persistFinalTurnSession(
         params.name,
@@ -1894,7 +2006,11 @@ export class AcpxSessionManager implements ISessionManager {
           ]),
           ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
           ...(turn.state === "failed"
-            ? { lastError: turn.output || current.lastError || "ACP turn failed." }
+            ? {
+                lastError: turn.output || current.lastError || "ACP turn failed.",
+                ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
+                ...(turn.retryable != null ? { retryable: turn.retryable } : {})
+              }
             : {}),
           ...(turn.tokenUsage != null
             ? { tokenUsage: turn.tokenUsage }
@@ -1911,19 +2027,26 @@ export class AcpxSessionManager implements ISessionManager {
           summary: `Updated session ${params.name}.`,
           output: turn.output,
           outputRole: outputRoleForTurn(turn),
+          ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
+          ...(turn.retryable != null ? { retryable: turn.retryable } : {}),
           ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
           contextFiles: context.files.map((file) => ({
             path: basename(file.path),
             bytes: file.bytes,
             truncated: file.truncated
           }))
-        }
+        },
+        turn.failureCode != null
+          ? { code: turn.failureCode, ...(turn.retryable != null ? { retryable: turn.retryable } : {}) }
+          : undefined
       );
       this.recordTurnUsage(nextSession, turn);
       return textToolResult(`Updated session ${params.name}.`, {
         session: nextSession,
         output: turn.output,
         outputRole: outputRoleForTurn(turn),
+        ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
+        ...(turn.retryable != null ? { retryable: turn.retryable } : {}),
         ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
         contextFiles: context.files
       });
@@ -2918,6 +3041,9 @@ export class AcpxSessionManager implements ISessionManager {
           durableReceipt.outcome.message,
           {
             ...durableReceipt.outcome.details,
+            ...(durableReceipt.outcome.retryable != null
+              ? { retryable: durableReceipt.outcome.retryable }
+              : {}),
             turnReceipt: { turnKey: idempotency.turnKey, state: "accepted" }
           }
         );
@@ -2937,6 +3063,9 @@ export class AcpxSessionManager implements ISessionManager {
       if (receipt?.state === "settled" && receipt.outcome?.kind === "error") {
         thrownError = new PuppenclawError(receipt.outcome.code, receipt.outcome.message, {
           ...receipt.outcome.details,
+          ...(receipt.outcome.retryable != null
+            ? { retryable: receipt.outcome.retryable }
+            : {}),
           turnReceipt: { turnKey: idempotency.turnKey, state: "accepted" }
         });
       } else if (receipt?.state === "running") {
@@ -2961,7 +3090,11 @@ export class AcpxSessionManager implements ISessionManager {
                       state: "failed" as const,
                       updatedAt: failedAt,
                       completedAt: failedAt,
-                      error: outcome.message
+                      error: outcome.message,
+                      failureCode: outcome.code,
+                      ...((outcome.retryable ?? outcome.details?.retryable) != null
+                        ? { retryable: (outcome.retryable ?? outcome.details?.retryable) as boolean }
+                        : {})
                     }
                   : current.activeTurn;
               return {
@@ -2969,6 +3102,10 @@ export class AcpxSessionManager implements ISessionManager {
                 state: "failed",
                 lastActivity: failedAt,
                 lastError: outcome.message,
+                failureCode: outcome.code,
+                ...((outcome.retryable ?? outcome.details?.retryable) != null
+                  ? { retryable: (outcome.retryable ?? outcome.details?.retryable) as boolean }
+                  : {}),
                 ...(activeTurn != null ? { activeTurn } : {})
               };
             }
@@ -4695,7 +4832,10 @@ export class AcpxSessionManager implements ISessionManager {
 
     const exitCode = await exit.catch((error) => {
       this.completeActiveTurnOutput(params.session.name);
-      throw new PuppenclawError("ACP_TURN_FAILED", ensureError(error).message);
+      throw normalizeProviderError(
+        params.session,
+        new PuppenclawError("ACP_TURN_FAILED", ensureError(error).message)
+      );
     });
 
     const trailingLine = pendingStdout.trim();
@@ -4770,6 +4910,21 @@ export class AcpxSessionManager implements ISessionManager {
           ...(baselineMessageCount != null ? { baselineMessageCount } : {})
         });
       }
+      const reconnectFailure = classifyProviderFailure({
+        agent: params.session.agent,
+        code: "CONNECTION_FAILED",
+        message: safeReconnectText,
+        retryable: true
+      });
+      if (reconnectFailure != null) {
+        await this.deps.outputRouter.onError(
+          params.session.name,
+          new PuppenclawError(reconnectFailure.code, reconnectFailure.message),
+          { code: reconnectFailure.code, retryable: reconnectFailure.retryable }
+        );
+        this.completeActiveTurnOutput(params.session.name);
+        return failedProviderTurn(reconnectFailure);
+      }
       await this.deps.outputRouter.onError(params.session.name, new Error(safeReconnectText));
       this.completeActiveTurnOutput(params.session.name);
       return {
@@ -4790,7 +4945,25 @@ export class AcpxSessionManager implements ISessionManager {
       this.deps.logger.warn(
         `ACPX session ${params.session.name} returned error event: ${safeErrorMessage}`
       );
-      await this.deps.outputRouter.onError(params.session.name, new Error(safeErrorMessage));
+      const providerFailure = classifyProviderFailure({
+        agent: params.session.agent,
+        ...(errorEvent.code != null ? { code: errorEvent.code } : {}),
+        message: safeErrorMessage,
+        ...(errorEvent.retryable != null ? { retryable: errorEvent.retryable } : {})
+      });
+      if (providerFailure != null) {
+        await this.deps.outputRouter.onError(
+          params.session.name,
+          new PuppenclawError(providerFailure.code, providerFailure.message),
+          { code: providerFailure.code, retryable: providerFailure.retryable }
+        );
+        this.completeActiveTurnOutput(params.session.name);
+        return failedProviderTurn(providerFailure);
+      }
+      await this.deps.outputRouter.onError(params.session.name, new Error(safeErrorMessage), {
+        ...(errorEvent.code != null ? { code: errorEvent.code } : {}),
+        ...(errorEvent.retryable != null ? { retryable: errorEvent.retryable } : {})
+      });
       this.completeActiveTurnOutput(params.session.name);
       return {
         output: safeErrorMessage,
@@ -4812,6 +4985,19 @@ export class AcpxSessionManager implements ISessionManager {
       this.deps.logger.warn(
         `ACPX session ${params.session.name} exited with code ${exitCode ?? "unknown"}: ${message}`
       );
+      const providerFailure = classifyProviderFailure({
+        agent: params.session.agent,
+        message
+      });
+      if (providerFailure != null) {
+        await this.deps.outputRouter.onError(
+          params.session.name,
+          new PuppenclawError(providerFailure.code, providerFailure.message),
+          { code: providerFailure.code, retryable: providerFailure.retryable }
+        );
+        this.completeActiveTurnOutput(params.session.name);
+        return failedProviderTurn(providerFailure);
+      }
       await this.deps.outputRouter.onError(params.session.name, new Error(message));
       this.completeActiveTurnOutput(params.session.name);
       return {
@@ -4999,7 +5185,10 @@ export class AcpxSessionManager implements ISessionManager {
     const exitCode = await exit.catch((error) => {
       this.setActiveTurnOutput(params.session.name, `\n[error] ${ensureError(error).message}\n`);
       this.completeActiveTurnOutput(params.session.name);
-      throw new PuppenclawError("CODEX_TURN_FAILED", ensureError(error).message);
+      throw normalizeProviderError(
+        params.session,
+        new PuppenclawError("CODEX_TURN_FAILED", ensureError(error).message)
+      );
     });
 
     const trailingStdoutLine = pendingStdout.trim();
@@ -5025,6 +5214,19 @@ export class AcpxSessionManager implements ISessionManager {
         .filter((part) => part.trim().length > 0)
         .join("\n");
       this.setActiveTurnOutput(params.session.name, failureOutput);
+      const providerFailure = classifyProviderFailure({
+        agent: params.session.agent,
+        message
+      });
+      if (providerFailure != null) {
+        await this.deps.outputRouter.onError(
+          params.session.name,
+          new PuppenclawError(providerFailure.code, providerFailure.message),
+          { code: providerFailure.code, retryable: providerFailure.retryable }
+        );
+        this.completeActiveTurnOutput(params.session.name);
+        return failedProviderTurn(providerFailure);
+      }
       await this.deps.outputRouter.onError(params.session.name, new Error(message));
       this.completeActiveTurnOutput(params.session.name);
       return {
@@ -5084,8 +5286,14 @@ export class AcpxSessionManager implements ISessionManager {
     const keyedExecution = this.keyedTurnExecutions.get(sessionName);
     const buildSession = (stored: SessionInfo | null): SessionInfo => {
       const current = stored ?? session;
+      const {
+        lastError: _lastError,
+        failureCode: _failureCode,
+        retryable: _retryable,
+        ...healthy
+      } = current;
       return {
-        ...current,
+        ...healthy,
         state: "running",
         lastActivity: now,
         activeTurn: {
@@ -5273,7 +5481,8 @@ export class AcpxSessionManager implements ISessionManager {
       stoppedDuringTurn: boolean
     ) => SessionInfo,
     error?: string,
-    receiptOutcome?: Omit<TurnRequestSuccessOutcome, "session"> | TurnRequestErrorOutcome
+    receiptOutcome?: Omit<TurnRequestSuccessOutcome, "session"> | TurnRequestErrorOutcome,
+    failureMetadata?: { code: string; retryable?: boolean }
   ): Promise<SessionInfo> {
     this.checkpointActiveTurnOutput(sessionName, true);
     await this.activeTurnPersistence.get(sessionName)?.catch(() => undefined);
@@ -5292,10 +5501,27 @@ export class AcpxSessionManager implements ISessionManager {
               state: finalLifecycleState,
               updatedAt: completedAt,
               completedAt,
-              ...(error != null && error.trim().length > 0 ? { error } : {})
+              ...(error != null && error.trim().length > 0 ? { error } : {}),
+              ...(failureMetadata != null
+                ? {
+                    failureCode: failureMetadata.code,
+                    ...(failureMetadata.retryable != null
+                      ? { retryable: failureMetadata.retryable }
+                      : {})
+                  }
+                : {})
             }
           : current.activeTurn;
-      const built = buildSession(current, activeTurn, stoppedDuringTurn);
+      let built = buildSession(current, activeTurn, stoppedDuringTurn);
+      if (!stoppedDuringTurn && built.state !== "failed") {
+        const {
+          lastError: _lastError,
+          failureCode: _failureCode,
+          retryable: _retryable,
+          ...healthy
+        } = built;
+        built = healthy;
+      }
       if (!stoppedDuringTurn) {
         return built;
       }

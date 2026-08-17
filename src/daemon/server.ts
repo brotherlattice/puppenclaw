@@ -246,6 +246,12 @@ export async function createDaemonServer(params: {
     },
     structuredTurnSignals: true,
     structuredOutputEvents: true,
+    providerFailureContracts: {
+      version: 1,
+      codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED"],
+      retryability: true,
+      durableReplay: true
+    },
     sessionOutput: true,
     sessionPurge: true,
     sessionPurgeTransientFencing: true,
@@ -719,6 +725,8 @@ function daemonStatusForError(code: string): number {
       return 400;
     case "NO_SESSION":
       return 404;
+    case "PROVIDER_AUTHENTICATION_REQUIRED":
+      return 424;
     case "SESSION_QUIESCED":
     case "STALE_QUIESCENCE_EPOCH":
     case "LIFECYCLE_EPOCH_REQUIRED":
@@ -733,6 +741,7 @@ function daemonStatusForError(code: string): number {
       return 409;
     case "QUIESCENCE_UNAVAILABLE":
     case "ACP_CONTROL_TIMEOUT":
+    case "PROVIDER_CONNECTION_FAILED":
     case "STATE_RECOVERY_REQUIRED":
       return 503;
     default:
@@ -742,6 +751,17 @@ function daemonStatusForError(code: string): number {
 
 function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unknown> | null {
   const turnReceipt = parseTurnReceipt(error.details?.turnReceipt);
+  if (
+    error.code === "PROVIDER_AUTHENTICATION_REQUIRED" ||
+    error.code === "PROVIDER_CONNECTION_FAILED"
+  ) {
+    return {
+      ...(typeof error.details?.retryable === "boolean"
+        ? { retryable: error.details.retryable }
+        : {}),
+      ...(turnReceipt != null ? { turnReceipt } : {})
+    };
+  }
   if (
     ![
       "NO_SESSION",
@@ -859,6 +879,9 @@ async function streamToolResult(params: {
       sessionName: params.sessionName,
       text: message,
       ...(error instanceof PuppenclawError ? { code: error.code } : {}),
+      ...(error instanceof PuppenclawError && typeof error.details?.retryable === "boolean"
+        ? { retryable: error.details.retryable }
+        : {}),
       ...(lifecycleDetails != null ? { details: lifecycleDetails } : {})
     });
     write({ kind: "done" });
