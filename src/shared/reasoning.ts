@@ -11,7 +11,7 @@ export const REASONING_MODE_VALUES = [
 ] as const;
 
 export type ReasoningMode = (typeof REASONING_MODE_VALUES)[number];
-export type ReasoningProfile = "claude" | "codex" | "glm-5.2" | "qwen-3.6";
+export type ReasoningProfile = "claude" | "codex" | "glm-5.2" | "qwen-3.6" | "qwen-3.8";
 export type EffectiveReasoningMode = ReasoningMode;
 
 type ReasoningSubject = {
@@ -49,6 +49,7 @@ const CODEX_MODES = new Set<ReasoningMode>([
 ]);
 const GLM_52_MODES = new Set<ReasoningMode>(REASONING_MODE_VALUES);
 const QWEN_36_MODES = new Set<ReasoningMode>(REASONING_MODE_VALUES);
+const QWEN_38_MODES = new Set<ReasoningMode>(REASONING_MODE_VALUES);
 
 export const REASONING_CAPABILITIES = {
   version: 1,
@@ -88,6 +89,28 @@ export const REASONING_CAPABILITIES = {
         { id: "ultra", label: "Ultra", kind: "effort" }
       ],
       aliases: []
+    },
+    {
+      id: "qwen-3.8",
+      label: "Qwen 3.8",
+      modes: [
+        { id: "low", label: "Low", kind: "effort" },
+        { id: "medium", label: "Medium", kind: "effort" },
+        {
+          id: "xhigh",
+          label: "XHigh",
+          kind: "effort",
+          description: "The Qwen 3.8 server's default and deepest reasoning tier."
+        }
+      ],
+      aliases: [
+        { id: "none", effective: "low" },
+        { id: "minimal", effective: "low" },
+        { id: "high", effective: "xhigh" },
+        { id: "max", effective: "xhigh" },
+        { id: "ultra", effective: "xhigh" },
+        { id: "ultracode", effective: "xhigh" }
+      ]
     },
     {
       id: "qwen-3.6",
@@ -165,6 +188,13 @@ function looksLikeQwen36(model: string | undefined): boolean {
   return /(?:^|[^a-z0-9])qwen[_.-]?3[_.-]?6(?=$|[^a-z0-9])/iu.test(model.trim());
 }
 
+function looksLikeQwen38(model: string | undefined): boolean {
+  if (model == null) {
+    return false;
+  }
+  return /(?:^|[^a-z0-9])qwen[_.-]?3[_.-]?8(?=$|[^a-z0-9])/iu.test(model.trim());
+}
+
 export function reasoningProfileFor(subject: ReasoningSubject): ReasoningProfile {
   if (subject.modelProvider?.reasoningProfile != null) {
     return subject.modelProvider.reasoningProfile;
@@ -174,6 +204,9 @@ export function reasoningProfileFor(subject: ReasoningSubject): ReasoningProfile
   }
   if (looksLikeQwen36(subject.modelProvider?.model ?? subject.model)) {
     return "qwen-3.6";
+  }
+  if (looksLikeQwen38(subject.modelProvider?.model ?? subject.model)) {
+    return "qwen-3.8";
   }
   return subject.agent;
 }
@@ -187,6 +220,9 @@ function modesForProfile(profile: ReasoningProfile): Set<ReasoningMode> {
   }
   if (profile === "qwen-3.6") {
     return QWEN_36_MODES;
+  }
+  if (profile === "qwen-3.8") {
+    return QWEN_38_MODES;
   }
   return GLM_52_MODES;
 }
@@ -231,6 +267,26 @@ export function resolveReasoningMode(
       ...(requested !== effective
         ? {
             warning: `GLM-5.2 reasoning mode "${requested}" maps to its effective "${effective}" tier.`
+          }
+        : {})
+    };
+  }
+
+  if (profile === "qwen-3.8") {
+    const effective =
+      requested === "none" || requested === "minimal" || requested === "low"
+        ? "low"
+        : requested === "medium"
+          ? "medium"
+          : "xhigh";
+    return {
+      profile,
+      requested,
+      effective,
+      runtimeValue: effective,
+      ...(requested !== effective
+        ? {
+            warning: `Qwen 3.8 reasoning mode "${requested}" maps to its effective "${effective}" tier.`
           }
         : {})
     };

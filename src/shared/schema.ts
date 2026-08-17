@@ -76,7 +76,7 @@ export const modelProviderConfigZod = z
     label: nonEmptyString.optional(),
     kind: z.enum(["claude-code", "codex-openai", "codex-openai-compatible"]).optional(),
     model: nonEmptyString,
-    reasoningProfile: z.enum(["claude", "codex", "glm-5.2", "qwen-3.6"]).optional(),
+    reasoningProfile: z.enum(["claude", "codex", "glm-5.2", "qwen-3.6", "qwen-3.8"]).optional(),
     baseUrl: nonEmptyString.optional(),
     authTokenEnv: nonEmptyString.optional(),
     wireApi: z.enum(["responses"]).optional()
@@ -897,7 +897,8 @@ export const toolStartSchema = Type.Object({
           Type.Literal("claude"),
           Type.Literal("codex"),
           Type.Literal("glm-5.2"),
-          Type.Literal("qwen-3.6")
+          Type.Literal("qwen-3.6"),
+          Type.Literal("qwen-3.8")
         ])
       ),
       baseUrl: Type.Optional(Type.String({ minLength: 1 })),

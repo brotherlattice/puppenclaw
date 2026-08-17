@@ -207,7 +207,7 @@ const sessionInfoZod = z
     effort: effortLevelZod.optional(),
     effectiveEffort: effortLevelZod.optional(),
     runtimeEffort: effortLevelZod.optional(),
-    reasoningProfile: z.enum(["claude", "codex", "glm-5.2", "qwen-3.6"]).optional(),
+    reasoningProfile: z.enum(["claude", "codex", "glm-5.2", "qwen-3.6", "qwen-3.8"]).optional(),
     planningProfile: planningProfileZod.optional(),
     model: z.string().min(1).optional(),
     modelProviderId: z.string().min(1).optional(),
