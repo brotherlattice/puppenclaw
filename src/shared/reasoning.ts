@@ -11,7 +11,7 @@ export const REASONING_MODE_VALUES = [
 ] as const;
 
 export type ReasoningMode = (typeof REASONING_MODE_VALUES)[number];
-export type ReasoningProfile = "claude" | "codex" | "glm-5.2";
+export type ReasoningProfile = "claude" | "codex" | "glm-5.2" | "qwen-3.6";
 export type EffectiveReasoningMode = ReasoningMode;
 
 type ReasoningSubject = {
@@ -48,6 +48,7 @@ const CODEX_MODES = new Set<ReasoningMode>([
   "ultra"
 ]);
 const GLM_52_MODES = new Set<ReasoningMode>(REASONING_MODE_VALUES);
+const QWEN_36_MODES = new Set<ReasoningMode>(REASONING_MODE_VALUES);
 
 export const REASONING_CAPABILITIES = {
   version: 1,
@@ -87,6 +88,33 @@ export const REASONING_CAPABILITIES = {
         { id: "ultra", label: "Ultra", kind: "effort" }
       ],
       aliases: []
+    },
+    {
+      id: "qwen-3.6",
+      label: "Qwen 3.6",
+      modes: [
+        {
+          id: "minimal",
+          label: "Minimal",
+          kind: "effort",
+          description: "Minimal reasoning for the fastest responses."
+        },
+        { id: "low", label: "Low", kind: "effort" },
+        { id: "medium", label: "Medium", kind: "effort" },
+        { id: "high", label: "High", kind: "effort" },
+        { id: "xhigh", label: "XHigh", kind: "effort" },
+        {
+          id: "max",
+          label: "Max",
+          kind: "effort",
+          description: "Maximum reasoning depth supported by the Qwen server."
+        }
+      ],
+      aliases: [
+        { id: "none", effective: "minimal" },
+        { id: "ultra", effective: "max" },
+        { id: "ultracode", effective: "max" }
+      ]
     },
     {
       id: "glm-5.2",
@@ -130,6 +158,13 @@ function looksLikeGlm52(model: string | undefined): boolean {
   return /(?:^|[^a-z0-9])glm[_.-]?5[_.-]?2(?=$|[^a-z0-9])/iu.test(model.trim());
 }
 
+function looksLikeQwen36(model: string | undefined): boolean {
+  if (model == null) {
+    return false;
+  }
+  return /(?:^|[^a-z0-9])qwen[_.-]?3[_.-]?6(?=$|[^a-z0-9])/iu.test(model.trim());
+}
+
 export function reasoningProfileFor(subject: ReasoningSubject): ReasoningProfile {
   if (subject.modelProvider?.reasoningProfile != null) {
     return subject.modelProvider.reasoningProfile;
@@ -137,12 +172,27 @@ export function reasoningProfileFor(subject: ReasoningSubject): ReasoningProfile
   if (looksLikeGlm52(subject.modelProvider?.model ?? subject.model)) {
     return "glm-5.2";
   }
+  if (looksLikeQwen36(subject.modelProvider?.model ?? subject.model)) {
+    return "qwen-3.6";
+  }
   return subject.agent;
 }
 
+function modesForProfile(profile: ReasoningProfile): Set<ReasoningMode> {
+  if (profile === "claude") {
+    return CLAUDE_MODES;
+  }
+  if (profile === "codex") {
+    return CODEX_MODES;
+  }
+  if (profile === "qwen-3.6") {
+    return QWEN_36_MODES;
+  }
+  return GLM_52_MODES;
+}
+
 export function acceptedReasoningModes(profile: ReasoningProfile): ReasoningMode[] {
-  const modes =
-    profile === "claude" ? CLAUDE_MODES : profile === "codex" ? CODEX_MODES : GLM_52_MODES;
+  const modes = modesForProfile(profile);
   return REASONING_MODE_VALUES.filter((mode) => modes.has(mode));
 }
 
@@ -151,8 +201,7 @@ export function resolveReasoningMode(
   requested: ReasoningMode
 ): ReasoningResolution | null {
   const profile = reasoningProfileFor(subject);
-  const accepted =
-    profile === "claude" ? CLAUDE_MODES : profile === "codex" ? CODEX_MODES : GLM_52_MODES;
+  const accepted = modesForProfile(profile);
   if (!accepted.has(requested)) {
     return null;
   }
@@ -182,6 +231,26 @@ export function resolveReasoningMode(
       ...(requested !== effective
         ? {
             warning: `GLM-5.2 reasoning mode "${requested}" maps to its effective "${effective}" tier.`
+          }
+        : {})
+    };
+  }
+
+  if (profile === "qwen-3.6") {
+    const effective =
+      requested === "none"
+        ? "minimal"
+        : requested === "ultra" || requested === "ultracode"
+          ? "max"
+          : requested;
+    return {
+      profile,
+      requested,
+      effective,
+      runtimeValue: effective,
+      ...(requested !== effective
+        ? {
+            warning: `Qwen 3.6 reasoning mode "${requested}" maps to its effective "${effective}" tier.`
           }
         : {})
     };

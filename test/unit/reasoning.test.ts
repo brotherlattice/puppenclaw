@@ -114,6 +114,10 @@ describe("reasoning profiles", () => {
     [
       "glm-5.2",
       ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]
+    ],
+    [
+      "qwen-3.6",
+      ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]
     ]
   ] satisfies Array<[ReasoningProfile, ReasoningMode[]]>) (
     "advertises only accepted %s modes",
@@ -121,4 +125,76 @@ describe("reasoning profiles", () => {
       expect(acceptedReasoningModes(profile)).toEqual(expected);
     }
   );
+
+  it.each([
+    "Qwen/Qwen3.6-27B-FP8",
+    "qwen3.6",
+    "QWEN-3-6",
+    "local/qwen_3_6-instruct"
+  ])("detects Qwen 3.6 from model name %s", (model) => {
+    expect(reasoningProfileFor({ agent: "codex", model })).toBe("qwen-3.6");
+  });
+
+  it("does not detect other Qwen generations as the Qwen 3.6 profile", () => {
+    expect(
+      reasoningProfileFor({ agent: "codex", model: "Qwen/Qwen3-Coder-30B" })
+    ).toBe("codex");
+    expect(
+      reasoningProfileFor({ agent: "codex", model: "qwen35-coder-composite" })
+    ).toBe("codex");
+  });
+
+  it.each([
+    ["none", "minimal"],
+    ["minimal", "minimal"],
+    ["low", "low"],
+    ["medium", "medium"],
+    ["high", "high"],
+    ["xhigh", "xhigh"],
+    ["max", "max"],
+    ["ultra", "max"],
+    ["ultracode", "max"]
+  ] as const)("maps Qwen 3.6 %s to its effective %s tier", (requested, effective) => {
+    const resolution = resolveReasoningMode(
+      {
+        agent: "codex",
+        modelProvider: {
+          model: "Qwen/Qwen3.6-27B-FP8",
+          reasoningProfile: "qwen-3.6"
+        }
+      },
+      requested
+    );
+
+    expect(resolution).toMatchObject({
+      profile: "qwen-3.6",
+      requested,
+      effective,
+      runtimeValue: effective
+    });
+    if (requested === effective) {
+      expect(resolution?.warning).toBeUndefined();
+    } else {
+      expect(resolution?.warning).toContain(`maps to its effective "${effective}" tier`);
+    }
+  });
+
+  it("advertises the six selectable Qwen 3.6 effort modes", () => {
+    const qwen = REASONING_CAPABILITIES.profiles.find(
+      (profile) => profile.id === "qwen-3.6"
+    );
+    expect(qwen?.modes.map((mode) => mode.id)).toEqual([
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]);
+    expect(qwen?.aliases.map((alias) => alias.id)).toEqual([
+      "none",
+      "ultra",
+      "ultracode"
+    ]);
+  });
 });
