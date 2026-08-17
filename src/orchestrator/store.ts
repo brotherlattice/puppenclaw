@@ -131,6 +131,70 @@ export class OrchestratorStore {
       .run(campaign.id, campaign.projectId, JSON.stringify(campaign));
   }
 
+  resumeCampaignApproval(
+    campaignId: string,
+    resumedAt: string
+  ): { campaign: CampaignSpecRecord; approvedStepId: string } | null {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const campaign = this.getCampaign(campaignId);
+      if (campaign?.state !== "waiting_approval" || campaign.waitingApprovalStepId == null) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      const approvedStepId = campaign.waitingApprovalStepId;
+      const resumed: CampaignSpecRecord = {
+        ...campaign,
+        state: "running",
+        lastProgressAt: resumedAt,
+        updatedAt: resumedAt
+      };
+      delete resumed.waitingApprovalStepId;
+      this.upsertCampaign(resumed);
+      this.db.exec("COMMIT");
+      return { campaign: resumed, approvedStepId };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  beginCampaignCancellation(
+    campaignId: string,
+    cancellingAt: string
+  ): CampaignSpecRecord | null {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const campaign = this.getCampaign(campaignId);
+      if (campaign == null) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      if (
+        ["completed", "failed", "cancelled", "cancelling", "recovery_required"].includes(
+          campaign.state
+        )
+      ) {
+        this.db.exec("COMMIT");
+        return campaign;
+      }
+      const cancelling: CampaignSpecRecord = {
+        ...campaign,
+        state: "cancelling",
+        failureCode: "CAMPAIGN_CANCELLING",
+        lastProgressAt: cancellingAt,
+        updatedAt: cancellingAt
+      };
+      delete cancelling.waitingApprovalStepId;
+      this.upsertCampaign(cancelling);
+      this.db.exec("COMMIT");
+      return cancelling;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   finalizeCampaignCancellation(campaignId: string, cancelledAt: string): CampaignSpecRecord | null {
     this.db.exec("BEGIN IMMEDIATE");
     try {

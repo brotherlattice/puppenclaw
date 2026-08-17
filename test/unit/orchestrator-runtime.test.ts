@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
 import { OrchestratorRuntime } from "../../src/orchestrator/runtime.js";
@@ -408,6 +408,116 @@ describe("OrchestratorRuntime", () => {
       } catch {
         // The cancellation escalation normally terminated it already.
       }
+    }
+  });
+
+  it("keeps approval and cancellation monotonic in both orderings", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-orch-approval-cancel-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const sessionStore = await SessionStore.open(workspaceDir);
+    const config = makeConfig({ acpxCommand });
+    const manager = new AcpxSessionManager({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      store: sessionStore,
+      outputRouter: new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} })
+    });
+    const store = await OrchestratorStore.open(join(workspaceDir, ".orchestrator"));
+    const runtime = new OrchestratorRuntime({
+      config,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      sessionStore,
+      store,
+      sessionManager: manager
+    });
+    const startSpy = vi.spyOn(manager, "start");
+    await runtime.createProject({ name: "approval-cancel-project", rootDir: workspaceDir });
+
+    const startWaitingCampaign = async (name: string): Promise<string> => {
+      const result = await runtime.runCampaign({
+        projectId: "approval-cancel-project",
+        workerId: "local",
+        name,
+        template: "custom",
+        experimentCommands: [],
+        experimentParallelism: 1,
+        iterations: 1,
+        steps: [
+          {
+            title: "Approved launch",
+            kind: "plan",
+            executor: "acp",
+            instruction: "Do not launch after cancellation.",
+            approvalRequired: true,
+            contextFiles: [],
+            env: {},
+            retryLimit: 0
+          }
+        ]
+      });
+      const campaign = (result.details as { campaign: { id: string; state: string } }).campaign;
+      expect(campaign.state).toBe("waiting_approval");
+      return campaign.id;
+    };
+
+    try {
+      const cancelledFirstId = await startWaitingCampaign("cancel-before-approval");
+      const cancelledFirst = await runtime.cancel({ campaignId: cancelledFirstId });
+      expect(
+        (cancelledFirst.details as { campaign: { state: string } }).campaign.state
+      ).toBe("cancelled");
+      await expect(runtime.approve({ campaignId: cancelledFirstId })).rejects.toMatchObject({
+        code: "CAMPAIGN_NOT_WAITING_APPROVAL"
+      });
+      expect(startSpy).not.toHaveBeenCalled();
+
+      const approvedFirstId = await startWaitingCampaign("approval-before-cancel");
+      let releasePrompt: () => void = () => {};
+      const promptGate = new Promise<void>((resolveGate) => {
+        releasePrompt = resolveGate;
+      });
+      let signalPromptEntered: () => void = () => {};
+      const promptEntered = new Promise<void>((resolveEntered) => {
+        signalPromptEntered = resolveEntered;
+      });
+      const runtimeInternals = runtime as unknown as {
+        buildStepPrompt: (...args: unknown[]) => Promise<string>;
+      };
+      const originalBuildStepPrompt = runtimeInternals.buildStepPrompt.bind(runtime);
+      runtimeInternals.buildStepPrompt = async (...args: unknown[]) => {
+        signalPromptEntered();
+        await promptGate;
+        return originalBuildStepPrompt(...args);
+      };
+
+      const approval = runtime.approve({ campaignId: approvedFirstId });
+      await promptEntered;
+      expect(store.getCampaign(approvedFirstId)?.state).toBe("running");
+      const cancellation = runtime.cancel({ campaignId: approvedFirstId });
+      const cancellingDeadline = Date.now() + 1_000;
+      while (
+        store.getCampaign(approvedFirstId)?.state !== "cancelling" &&
+        Date.now() < cancellingDeadline
+      ) {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 5));
+      }
+      expect(store.getCampaign(approvedFirstId)?.state).toBe("cancelling");
+      expect(startSpy).not.toHaveBeenCalled();
+      releasePrompt();
+
+      const [approvalResult, cancellationResult] = await Promise.all([approval, cancellation]);
+      expect(
+        (approvalResult.details as { campaign: { state: string } }).campaign.state
+      ).toBe("cancelled");
+      expect(
+        (cancellationResult.details as { campaign: { state: string } }).campaign.state
+      ).toBe("cancelled");
+      expect(store.getCampaign(approvedFirstId)?.state).toBe("cancelled");
+      expect(store.listRuns(approvedFirstId)).toMatchObject([{ state: "cancelled" }]);
+      expect(startSpy).not.toHaveBeenCalled();
+    } finally {
+      store.close();
+      await sessionStore.close();
     }
   });
 

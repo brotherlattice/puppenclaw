@@ -806,30 +806,26 @@ export class OrchestratorRuntime implements IOrchestrator {
 
   async approve(params: CampaignActionParams): Promise<ToolResult> {
     await this.prepareRuntime();
-    const campaign = this.requireCampaign(params.campaignId);
-    if (campaign.state !== "waiting_approval" || campaign.waitingApprovalStepId == null) {
+    const resumed = this.deps.store.resumeCampaignApproval(params.campaignId, nowIso());
+    if (resumed == null) {
+      if (this.deps.store.getCampaign(params.campaignId) == null) {
+        throw new PuppenclawError("UNKNOWN_CAMPAIGN", `Unknown campaign ${params.campaignId}.`);
+      }
       throw new PuppenclawError(
         "CAMPAIGN_NOT_WAITING_APPROVAL",
-        `Campaign ${campaign.id} is not waiting for approval.`
+        `Campaign ${params.campaignId} is not waiting for approval.`
       );
     }
-    const approvedStepId = campaign.waitingApprovalStepId;
-    const resumedAt = nowIso();
-    const resumed: CampaignSpecRecord = {
-      ...campaign,
-      state: "running",
-      lastProgressAt: resumedAt,
-      updatedAt: resumedAt
-    };
-    delete resumed.waitingApprovalStepId;
-    this.deps.store.upsertCampaign(resumed);
-    const snapshot = await this.driveCampaign(resumed, approvedStepId);
+    const snapshot = await this.driveCampaign(resumed.campaign, resumed.approvedStepId);
     return textToolResult(`Approved campaign ${snapshot.campaign.name}.`, snapshot);
   }
 
   async cancel(params: CampaignActionParams): Promise<ToolResult> {
     await this.prepareRuntime();
-    let campaign = this.requireCampaign(params.campaignId);
+    const campaign = this.deps.store.beginCampaignCancellation(params.campaignId, nowIso());
+    if (campaign == null) {
+      throw new PuppenclawError("UNKNOWN_CAMPAIGN", `Unknown campaign ${params.campaignId}.`);
+    }
     if (["completed", "failed", "cancelled"].includes(campaign.state)) {
       return textToolResult(`Campaign ${campaign.name} is already ${campaign.state}.`, {
         campaign
@@ -840,18 +836,6 @@ export class OrchestratorRuntime implements IOrchestrator {
         campaign,
         recoveryRequired: true
       });
-    }
-    if (campaign.state !== "cancelling") {
-      const cancellingAt = nowIso();
-      campaign = {
-        ...campaign,
-        state: "cancelling",
-        failureCode: "CAMPAIGN_CANCELLING",
-        lastProgressAt: cancellingAt,
-        updatedAt: cancellingAt
-      };
-      delete campaign.waitingApprovalStepId;
-      this.deps.store.upsertCampaign(campaign);
     }
 
     const terminationChecks: Array<Promise<boolean>> = [];
@@ -2912,6 +2896,7 @@ export class OrchestratorRuntime implements IOrchestrator {
       : campaign.acpSessionName ?? `${slug(campaign.name)}-${campaign.id.slice(-8)}`;
     const selectedAgent = step.agent ?? project.defaultAgent ?? this.deps.config.defaultAgent;
     const prompt = await this.buildStepPrompt(project, campaign, step, selectedAgent);
+    this.assertCampaignLaunchable(campaign.id);
     const startFresh = sessionScope === "step" || campaign.acpSessionName == null;
     const storedRun = this.deps.store.getRun(runId);
     if (storedRun != null && storedRun.state === "running") {
@@ -4013,6 +3998,7 @@ export class OrchestratorRuntime implements IOrchestrator {
     stdinText?: string;
     timeoutMs?: number;
   }): Promise<ShellCommandResult> {
+    this.assertCampaignLaunchable(params.campaignId);
     const child = spawn(params.command, params.args, {
       cwd: params.cwd,
       windowsHide: true,
@@ -4104,6 +4090,23 @@ export class OrchestratorRuntime implements IOrchestrator {
       stderr: stderrText,
       outputText
     };
+  }
+
+  private assertCampaignLaunchable(campaignId: string): void {
+    const campaign = this.deps.store.getCampaign(campaignId);
+    if (campaign == null) {
+      return;
+    }
+    if (campaign.state === "running") {
+      return;
+    }
+    if (campaign.state === "cancelling" || campaign.state === "cancelled") {
+      throw new PuppenclawError("CAMPAIGN_CANCELLED", `Campaign ${campaignId} was cancelled.`);
+    }
+    throw new PuppenclawError(
+      "CAMPAIGN_NOT_RUNNING",
+      `Campaign ${campaignId} is not running and cannot launch new work.`
+    );
   }
 
   private async buildSiteStatus(params: SiteStatusParams): Promise<SiteStatus> {
