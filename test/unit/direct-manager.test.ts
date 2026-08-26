@@ -282,6 +282,116 @@ if (outputPath != null) {
   return `node "${fakeCodexPath.replaceAll('"', '\\"')}"`;
 }
 
+async function resolveFakeCodexEmptyFinalCommand(workspaceDir: string): Promise<string> {
+  const fakeCodexPath = join(workspaceDir, "fake-codex-empty-final.mjs");
+  await writeFile(
+    fakeCodexPath,
+    `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { join } from "node:path";
+
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+const outputPath = outputIndex >= 0 ? args[outputIndex + 1] : null;
+const cwdIndex = args.indexOf("--cd");
+const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : process.cwd();
+const counterPath = join(cwd, ".fake-codex-empty-final-count");
+const invocation = existsSync(counterPath)
+  ? Number.parseInt(readFileSync(counterPath, "utf8"), 10) || 0
+  : 0;
+writeFileSync(counterPath, String(invocation + 1), "utf8");
+
+readFileSync(0, "utf8");
+
+function emit(value) {
+  writeSync(1, JSON.stringify(value) + "\\n");
+}
+
+emit({ type: "turn_started" });
+if (invocation === 0) {
+  emit({
+    type: "response_item",
+    item: {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "First answer." }]
+    }
+  });
+  if (outputPath != null) {
+    writeFileSync(outputPath, "First answer.", "utf8");
+  }
+}
+`,
+    "utf8"
+  );
+  return `node "${fakeCodexPath.replaceAll('"', '\\"')}"`;
+}
+
+async function resolveEmptyTurnFakeAcpxCommand(workspaceDir: string): Promise<string> {
+  const fakeAcpxPath = join(workspaceDir, "fake-empty-turn-acpx.mjs");
+  await writeFile(
+    fakeAcpxPath,
+    `#!/usr/bin/env node
+import { existsSync, mkdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { basename, join } from "node:path";
+
+const args = process.argv.slice(2);
+const cwdIndex = args.indexOf("--cwd");
+const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : process.cwd();
+const commandIndex = args.findIndex((arg) => ["status", "sessions", "prompt"].includes(arg));
+const command = commandIndex >= 0 ? args.slice(commandIndex) : [];
+const stateDir = join(cwd, ".fake-acpx-state");
+mkdirSync(stateDir, { recursive: true });
+
+function emit(value) {
+  writeSync(1, JSON.stringify(value) + "\\n");
+}
+
+function sessionFile(name) {
+  return join(stateDir, \`\${basename(name)}.session\`);
+}
+
+if (command[0] === "status" && command[1] === "--session" && command[2]) {
+  if (!existsSync(sessionFile(command[2]))) {
+    emit({ action: "status_snapshot", status: "no-session", summary: "no active session" });
+    process.exit(0);
+  }
+  emit({ status: "alive", summary: "ready" });
+  process.exit(0);
+}
+
+if (command[0] === "sessions" && command[1] === "new") {
+  const nameIndex = command.indexOf("--name");
+  const name = nameIndex >= 0 ? command[nameIndex + 1] : "demo";
+  writeFileSync(sessionFile(name), "alive\\n", "utf8");
+  emit({ status: "alive" });
+  process.exit(0);
+}
+
+if (command[0] === "sessions" && command[1] === "show" && command[2]) {
+  emit({ messages: [] });
+  process.exit(0);
+}
+
+if (command[0] === "sessions" && command[1] === "history") {
+  emit({ entries: [] });
+  process.exit(0);
+}
+
+if (command[0] === "prompt" && command[1] === "--session" && command[2]) {
+  readFileSync(0, "utf8");
+  emit({ type: "done" });
+  process.exit(0);
+}
+
+console.error(\`unsupported fake acpx command: \${command.join(" ")}\`);
+process.exit(1);
+`,
+    "utf8"
+  );
+  return `node "${fakeAcpxPath.replaceAll('"', '\\"')}"`;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -3387,6 +3497,122 @@ process.exit(1);
     expect(store.getTurnRequest("unpublished-stop", "queue:unpublished")).toMatchObject({
       state: "settled",
       outcome: { kind: "error", code: "TURN_ABORTED" }
+    });
+  });
+
+  it("publishes a status result when an exit-0 Codex one-shot turn produces no final message", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-codex-empty-final-");
+    const codexCommand = await resolveFakeCodexEmptyFinalCommand(workspaceDir);
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({
+        acpxCommand,
+        agentCommands: {
+          codex: codexCommand
+        }
+      }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+    const modelProvider = {
+      id: "fake-openai-compatible",
+      kind: "codex-openai-compatible" as const,
+      model: "fake-model",
+      baseUrl: "http://example.invalid/v1",
+      authTokenEnv: "FAKE_CODEX_TOKEN",
+      wireApi: "responses" as const
+    };
+
+    await manager.start({
+      agent: "codex",
+      name: "codex-empty-final-demo",
+      directory: workspaceDir,
+      task: "Prime the one-shot session.",
+      contextFiles: [],
+      modelProvider
+    });
+
+    // The second invocation exits 0 without an assistant message and without
+    // writing --output-last-message: the turn must surface as a status result,
+    // never as an assistant reply a consumer could confuse with the previous
+    // turn's final message.
+    const result = await manager.send({
+      name: "codex-empty-final-demo",
+      message: "Run the approved work.",
+      contextFiles: []
+    });
+    const details = result.details as {
+      output: string;
+      outputRole: "assistant" | "status";
+      turnSignals?: { stopReason?: string };
+      session: SessionInfo;
+    };
+
+    expect(details.outputRole).toBe("status");
+    expect(details.output).toBe("Runner completed without a final assistant message.");
+    expect(details.turnSignals?.stopReason).toBe("no_final_message");
+    expect(details.session.state).toBe("idle");
+    expect(
+      details.session.transcript
+        .filter((entry) => entry.role === "assistant")
+        .map((entry) => entry.text)
+    ).toEqual(["First answer."]);
+    expect(details.session.transcript.at(-1)).toMatchObject({
+      role: "status",
+      text: "Runner completed without a final assistant message."
+    });
+
+    const output = await manager.output({ name: "codex-empty-final-demo" });
+    const outputDetails = (
+      output.details as { output?: { text?: string; source?: string } }
+    ).output;
+    expect(outputDetails?.text).toContain("without a final assistant message");
+  });
+
+  it("publishes a status result for an empty ACP turn", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-empty-acp-turn-");
+    const acpxCommand = await resolveEmptyTurnFakeAcpxCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({
+      config: makeConfig({ acpxCommand }),
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        debug() {}
+      },
+      store,
+      outputRouter
+    });
+
+    const result = await manager.start({
+      agent: "codex",
+      name: "empty-acp-demo",
+      directory: workspaceDir,
+      task: "Run a turn that emits no message.",
+      contextFiles: []
+    });
+    const details = result.details as {
+      output: string;
+      outputRole: "assistant" | "status";
+      turnSignals?: { stopReason?: string };
+      session: SessionInfo;
+    };
+
+    expect(details.outputRole).toBe("status");
+    expect(details.output).toBe("Runner completed without a final assistant message.");
+    expect(details.turnSignals?.stopReason).toBe("no_final_message");
+    expect(details.session.state).toBe("idle");
+    expect(details.session.transcript.at(-1)).toMatchObject({
+      role: "status",
+      text: "Runner completed without a final assistant message."
     });
   });
 });

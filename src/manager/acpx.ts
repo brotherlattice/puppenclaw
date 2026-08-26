@@ -89,6 +89,7 @@ type NativeModePreparation = {
 
 type TurnResult = {
   output: string;
+  outputRole?: TurnOutputRole;
   question?: string;
   tokenUsage?: TokenUsage;
   usage?: NormalizedUsage;
@@ -142,7 +143,7 @@ function failedProviderTurn(failure: ProviderFailure): TurnResult {
 }
 
 function outputRoleForTurn(turn: TurnResult): TurnOutputRole {
-  return turn.state === "failed" ? "status" : "assistant";
+  return turn.outputRole ?? (turn.state === "failed" ? "status" : "assistant");
 }
 
 function withTurnReceipt(
@@ -312,6 +313,8 @@ const QUIESCENCE_DRAIN_TIMEOUT_MS = 4_000;
 const QUIESCENCE_POLL_MS = 25;
 const ACTIVE_TURN_CHECKPOINT_MS = 5_000;
 const RECOVERY_FENCE_TERMINATION_TIMEOUT_MS = 4_000;
+const NO_FINAL_MESSAGE_STOP_REASON = "no_final_message";
+const NO_FINAL_MESSAGE_STATUS_TEXT = "Runner completed without a final assistant message.";
 
 type LinuxProcessIdentity = {
   processGroupId: number;
@@ -5256,6 +5259,11 @@ export class AcpxSessionManager implements ISessionManager {
       };
     }
 
+    if (combinedOutput.length === 0) {
+      this.deps.logger.warn(
+        `Codex session ${params.session.name} exited with code ${exitCode ?? 0} without a final assistant message (--output-last-message ${finalOutput.length > 0 ? "sanitized to empty" : "empty or missing"}, ${liveOutputChunks.length} live chunks, ${stderr.trim().length} stderr chars).`
+      );
+    }
     if (combinedOutput.length > 0) {
       const activeText = this.activeTurnOutputs.get(params.session.name)?.text ?? "";
       if (activeText.trim().length === 0) {
@@ -5613,6 +5621,35 @@ export class AcpxSessionManager implements ISessionManager {
         : signals?.plan == null
           ? resolveQuestionFromOutput(params.output)
           : undefined);
+    if (question == null && signals?.plan == null && params.output.trim().length === 0) {
+      // A successful turn with no visible assistant output must never be
+      // published as an assistant message: consumers holding only the
+      // cumulative transcript would fall back to the previous assistant entry
+      // and resurrect a stale reply as this turn's answer.
+      this.deps.logger.warn(
+        `Session ${params.sessionName} completed without a final assistant message; publishing a status result.`
+      );
+      const statusSignals = mergeTurnSignals(signals, {
+        stopReason: NO_FINAL_MESSAGE_STOP_REASON
+      });
+      await this.deps.outputRouter.onFinal(params.sessionName, NO_FINAL_MESSAGE_STATUS_TEXT);
+      await this.deps.outputRouter.onComplete(
+        params.sessionName,
+        "Turn completed without a final assistant message."
+      );
+      return {
+        output: NO_FINAL_MESSAGE_STATUS_TEXT,
+        outputRole: "status",
+        ...(params.tokenUsage != null ? { tokenUsage: params.tokenUsage } : {}),
+        ...(params.usage != null ? { usage: params.usage } : {}),
+        stopReason: NO_FINAL_MESSAGE_STOP_REASON,
+        ...(params.durationMs != null ? { durationMs: params.durationMs } : {}),
+        ...(statusSignals != null ? { signals: statusSignals } : {}),
+        warnings: [],
+        transcript: [{ role: "status", text: NO_FINAL_MESSAGE_STATUS_TEXT, createdAt: nowIso() }],
+        state: "idle"
+      };
+    }
     await this.deps.outputRouter.onFinal(params.sessionName, params.output);
     if (question != null) {
       await this.deps.outputRouter.onQuestion(params.sessionName, question);
