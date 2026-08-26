@@ -1333,6 +1333,16 @@ function mergeTranscript(
   return [...previous, ...additions];
 }
 
+function stampTranscriptTurn(
+  entries: readonly SessionTranscriptEntry[],
+  turnId: string | undefined
+): SessionTranscriptEntry[] {
+  if (turnId == null) {
+    return [...entries];
+  }
+  return entries.map((entry) => ({ ...entry, turnId }));
+}
+
 function isConnectedSession(session: SessionInfo): boolean {
   return CONNECTED_SESSION_STATES.has(session.state);
 }
@@ -1785,10 +1795,13 @@ export class AcpxSessionManager implements ISessionManager {
             lastActivity: nowIso(),
             warnings: dedupeWarnings([...warnings, ...turn.warnings]),
             ...(sessionSkills.length > 0 ? { skills: sessionSkills } : {}),
-            transcript: mergeTranscript(current.transcript, [
-              ...makeUserTranscript(promptText),
-              ...turn.transcript
-            ]),
+            transcript: mergeTranscript(
+              current.transcript,
+              stampTranscriptTurn(
+                [...makeUserTranscript(promptText), ...turn.transcript],
+                activeTurn?.id
+              )
+            ),
             ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
             ...(turn.state === "failed"
               ? {
@@ -2012,10 +2025,13 @@ export class AcpxSessionManager implements ISessionManager {
             ...(reasoning.warning != null ? [reasoning.warning] : []),
             ...turn.warnings
           ]),
-          transcript: mergeTranscript(current.transcript, [
-            ...makeUserTranscript(promptText),
-            ...turn.transcript
-          ]),
+          transcript: mergeTranscript(
+            current.transcript,
+            stampTranscriptTurn(
+              [...makeUserTranscript(promptText), ...turn.transcript],
+              activeTurn?.id
+            )
+          ),
           ...(turn.question != null ? { pendingQuestion: turn.question } : {}),
           ...(turn.state === "failed"
             ? {
@@ -2524,6 +2540,22 @@ export class AcpxSessionManager implements ISessionManager {
               : latestTranscriptOutput != null
                 ? "transcript"
                 : "none",
+          // Turn provenance: consumers attributing this text to a specific
+          // turn must be able to reject text that predates the turn they
+          // dispatched, instead of resurrecting an older reply.
+          turnId:
+            useActive && active != null
+              ? (this.activeTurnIds.get(params.name) ?? reconciled.session.activeTurn?.id ?? null)
+              : (latestTranscriptOutput?.turnId ?? null),
+          withinActiveTurn:
+            useActive && active != null
+              ? true
+              : latestTranscriptOutput != null && reconciled.session.activeTurn != null
+                ? latestTranscriptOutput.turnId != null
+                  ? latestTranscriptOutput.turnId === reconciled.session.activeTurn.id
+                  : Date.parse(latestTranscriptOutput.createdAt) >=
+                    Date.parse(reconciled.session.activeTurn.startedAt)
+                : false,
           startedAt: useActive ? (active?.startedAt ?? null) : null,
           updatedAt: useActive
             ? (active?.updatedAt ?? null)

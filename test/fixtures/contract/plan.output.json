@@ -2,7 +2,7 @@
   "content": [
     {
       "type": "text",
-      "text": "Output for plan\n{\n  \"session\": {\n    \"name\": \"plan\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"idle\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"This is a read-only planning turn. Develop or revise the plan and surface genuine decision boundaries, but do not execute the plan or modify the workspace.\\n\\nEXIT_PLAN_MODE\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"The plan is ready. Should I proceed?\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\"\n      }\n    ],\n    \"handle\": {\n      \"runtimeSessionName\": \"plan\",\n      \"cwd\": \"/workspace/project\",\n      \"agent\": \"claude\",\n      \"mode\": \"persistent\"\n    },\n    \"reasoningProfile\": \"claude\",\n    \"activeTurn\": {\n      \"id\": \"turn-plan-1\",\n      \"state\": \"completed\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 36,\n      \"exitCode\": 0,\n      \"signal\": null,\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"completedAt\": \"2026-01-01T10:01:30.000Z\"\n    },\n    \"tokenUsage\": {\n      \"used\": 171,\n      \"size\": 4096,\n      \"input\": 171,\n      \"output\": 12,\n      \"cacheRead\": 5,\n      \"cacheWrite\": 3\n    }\n  },\n  \"turn\": {\n    \"classification\": \"completed\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": null,\n    \"identityMatches\": null,\n    \"pid\": null,\n    \"processGroupId\": null,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 36,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  },\n  \"output\": {\n    \"text\": \"The plan is ready. Should I proceed?\",\n    \"chars\": 36,\n    \"source\": \"transcript\",\n    \"startedAt\": null,\n    \"updatedAt\": \"2026-01-01T10:00:20.000Z\",\n    \"complete\": true\n  }\n}"
+      "text": "Output for plan\n{\n  \"session\": {\n    \"name\": \"plan\",\n    \"agent\": \"claude\",\n    \"directory\": \"/workspace/project\",\n    \"state\": \"idle\",\n    \"createdAt\": \"2026-01-01T10:00:00.000Z\",\n    \"lastActivity\": \"2026-01-01T10:02:00.000Z\",\n    \"permissionMode\": \"approve-reads\",\n    \"warnings\": [],\n    \"transcript\": [\n      {\n        \"role\": \"user\",\n        \"text\": \"This is a read-only planning turn. Develop or revise the plan and surface genuine decision boundaries, but do not execute the plan or modify the workspace.\\n\\nEXIT_PLAN_MODE\",\n        \"createdAt\": \"2026-01-01T10:00:05.000Z\",\n        \"turnId\": \"turn-plan-1\"\n      },\n      {\n        \"role\": \"assistant\",\n        \"text\": \"The plan is ready. Should I proceed?\",\n        \"createdAt\": \"2026-01-01T10:00:20.000Z\",\n        \"turnId\": \"turn-plan-1\"\n      }\n    ],\n    \"handle\": {\n      \"runtimeSessionName\": \"plan\",\n      \"cwd\": \"/workspace/project\",\n      \"agent\": \"claude\",\n      \"mode\": \"persistent\"\n    },\n    \"reasoningProfile\": \"claude\",\n    \"activeTurn\": {\n      \"id\": \"turn-plan-1\",\n      \"state\": \"completed\",\n      \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n      \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n      \"outputChars\": 36,\n      \"exitCode\": 0,\n      \"signal\": null,\n      \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n      \"completedAt\": \"2026-01-01T10:01:30.000Z\"\n    },\n    \"tokenUsage\": {\n      \"used\": 171,\n      \"size\": 4096,\n      \"input\": 171,\n      \"output\": 12,\n      \"cacheRead\": 5,\n      \"cacheWrite\": 3\n    }\n  },\n  \"turn\": {\n    \"classification\": \"completed\",\n    \"lockHeld\": false,\n    \"trackedChild\": false,\n    \"processAlive\": null,\n    \"identityMatches\": null,\n    \"pid\": null,\n    \"processGroupId\": null,\n    \"startedAt\": \"2026-01-01T10:01:00.000Z\",\n    \"updatedAt\": \"2026-01-01T10:01:30.000Z\",\n    \"lastOutputAt\": \"2026-01-01T10:01:30.000Z\",\n    \"outputChars\": 36,\n    \"ageMs\": 61000,\n    \"outputAgeMs\": 32000,\n    \"conflict\": null\n  },\n  \"output\": {\n    \"text\": \"The plan is ready. Should I proceed?\",\n    \"chars\": 36,\n    \"source\": \"transcript\",\n    \"turnId\": \"turn-plan-1\",\n    \"withinActiveTurn\": true,\n    \"startedAt\": null,\n    \"updatedAt\": \"2026-01-01T10:00:20.000Z\",\n    \"complete\": true\n  }\n}"
     }
   ],
   "details": {
@@ -19,12 +19,14 @@
         {
           "role": "user",
           "text": "This is a read-only planning turn. Develop or revise the plan and surface genuine decision boundaries, but do not execute the plan or modify the workspace.\n\nEXIT_PLAN_MODE",
-          "createdAt": "2026-01-01T10:00:05.000Z"
+          "createdAt": "2026-01-01T10:00:05.000Z",
+          "turnId": "turn-plan-1"
         },
         {
           "role": "assistant",
           "text": "The plan is ready. Should I proceed?",
-          "createdAt": "2026-01-01T10:00:20.000Z"
+          "createdAt": "2026-01-01T10:00:20.000Z",
+          "turnId": "turn-plan-1"
         }
       ],
       "handle": {
@@ -74,6 +76,8 @@
       "text": "The plan is ready. Should I proceed?",
       "chars": 36,
       "source": "transcript",
+      "turnId": "turn-plan-1",
+      "withinActiveTurn": true,
       "startedAt": null,
       "updatedAt": "2026-01-01T10:00:20.000Z",
       "complete": true

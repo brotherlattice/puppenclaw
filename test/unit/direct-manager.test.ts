@@ -3571,9 +3571,67 @@ process.exit(1);
 
     const output = await manager.output({ name: "codex-empty-final-demo" });
     const outputDetails = (
-      output.details as { output?: { text?: string; source?: string } }
+      output.details as {
+        output?: {
+          text?: string;
+          source?: string;
+          turnId?: string | null;
+          withinActiveTurn?: boolean;
+        };
+      }
     ).output;
     expect(outputDetails?.text).toContain("without a final assistant message");
+
+    // Turn provenance is stamped end to end: the turn's own entries carry its
+    // id, and the served transcript output identifies as within that turn.
+    const sessionAfter = store.getSession("codex-empty-final-demo");
+    const sendTurnId = sessionAfter?.activeTurn?.id;
+    expect(sendTurnId).toBeTruthy();
+    const stampedEntries = details.session.transcript.filter(
+      (entry) => entry.turnId === sendTurnId
+    );
+    expect(stampedEntries.at(-1)).toMatchObject({ role: "status" });
+    expect(outputDetails?.source).toBe("transcript");
+    expect(outputDetails?.turnId).toBe(sendTurnId);
+    expect(outputDetails?.withinActiveTurn).toBe(true);
+
+    // A newest response entry that predates the reported turn is flagged as
+    // outside it — the signal consumers use to reject resurrected text.
+    if (sessionAfter?.activeTurn == null) {
+      throw new Error("expected active turn metadata after the send turn");
+    }
+    await store.upsertSession({
+      ...sessionAfter,
+      activeTurn: {
+        ...sessionAfter.activeTurn,
+        id: "later-turn"
+      }
+    });
+    const staleOutput = await manager.output({ name: "codex-empty-final-demo" });
+    const staleProvenance = (
+      staleOutput.details as {
+        output?: { source?: string; withinActiveTurn?: boolean };
+      }
+    ).output;
+    expect(staleProvenance?.source).toBe("transcript");
+    expect(staleProvenance?.withinActiveTurn).toBe(false);
+
+    // Persisted entries keep their turn ids (every persist round-trips
+    // through the strict stored-state schema, so this also proves the schema
+    // accepts the stamp).
+    const persisted = JSON.parse(
+      await readFile(join(workspaceDir, "state.json"), "utf8")
+    ) as {
+      sessions: Record<
+        string,
+        { transcript: Array<{ turnId?: string }> }
+      >;
+    };
+    expect(
+      persisted.sessions["codex-empty-final-demo"]?.transcript.filter(
+        (entry) => entry.turnId != null
+      ).length ?? 0
+    ).toBeGreaterThan(0);
   });
 
   it("publishes a status result for an empty ACP turn", async () => {

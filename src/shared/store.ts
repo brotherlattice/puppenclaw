@@ -51,7 +51,8 @@ const transcriptEntryZod = z
   .object({
     role: z.enum(["system", "user", "assistant", "status"]),
     text: z.string(),
-    createdAt: persistedTimestampZod
+    createdAt: persistedTimestampZod,
+    turnId: z.string().min(1).optional()
   })
   .strict();
 

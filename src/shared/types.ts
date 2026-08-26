@@ -230,6 +230,7 @@ export type SessionTranscriptEntry = {
   role: "system" | "user" | "assistant" | "status";
   text: string;
   createdAt: string;
+  turnId?: string;
 };
 
 export type ContextFileEntry = {

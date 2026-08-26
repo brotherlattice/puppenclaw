@@ -190,7 +190,8 @@ async function normalizeRealScenario(store: Awaited<ReturnType<typeof createStor
       lastActivity: T_LAST_ACTIVITY,
       transcript: current.transcript.map((entry) => ({
         ...entry,
-        createdAt: entry.role === "user" ? T_USER : T_ASSISTANT
+        createdAt: entry.role === "user" ? T_USER : T_ASSISTANT,
+        ...(entry.turnId != null ? { turnId: `turn-${name}-1` } : {})
       })),
       ...(current.activeTurn != null
         ? { activeTurn: normalizedTerminalTurn(name, current.activeTurn) }
